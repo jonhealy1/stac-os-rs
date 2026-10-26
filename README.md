@@ -206,8 +206,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 **Hierarchy & data**
 - Children/descendants capped at 10k per level — real pagination needed on the DAG itself
 - Reserved IDs: a catalog named `search` collides with the static route — should 400 on create
-- Orphaned docs: a hierarchy node whose document is missing is silently skipped in children listings — needs a consistency check
-- Catalogs don't emit per-child `rel: child` links (upstream behavior) — the `children` endpoint link is provided instead
+- Orphaned docs: a hierarchy node whose document is missing is silently skipped in children listings and `rel: child` links — needs a consistency check
 - User-provided `links` in POST/PUT bodies are replaced by generated links on read (upstream merges non-dynamic user links — a deliberate divergence for now)
 - No request-body STAC schema validation yet (`stac-validate` crate planned)
 
@@ -217,4 +216,4 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Concurrency** — all writes use optimistic concurrency via OpenSearch `_seq_no`/`_primary_term`: document PUTs re-stamp and retry up to 5 times (`Store::replace_document`/`put_document`), hierarchy link/unlink replay the edge mutation on a fresh read (`Store::mutate_node`), and POSTs use `op_type=create` for atomic repost-409s. Exhausted retries surface as HTTP 409.
 
-**Tests** — `tests/catalogs.rs` ports `stac-fastapi-elasticsearch-opensearch`'s `test_catalogs.py` (112 passing, 8 `#[ignore]`d pending: `stac-validate`, per-child `child` links, user-link merge semantics, validator wiring). CI also runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (core, item-search, features, browseable — all passing) as an advisory job. Each test gets isolated `it-*` indices (unique `Store` index prefix), so tests never touch dev data — `make test*` sweeps `it-*` afterwards, or `make test-clean` manually.
+**Tests** — `tests/catalogs.rs` ports `stac-fastapi-elasticsearch-opensearch`'s `test_catalogs.py` (118 passing, 2 `#[ignore]`d pending: `stac-validate`, user-link merge semantics). CI also runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (core, item-search, features, browseable — all passing) as an advisory job. Each test gets isolated `it-*` indices (unique `Store` index prefix), so tests never touch dev data — `make test*` sweeps `it-*` afterwards, or `make test-clean` manually.

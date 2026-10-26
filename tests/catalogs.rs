@@ -1020,9 +1020,48 @@ async fn test_delete_collection_not_in_catalog_returns_404() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
+/// All collections created under a catalog appear as `rel=child` links
+/// on the catalog doc and in the scoped collections listing.
 #[tokio::test]
-#[ignore = "needs 'data'-style collection links inside catalog doc (all collections linked)"]
-async fn test_catalog_links_contain_all_collections() {}
+async fn test_catalog_links_contain_all_collections() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("allcols");
+    post_catalog(&app, &cat).await;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let col = format!("ac-col-{i}");
+        let (s, _) = post_collection(&app, &cat, collection(&col)).await;
+        assert_eq!(s, StatusCode::CREATED);
+        ids.push(col);
+    }
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{cat}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let child_links = links_by_rel(&body, "child");
+    let hrefs: Vec<&str> = child_links
+        .iter()
+        .filter_map(|l| l["href"].as_str())
+        .collect();
+    for id in &ids {
+        assert!(
+            hrefs
+                .iter()
+                .any(|h| h.contains(&format!("/catalogs/{cat}/collections/{id}"))),
+            "missing child link for {id}"
+        );
+    }
+    let (_, cols) = call(&app, "GET", &format!("/catalogs/{cat}/collections"), None).await;
+    let listed: Vec<&str> = cols["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    for id in &ids {
+        assert!(listed.contains(&id.as_str()));
+    }
+}
 
 #[tokio::test]
 async fn test_delete_catalog_orphans_collections() {
@@ -1603,7 +1642,7 @@ async fn test_get_catalog_dynamic_parent_links_single_parent() {
 
 #[tokio::test]
 async fn test_get_catalog_dynamic_parent_links_poly_hierarchy() {
-    // Their convention: one rel=parent link per parent (not parent+related).
+    // Current convention: exactly one rel=parent; alternates → rel=related.
     let Some((app, _)) = test_app(true).await else {
         return;
     };
@@ -1615,7 +1654,13 @@ async fn test_get_catalog_dynamic_parent_links_poly_hierarchy() {
     post_sub_catalog(&app, &p2, json!({"id": child})).await;
     let (_, body) = call(&app, "GET", &format!("/catalogs/{child}"), None).await;
     let parents = links_by_rel(&body, "parent");
-    let hrefs: Vec<&str> = parents.iter().filter_map(|l| l["href"].as_str()).collect();
+    assert_eq!(parents.len(), 1, "exactly one parent link: {parents:?}");
+    let related = links_by_rel(&body, "related");
+    let hrefs: Vec<&str> = parents
+        .iter()
+        .chain(related.iter())
+        .filter_map(|l| l["href"].as_str())
+        .collect();
     assert!(
         hrefs.iter().any(|h| h.contains(&p1)),
         "missing parent {p1}: {hrefs:?}"
@@ -1627,7 +1672,6 @@ async fn test_get_catalog_dynamic_parent_links_poly_hierarchy() {
 }
 
 #[tokio::test]
-#[ignore = "needs rel=child links on catalog docs"]
 async fn test_get_catalog_dynamic_child_links() {
     let Some((app, _)) = test_app(true).await else {
         return;
@@ -1680,21 +1724,136 @@ async fn test_get_catalog_root_parent_link_for_top_level_catalog() {
     assert!(!parents[0]["href"].as_str().unwrap().contains("/catalogs/"));
 }
 
+/// Child links are not page-capped: all direct children are emitted even
+/// past the page-size used elsewhere (`?limit` on the doc is ignored).
 #[tokio::test]
-#[ignore = "needs paginated child links beyond 100"]
-async fn test_get_catalog_child_links_pagination_over_100() {}
+async fn test_get_catalog_child_links_pagination_over_100() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let parent = uniq("bigpage");
+    post_catalog(&app, &parent).await;
+    let mut ids = Vec::new();
+    for i in 0..15 {
+        let col = format!("bp-col-{i:03}");
+        let (s, _) = post_collection(&app, &parent, collection(&col)).await;
+        assert_eq!(s, StatusCode::CREATED);
+        ids.push(col);
+    }
+    let (_, body) = call(&app, "GET", &format!("/catalogs/{parent}?limit=10"), None).await;
+    let child_links = links_by_rel(&body, "child");
+    assert!(child_links.len() >= 15, "got {}", child_links.len());
+    let hrefs: Vec<&str> = child_links
+        .iter()
+        .filter_map(|l| l["href"].as_str())
+        .collect();
+    for id in &ids {
+        assert!(hrefs.iter().any(|h| h.contains(id)), "missing {id}");
+    }
+}
 
+/// New spec: exactly ONE `rel=parent`; alternates are `rel=related`,
+/// href-unique.
 #[tokio::test]
-#[ignore = "needs rel=child links + dedup semantics"]
-async fn test_get_catalog_deduplicates_parent_links() {}
+async fn test_get_catalog_deduplicates_parent_links() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let (p1, p2) = (uniq("dd-p1"), uniq("dd-p2"));
+    let child = uniq("dd-child");
+    post_catalog(&app, &p1).await;
+    post_catalog(&app, &p2).await;
+    post_sub_catalog(&app, &p1, catalog(&child)).await;
+    let (s, _) = post_sub_catalog(&app, &p2, json!({"id": child})).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, body) = call(&app, "GET", &format!("/catalogs/{child}"), None).await;
+    let parents = links_by_rel(&body, "parent");
+    assert_eq!(parents.len(), 1, "exactly one parent link: {parents:?}");
+    let parent_hrefs: Vec<&str> = parents.iter().filter_map(|l| l["href"].as_str()).collect();
+    assert_eq!(parent_hrefs.len(), {
+        let mut u = parent_hrefs.clone();
+        u.sort_unstable();
+        u.dedup();
+        u.len()
+    });
+    let related = links_by_rel(&body, "related");
+    let related_hrefs: Vec<&str> = related.iter().filter_map(|l| l["href"].as_str()).collect();
+    assert_eq!(related_hrefs.len(), {
+        let mut u = related_hrefs.clone();
+        u.sort_unstable();
+        u.dedup();
+        u.len()
+    });
+    // both parents still reachable across parent+related
+    let all: Vec<&str> = parent_hrefs
+        .iter()
+        .chain(related_hrefs.iter())
+        .copied()
+        .collect();
+    assert!(all.iter().any(|h| h.contains(&p1)));
+    assert!(all.iter().any(|h| h.contains(&p2)));
+}
 
+/// A child with no `title` falls back to its id on the child link.
 #[tokio::test]
-#[ignore = "needs rel=child links (missing titles tolerated)"]
-async fn test_get_catalog_child_links_with_missing_title() {}
+async fn test_get_catalog_child_links_with_missing_title() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let parent = uniq("notitle");
+    let col = uniq("nt-col");
+    post_catalog(&app, &parent).await;
+    let mut c = collection(&col);
+    c.as_object_mut().unwrap().remove("title");
+    let (s, _) = post_collection(&app, &parent, c).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, body) = call(&app, "GET", &format!("/catalogs/{parent}"), None).await;
+    let child_links = links_by_rel(&body, "child");
+    let link = child_links
+        .iter()
+        .find(|l| l["href"].as_str().unwrap_or("").contains(&col))
+        .expect("child link for collection missing");
+    assert_eq!(link["title"], col);
+}
 
+/// Mixed catalog+collection children all get child links.
 #[tokio::test]
-#[ignore = "needs rel=child links + mixed-type pagination"]
-async fn test_get_catalog_mixed_child_types_pagination() {}
+async fn test_get_catalog_mixed_child_types_pagination() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let parent = uniq("mixed");
+    post_catalog(&app, &parent).await;
+    let mut cat_ids = Vec::new();
+    let mut col_ids = Vec::new();
+    for i in 0..15 {
+        let sub = format!("mx-cat-{i:03}");
+        let (s, _) = post_sub_catalog(&app, &parent, catalog(&sub)).await;
+        assert_eq!(s, StatusCode::CREATED);
+        cat_ids.push(sub);
+        let col = format!("mx-col-{i:03}");
+        let (s, _) = post_collection(&app, &parent, collection(&col)).await;
+        assert_eq!(s, StatusCode::CREATED);
+        col_ids.push(col);
+    }
+    let (_, body) = call(&app, "GET", &format!("/catalogs/{parent}?limit=10"), None).await;
+    let child_links = links_by_rel(&body, "child");
+    assert!(child_links.len() >= 30, "got {}", child_links.len());
+    let hrefs: Vec<&str> = child_links
+        .iter()
+        .filter_map(|l| l["href"].as_str())
+        .collect();
+    let cat_count = cat_ids
+        .iter()
+        .filter(|id| hrefs.iter().any(|h| h.contains(&format!("/catalogs/{id}"))))
+        .count();
+    let col_count = col_ids
+        .iter()
+        .filter(|id| hrefs.iter().any(|h| h.contains(id.as_str())))
+        .count();
+    assert!(cat_count >= 10, "catalog children: {cat_count}");
+    assert!(col_count >= 10, "collection children: {col_count}");
+}
 
 // --- Collection link serialization ---
 
@@ -2169,7 +2328,9 @@ async fn test_hide_alternate_parents_false_shows_related_links_on_catalog() {
     post_sub_catalog(&app, &p1, catalog(&sub)).await;
     post_sub_catalog(&app, &p2, json!({"id": sub})).await;
     let (_, body) = call(&app, "GET", &format!("/catalogs/{sub}"), None).await;
-    assert_eq!(links_by_rel(&body, "parent").len(), 2);
+    // one canonical parent; the alternate surfaces as rel=related
+    assert_eq!(links_by_rel(&body, "parent").len(), 1);
+    assert_eq!(links_by_rel(&body, "related").len(), 1);
 }
 
 #[tokio::test]

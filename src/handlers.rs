@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use stac::{Catalog, Collection, Item, Link};
 use stac_api::{GetSearch, ItemCollection, Search};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct AppState {
@@ -169,7 +169,15 @@ fn item_links(
 /// (upstream convention for poly-hierarchy); a root-level catalog gets a
 /// single `parent` pointing at the landing page. Links are derived from
 /// the DAG at read time — never stored.
-fn catalog_links(state: &AppState, catalog_id: &str, parents: &[String]) -> Vec<Link> {
+/// Dynamic links for a Catalog doc. Upstream semantics: exactly ONE
+/// `rel=parent` (first sorted real parent; landing page when none), the
+/// rest as `rel=related` — unless hide_alternate_parents suppresses them.
+/// A `rel=child` link is emitted per direct child.
+async fn catalog_links(
+    state: &AppState,
+    catalog_id: &str,
+    parents: &[String],
+) -> Result<Vec<Link>, ApiError> {
     let base = &state.base_url;
     let mut links = vec![
         link_json(format!("{base}/catalogs/{catalog_id}"), "self"),
@@ -185,11 +193,14 @@ fn catalog_links(state: &AppState, catalog_id: &str, parents: &[String]) -> Vec<
     if real.is_empty() {
         links.push(link_json(base.clone(), "parent"));
     } else {
-        if state.hide_alternate_parents {
-            real.truncate(1);
-        }
-        for p in real {
-            links.push(link_json(format!("{base}/catalogs/{p}"), "parent"));
+        links.push(link_json(format!("{base}/catalogs/{}", real[0]), "parent"));
+        if !state.hide_alternate_parents {
+            for p in &real[1..] {
+                links.push(
+                    link_json(format!("{base}/catalogs/{p}"), "related")
+                        .title(format!("Alternate parent: {p}")),
+                );
+            }
         }
     }
     links.push(link_json(
@@ -200,10 +211,65 @@ fn catalog_links(state: &AppState, catalog_id: &str, parents: &[String]) -> Vec<
         format!("{base}/catalogs/{catalog_id}/children"),
         "children",
     ));
+    links.extend(child_links(state, catalog_id).await?);
     let mut search = link_json(format!("{base}/catalogs/{catalog_id}/search"), "search");
     search.r#type = Some("application/geo+json".to_string());
     links.push(search);
-    links
+    Ok(links)
+}
+
+/// `rel=child` links for a catalog's direct children. Catalogs get
+/// canonical `/catalogs/{id}` hrefs, collections get scoped
+/// `/catalogs/{cat}/collections/{id}` hrefs. Nodes without a backing
+/// document are skipped (no dead links); `title` is the doc title,
+/// falling back to the child id.
+async fn child_links(state: &AppState, catalog_id: &str) -> Result<Vec<Link>, ApiError> {
+    let base = &state.base_url;
+    let nodes = state.store.get_child_nodes(catalog_id, None).await?;
+    let cat_ids: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Catalog)
+        .map(|n| n.id.clone())
+        .collect();
+    let col_ids: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Collection)
+        .map(|n| n.id.clone())
+        .collect();
+    // id -> title (absent entry = no backing doc → skip the child)
+    let mut titles: HashMap<String, Option<String>> = HashMap::new();
+    for docs in [
+        state.store.get_documents(CATALOGS_INDEX, &cat_ids).await?,
+        state
+            .store
+            .get_documents(COLLECTIONS_INDEX, &col_ids)
+            .await?,
+    ] {
+        for d in docs {
+            if let Some(id) = d["id"].as_str() {
+                titles.insert(id.to_string(), d["title"].as_str().map(str::to_owned));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+    for node in nodes {
+        let Some(title) = titles.get(&node.id) else {
+            continue;
+        };
+        let href = match node.kind {
+            NodeKind::Catalog => format!("{base}/catalogs/{}", node.id),
+            NodeKind::Collection => {
+                format!("{base}/catalogs/{catalog_id}/collections/{}", node.id)
+            }
+        };
+        if seen.insert(href.clone()) {
+            links.push(
+                link_json(href, "child").title(title.clone().unwrap_or_else(|| node.id.clone())),
+            );
+        }
+    }
+    Ok(links)
 }
 
 fn collection_links(
@@ -290,7 +356,7 @@ async fn global_collection_doc(
 async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::Value, ApiError> {
     let parents = state.store.get_parents(&catalog.id).await?;
     let mut doc = serde_json::to_value(catalog).map_err(|e| ApiError::Internal(e.to_string()))?;
-    doc["links"] = json!(catalog_links(state, &catalog.id, &parents));
+    doc["links"] = json!(catalog_links(state, &catalog.id, &parents).await?);
     Ok(doc)
 }
 
@@ -392,7 +458,7 @@ pub async fn root_landing_page(
         .filter(|n| n.kind == NodeKind::Collection)
         .map(|n| n.id.clone())
         .collect();
-    let mut live: Vec<String> = state
+    let mut live: HashMap<String, Option<String>> = state
         .store
         .get_documents(CATALOGS_INDEX, &cat_ids)
         .await?
@@ -403,13 +469,16 @@ pub async fn root_landing_page(
                 .get_documents(COLLECTIONS_INDEX, &col_ids)
                 .await?,
         )
-        .filter_map(|d| d["id"].as_str().map(str::to_owned))
+        .filter_map(|d| {
+            d["id"]
+                .as_str()
+                .map(|id| (id.to_string(), d["title"].as_str().map(str::to_owned)))
+        })
         .collect();
-    live.sort_unstable();
     for child in children {
-        if !live.contains(&child.id) {
+        let Some(title) = live.remove(&child.id) else {
             continue;
-        }
+        };
         let href = match child.kind {
             NodeKind::Collection => format!("{base}/collections/{}", child.id),
             _ => format!("{base}/catalogs/{}", child.id),
@@ -417,7 +486,8 @@ pub async fn root_landing_page(
         links.as_array_mut().unwrap().push(json!({
             "rel": "child",
             "type": "application/json",
-            "href": href
+            "href": href,
+            "title": title.unwrap_or_else(|| child.id.clone())
         }));
     }
     Ok(Json(json!({
@@ -451,7 +521,7 @@ pub async fn list_catalogs(
     for doc in catalogs.iter_mut() {
         if let Some(id) = doc["id"].as_str() {
             let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(catalog_links(&state, id, &parents));
+            doc["links"] = json!(catalog_links(&state, id, &parents).await?);
         }
     }
     let mut links = json!([
@@ -522,7 +592,7 @@ pub async fn get_catalog(
     {
         Some(mut doc) => {
             let parents = state.store.get_parents(&catalog_id).await?;
-            doc["links"] = json!(catalog_links(&state, &catalog_id, &parents));
+            doc["links"] = json!(catalog_links(&state, &catalog_id, &parents).await?);
             Ok(Json(doc))
         }
         None => Err(ApiError::NotFound(catalog_id)),
@@ -605,7 +675,7 @@ pub async fn get_catalog_children(
         };
         doc["links"] = match node.kind {
             // parent link locked to this listing's catalog context
-            NodeKind::Catalog => json!(catalog_links(&state, &node.id, &node.parents)),
+            NodeKind::Catalog => json!(catalog_links(&state, &node.id, &node.parents).await?),
             NodeKind::Collection => json!(collection_links(
                 &state,
                 &node.id,
@@ -665,7 +735,7 @@ pub async fn list_sub_catalogs(
     for doc in catalogs.iter_mut() {
         if let Some(id) = doc["id"].as_str() {
             let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(catalog_links(&state, id, &parents));
+            doc["links"] = json!(catalog_links(&state, id, &parents).await?);
         }
     }
     let mut links = json!([
@@ -924,7 +994,7 @@ pub async fn link_or_create_sub_catalog(
                 .await?
                 .unwrap();
             let parents = state.store.get_parents(&id).await?;
-            doc["links"] = json!(catalog_links(&state, &id, &parents));
+            doc["links"] = json!(catalog_links(&state, &id, &parents).await?);
             Ok((StatusCode::OK, Json(doc)))
         }
         CreateOrLinkPayload::FullResource(new_catalog) => {
