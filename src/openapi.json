@@ -1,7 +1,7 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "sfeos-rs — STAC API with Multi-Tenant Catalogs",
+    "title": "stac-os-rs — STAC API with Multi-Tenant Catalogs",
     "description": "STAC API implementing the Multi-Tenant Catalogs extension, backed by OpenSearch. Transaction routes exist only when ENABLE_TRANSACTIONS_EXTENSIONS is set.",
     "version": "0.1.0"
   },

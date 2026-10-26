@@ -15,7 +15,7 @@ mod common;
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{json, Value};
-use sfeos_rs::store::{NodeKind, CATALOGS_INDEX, HIERARCHY_INDEX, ROOT_CATALOG_ID};
+use stac_os_rs::store::{NodeKind, CATALOGS_INDEX, HIERARCHY_INDEX, ROOT_CATALOG_ID};
 
 // Convenience wrappers
 

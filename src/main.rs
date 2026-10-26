@@ -1,5 +1,5 @@
 // src/main.rs
-use sfeos_rs::{build_app, handlers::AppState, links::LinkEngine, store::Store};
+use stac_os_rs::{build_app, handlers::AppState, links::LinkEngine, store::Store};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -33,7 +33,7 @@ async fn main() {
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("sfeos-rs API running on http://localhost:3000");
+    println!("stac-os-rs API running on http://localhost:3000");
     if enable_transactions {
         println!("Transaction extension ENABLED (ENABLE_TRANSACTIONS_EXTENSIONS)");
     }

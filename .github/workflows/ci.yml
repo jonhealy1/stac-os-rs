@@ -95,7 +95,7 @@ jobs:
         run: |
           ENABLE_TRANSACTIONS_EXTENSIONS=true \
           OPENSEARCH_URL=${{ env.OPENSEARCH_URL }} \
-            ./target/release/sfeos-rs &
+            ./target/release/stac-os-rs &
           timeout 30 bash -c 'until curl -sf http://localhost:3000/ > /dev/null; do sleep 1; done'
 
       - name: Seed sample data

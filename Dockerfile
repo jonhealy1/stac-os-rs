@@ -24,9 +24,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 stac
 
-COPY --from=builder /app/target/release/sfeos-rs /usr/local/bin/
+COPY --from=builder /app/target/release/stac-os-rs /usr/local/bin/
 
 USER stac
 EXPOSE 3000
 ENV OPENSEARCH_URL=http://opensearch:9200
-CMD ["sfeos-rs"]
+CMD ["stac-os-rs"]

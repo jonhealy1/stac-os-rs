@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use sfeos_rs::{
+use stac_os_rs::{
     build_app,
     handlers::AppState,
     links::LinkEngine,

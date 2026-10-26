@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    container_name: sfeos-api
+    container_name: stac-os-api
     ports:
       - "3000:3000"
     environment:
@@ -13,9 +13,9 @@ services:
 
   opensearch:
     image: opensearchproject/opensearch:3.8.0
-    container_name: sfeos-opensearch
+    container_name: stac-os-opensearch
     environment:
-      - cluster.name=sfeos-cluster
+      - cluster.name=stac-os-cluster
       - node.name=opensearch-node1
       - discovery.type=single-node
       - bootstrap.memory_lock=true
@@ -41,7 +41,7 @@ services:
 
   dashboards:
     image: opensearchproject/opensearch-dashboards:3.8.0
-    container_name: sfeos-opensearch-dashboards
+    container_name: stac-os-opensearch-dashboards
     ports:
       - "5601:5601"
     environment:

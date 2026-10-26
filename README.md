@@ -1,4 +1,4 @@
-# sfeos-rs
+# stac-os-rs
 
 ![StacLabs](https://github.com/StacLabs/.github/raw/main/profile/staclabs-orange-banner.png)
 
@@ -140,16 +140,16 @@ Or use the **Makefile**, which handles the Docker dependency for you (`make test
 
 ## Extending (custom routes)
 
-`sfeos-rs` is usable as a library — the router is composable axum, so consumers merge their own extension routes sharing the same `AppState` (store, link engine, config). Three seams:
+`stac-os-rs` is usable as a library — the router is composable axum, so consumers merge their own extension routes sharing the same `AppState` (store, link engine, config). Three seams:
 
-- `sfeos_rs::read_router()` / `sfeos_rs::transaction_router()` — mount selectively (e.g. transactions behind auth middleware), or `build_app(state)` for the whole surface
+- `stac_os_rs::read_router()` / `stac_os_rs::transaction_router()` — mount selectively (e.g. transactions behind auth middleware), or `build_app(state)` for the whole surface
 - `handlers::AppState` fields are public — your handlers can take `State<Arc<AppState>>` and call `state.store.*` directly
 - Standard axum composition: `.merge()` extra routes, `.layer()` middleware
 
 ```rust
 use axum::{extract::State, routing::get, Json, Router};
 use serde_json::json;
-use sfeos_rs::{handlers::AppState, read_router, store::ROOT_CATALOG_ID};
+use stac_os_rs::{handlers::AppState, read_router, store::ROOT_CATALOG_ID};
 use std::sync::Arc;
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

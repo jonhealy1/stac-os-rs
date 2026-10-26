@@ -9,7 +9,7 @@ mod common;
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{json, Value};
-use sfeos_rs::build_app;
+use stac_os_rs::build_app;
 
 /// Local variant — the shared `item()` sets `collection`; these tests
 /// rely on the handler auto-filling it from the path.

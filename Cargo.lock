@@ -2481,25 +2481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sfeos-rs"
-version = "0.1.0"
-dependencies = [
- "axum",
- "opensearch",
- "serde",
- "serde_json",
- "stac",
- "stac-api",
- "thiserror 2.0.21",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2671,6 +2652,25 @@ checksum = "06ada3595f5c00e6ea5782fc5e3070c5d63cb43bd0d9cc1d604fe28b78db5f1d"
 dependencies = [
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "stac-os-rs"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "opensearch",
+ "serde",
+ "serde_json",
+ "stac",
+ "stac-api",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
