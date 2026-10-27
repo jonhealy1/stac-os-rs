@@ -138,6 +138,8 @@ Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (
 
 Or use the **Makefile**, which handles the Docker dependency for you (`make test` / `make test-integration` start OpenSearch and wait for it to be healthy before running tests): `make up`, `make test`, `make test-integration`, `make ingest`, `make reset` (wipes data volumes), `make down`.
 
+**Spec conformance:** `make validate` runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (`pip install stac-api-validator` first) — needs the API running with `make up` and data via `make ingest`. Checks core, item-search, features, and browseable classes.
+
 ## Extending (custom routes)
 
 `stac-os-rs` is usable as a library — the router is composable axum, so consumers merge their own extension routes sharing the same `AppState` (store, link engine, config). Three seams:

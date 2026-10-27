@@ -2,7 +2,7 @@ OPENSEARCH_URL ?= http://localhost:9200
 STAC_API_URL ?= http://localhost:3000
 COMPOSE := docker compose
 
-.PHONY: up down reset opensearch test test-integration test-unit test-clean ingest check fmt
+.PHONY: up down reset opensearch test test-integration test-unit test-clean ingest validate check fmt
 
 up: ## Start the full stack (api + opensearch + dashboards)
 	$(COMPOSE) up -d --build --wait
@@ -37,6 +37,17 @@ test-clean: ## Delete leftover it-* test indices without running tests
 
 ingest: ## Load sample_data into the running API
 	STAC_API_URL=$(STAC_API_URL) python3 scripts/ingest_sample_data.py
+
+# Needs: API on :3000 + sample data ingested + `pip install stac-api-validator`
+validate: ## Run stac-api-validator (core, item-search, features, browseable)
+	stac-api-validator \
+		--root-url $(STAC_API_URL) \
+		--conformance core \
+		--conformance item-search \
+		--conformance features \
+		--conformance browseable \
+		--collection landsat-c2-l2 \
+		--geometry '{"type":"Polygon","coordinates":[[[-123,36],[-119,36],[-119,39],[-123,39],[-123,36]]]}'
 
 check: ## cargo fmt check + clippy + test-compile
 	cargo fmt --check
