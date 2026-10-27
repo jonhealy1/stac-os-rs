@@ -247,8 +247,13 @@ async fn test_search_bbox_datetime_intersects_ids() {
     let mut out_item = item(&outside);
     out_item["geometry"] = json!({"type": "Point", "coordinates": [-70.0, 42.0]});
     out_item["properties"]["datetime"] = json!("2023-08-01T00:00:00Z");
+    // dateline: Fiji-area point — inside antimeridian-crossing bboxes only
+    let dateline = uniq("it-geo-dl");
+    let mut dl_item = item(&dateline);
+    dl_item["geometry"] = json!({"type": "Point", "coordinates": [178.0, -18.0]});
+    dl_item["properties"]["datetime"] = json!("2023-06-20T00:00:00Z");
 
-    for it in [in_item, out_item] {
+    for it in [in_item, out_item, dl_item] {
         let (s, _) = call(
             &app,
             "POST",
@@ -271,24 +276,48 @@ async fn test_search_bbox_datetime_intersects_ids() {
     assert_eq!(body["numberMatched"], 1);
     assert_eq!(body["features"][0]["id"], inside);
 
-    // bbox covering both
+    // bbox covering everything
     let (_, body) = search(json!({"bbox": [-180.0, -90.0, 180.0, 90.0]})).await;
-    assert_eq!(body["numberMatched"], 2);
+    assert_eq!(body["numberMatched"], 3);
 
     // datetime interval and instant (full RFC3339 — the crate rejects
     // date-only bounds in valid())
-    let (_, body) = search(json!({"datetime": "2023-06-01T00:00:00Z/2023-07-01T00:00:00Z"})).await;
+    let (_, body) = search(json!({"datetime": "2023-06-01T00:00:00Z/2023-06-16T00:00:00Z"})).await;
     assert_eq!(body["numberMatched"], 1);
     assert_eq!(body["features"][0]["id"], inside);
     let (_, body) = search(json!({"datetime": "2023-08-01T00:00:00Z"})).await;
     assert_eq!(body["numberMatched"], 1);
     assert_eq!(body["features"][0]["id"], outside);
 
-    // intersects geometry
+    // intersects: Point geometry
     let (_, body) =
         search(json!({"intersects": {"type": "Point", "coordinates": [-122.0, 37.5]}})).await;
     assert_eq!(body["numberMatched"], 1);
     assert_eq!(body["features"][0]["id"], inside);
+
+    // intersects: Polygon covering the SF point only
+    let (_, body) = search(json!({"intersects": {
+        "type": "Polygon",
+        "coordinates": [[[-123.0, 37.0], [-121.0, 37.0], [-121.0, 38.0], [-123.0, 38.0], [-123.0, 37.0]]]
+    }}))
+    .await;
+    assert_eq!(body["numberMatched"], 1);
+    assert_eq!(body["features"][0]["id"], inside);
+
+    // Antimeridian: west > east crosses the dateline — normalized to a
+    // two-piece intersects MultiPolygon before validation. Must catch the
+    // dateline point without sweeping in the Boston point.
+    let (_, body) = search(json!({"bbox": [170.0, -25.0, -170.0, -10.0]})).await;
+    assert_eq!(body["numberMatched"], 1);
+    assert_eq!(body["features"][0]["id"], dateline);
+
+    // Non-crossing Pacific bboxes do hit/miss the dateline point exactly
+    // as the geography dictates — no dateline weirdness leaks in.
+    let (_, body) = search(json!({"bbox": [170.0, -25.0, 179.0, -10.0]})).await;
+    assert_eq!(body["numberMatched"], 1);
+    assert_eq!(body["features"][0]["id"], dateline);
+    let (_, body) = search(json!({"bbox": [-170.0, -25.0, -160.0, -10.0]})).await;
+    assert_eq!(body["numberMatched"], 0);
 
     // ids filter
     let (_, body) = search(json!({"ids": [outside]})).await;

@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use stac::{Catalog, Collection, Item, Link};
+use stac::{Bbox, Catalog, Collection, Item, Link};
 use stac_api::{GetSearch, ItemCollection, Search};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -829,6 +829,32 @@ async fn run_scoped_search(
     scope_id: &str,
     mut search: Search,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Antimeridian: a bbox with west > east means "crosses the dateline"
+    // per spec, but the stac crate's `Bbox::is_valid` rejects it. Rewrite
+    // crossing bboxes as a two-piece `intersects` MultiPolygon split at
+    // ±180 before validation — same semantics, no crate fight.
+    if let Some(Bbox::TwoDimensional([xmin, ymin, xmax, ymax])) = search.items.bbox {
+        if xmin > xmax && ymin <= ymax && search.intersects.is_none() {
+            search.intersects = Some(geojson::Geometry::new(geojson::Value::MultiPolygon(vec![
+                vec![vec![
+                    vec![xmin, ymin],
+                    vec![180.0, ymin],
+                    vec![180.0, ymax],
+                    vec![xmin, ymax],
+                    vec![xmin, ymin],
+                ]],
+                vec![vec![
+                    vec![-180.0, ymin],
+                    vec![xmax, ymin],
+                    vec![xmax, ymax],
+                    vec![-180.0, ymax],
+                    vec![-180.0, ymin],
+                ]],
+            ])));
+            search.items.bbox = None;
+        }
+    }
+
     // Spec-level validation: bbox/intersects mutual exclusion, bbox
     // ordering, and datetime parsing (full RFC3339 — date-only bounds
     // are rejected by the crate).
