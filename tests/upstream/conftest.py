@@ -314,17 +314,65 @@ _INDEX_MAPPINGS = {
 }
 
 
+class _TranslatingOsClient:
+    """Rewrites upstream index names to ours on direct OpenSearch ops.
+
+    Upstream stores catalogs *in* the `collections` index and items in
+    per-collection `items_*` indices; ours are `{prefix}-catalogs` /
+    `{prefix}-collections` / `{prefix}-items`. Reads (`get`) try each
+    candidate; writes use the first. Everything else passes through.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    @staticmethod
+    def _candidates(index):
+        if index == "collections":
+            return (f"{INDEX_PREFIX}-collections", f"{INDEX_PREFIX}-catalogs")
+        if index.startswith("items"):
+            return (f"{INDEX_PREFIX}-items",)
+        for logical in ("catalogs", "hierarchy"):
+            if index == logical:
+                return (f"{INDEX_PREFIX}-{logical}",)
+        return (index,)
+
+    async def get(self, index, id, **kw):
+        candidates = self._candidates(index)
+        for physical in candidates:
+            try:
+                return await self._client.get(index=physical, id=id, **kw)
+            except Exception:
+                if physical == candidates[-1]:
+                    raise
+        raise AssertionError("unreachable")
+
+    async def index(self, index, **kw):
+        return await self._client.index(
+            index=self._candidates(index)[0], **kw
+        )
+
+    async def search(self, index, **kw):
+        translated = ",".join(
+            c for i in index.split(",") for c in self._candidates(i)
+        )
+        return await self._client.search(index=translated, **kw)
+
+    def __getattr__(self, attr):
+        return getattr(self._client, attr)
+
+
 class _HttpDatabase:
     """Stand-in for sfeos DatabaseLogic.
 
-    `.client` is a real AsyncOpenSearch pointed at our cluster so
-    `refresh_indices` and direct index ops work. delete_* drop and recreate
-    OUR index set (clears docs AND stale mappings); anything else skips the
-    calling test.
+    `.client` is an AsyncOpenSearch wrapper that translates upstream index
+    names to ours, so `refresh_indices` and direct index ops work.
+    delete_* drop and recreate OUR index set (clears docs AND stale
+    mappings); anything else skips the calling test.
     """
 
     def __init__(self, os_client):
-        self.client = os_client
+        self.client = _TranslatingOsClient(os_client)
         self.async_index_selector = _IndexSelector()
         self.async_index_inserter = _SkipProxy("database.async_index_inserter")
 
@@ -481,7 +529,10 @@ async def catalogs_app_client():
 
 
 def _skip_fixture(name: str):
-    @pytest.fixture(name=name)
+    # Session scope: upstream test files define session-scoped fixtures
+    # that depend on `app` — a function scope would ScopeMismatch at
+    # resolution time (error) before this skip could fire.
+    @pytest.fixture(name=name, scope="session")
     def _f():
         pytest.skip(f"fixture '{name}' needs an in-process sfeos app")
 
