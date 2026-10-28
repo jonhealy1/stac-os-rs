@@ -69,6 +69,8 @@ pub struct ListQuery {
     pub token: Option<String>,
     /// Sort extension (features binding): `?sortby=+field,-field`.
     pub sortby: Option<String>,
+    /// Fields extension (features binding): `?fields=+include,-exclude`.
+    pub fields: Option<String>,
 }
 
 /// Resolve `?limit=&token=` into `(limit, offset)`. `limit=0` is a 400;
@@ -419,6 +421,8 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
         "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/sortables",
         "https://api.stacspec.org/v1.0.0/item-search",
+        "https://api.stacspec.org/v1.0.0/item-search#fields",
+        "https://api.stacspec.org/v1.0.0/ogcapi-features#fields",
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
         "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
@@ -650,6 +654,7 @@ pub async fn get_catalog_children(
         limit: query.limit,
         token: query.token.clone(),
         sortby: None,
+        fields: None,
     })?;
     let kind = parse_kind(query.r#type.as_deref());
     let nodes = state.store.get_child_nodes(&catalog_id, kind).await?;
@@ -925,6 +930,12 @@ async fn run_scoped_search(
             );
         }
     }
+    // Fields extension runs last — it strips generated links too.
+    if let Some(fields) = &search.items.fields {
+        for item in items.iter_mut() {
+            crate::store::filter_fields(item, &fields.include, &fields.exclude);
+        }
+    }
     let returned = items.len() as u64;
     let mut collection =
         ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -973,12 +984,31 @@ fn page_link(rel: &str, href: &str, search: &Search, offset: u64) -> Link {
     link
 }
 
+/// POST /search body. The stac-api crate's `Fields` requires both `include`
+/// and `exclude` members; the extension spec (and upstream) defaults each
+/// side to empty — normalize missing members before deserializing.
+pub struct SearchBody(pub Search);
+
+impl<'de> serde::Deserialize<'de> for SearchBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(fields) = value.get_mut("fields").and_then(|f| f.as_object_mut()) {
+            fields.entry("include").or_insert_with(|| json!([]));
+            fields.entry("exclude").or_insert_with(|| json!([]));
+        }
+        serde_json::from_value::<Search>(value)
+            .map(Self)
+            .map_err(D::Error::custom)
+    }
+}
+
 pub async fn scoped_search_post(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    StacJson(search): StacJson<Search>,
+    StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    run_scoped_search(&state, &catalog_id, search).await
+    run_scoped_search(&state, &catalog_id, search.0).await
 }
 
 pub async fn scoped_search_get(
@@ -994,9 +1024,9 @@ pub async fn scoped_search_get(
 /// `root`, since every orphan is adopted there.
 pub async fn catalogs_search_post(
     State(state): State<Arc<AppState>>,
-    StacJson(search): StacJson<Search>,
+    StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    run_scoped_search(&state, ROOT_CATALOG_ID, search).await
+    run_scoped_search(&state, ROOT_CATALOG_ID, search.0).await
 }
 
 pub async fn catalogs_search_get(
@@ -1521,6 +1551,9 @@ async fn items_page(
             .map(|s| s.parse().expect("infallible"))
             .collect();
     }
+    if let Some(fields) = &query.fields {
+        search.items.fields = Some(fields.parse().expect("infallible"));
+    }
     let (mut items, matched) = state.store.search_items(collections, &search).await?;
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
@@ -1529,6 +1562,12 @@ async fn items_page(
                 "links".to_string(),
                 json!(item_links(state, &item_id, &col, scoped_catalog_id)),
             );
+        }
+    }
+    // Fields extension runs last — it strips generated links too.
+    if let Some(fields) = &search.items.fields {
+        for item in items.iter_mut() {
+            crate::store::filter_fields(item, &fields.include, &fields.exclude);
         }
     }
     let returned = items.len() as u64;

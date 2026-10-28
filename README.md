@@ -42,11 +42,11 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
-| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset` → `next`/`prev` links |
+| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields` → `next`/`prev` links |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry |
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
-| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
+| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
 | GET | `/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 
 **Multi-tenant catalogs routes**
@@ -60,12 +60,14 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging |
 | GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}` | Contextual `self`/`parent`, alt parents as `related`/`duplicate` |
-| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `application/geo+json`, scoped item links |
+| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, scoped item links |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 | GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search` |
 | GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections |
 
-GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand) as query params; POST takes the full `Search` body (`intersects` included). `fields`, `query`, and CQL2 `filter` are parsed but not yet applied.
+GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes) as query params; POST takes the full `Search` body (`intersects` and `fields: {include, exclude}` object included). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query. `query` and CQL2 `filter` are parsed but not yet applied.
+
+`fields` implements the [Fields extension](https://github.com/stac-api-extensions/fields): include/exclude with nested paths (`properties.datetime`) and `*` wildcards (`properties.eo:*`); when an include selection matches nothing, items fall back to `{id, collection}` per spec.
 
 ### Transactions — require `ENABLE_TRANSACTIONS_EXTENSIONS`
 
@@ -136,7 +138,7 @@ Config via env vars: `OPENSEARCH_URL` (default `http://localhost:9200`), `ENABLE
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 
-Or use the **Makefile**, which handles the Docker dependency for you (`make test` / `make test-integration` start OpenSearch and wait for it to be healthy before running tests): `make up`, `make test`, `make test-integration`, `make ingest`, `make reset` (wipes data volumes), `make down`.
+Or use the **Makefile**, which handles the Docker dependency for you (`make test` / `make test-integration` start OpenSearch and wait for it to be healthy before running tests): `make up`, `make test`, `make test-integration`, `make test-upstream` (vendored upstream API suite against `localhost:3000`), `make ingest`, `make reset` (wipes data volumes), `make down`.
 
 **Spec conformance:** `make validate` runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (`pip install stac-api-validator` first) — needs the API running with `make up` and data via `make ingest`. Checks core, item-search, features, and browseable classes.
 
@@ -195,7 +197,7 @@ Then try scoped search: `POST /catalogs/earth-observation/search` returns its 4 
 This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Search**
-- `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, and `limit` are translated to OpenSearch queries — `fields` and `query` are parsed but ignored
+- `collections`, `ids`, `bbox` (incl. antimeridian crossing), `intersects`, `datetime`, `sortby`, `limit`, and `fields` are applied — `query` and CQL2 `filter` are parsed but ignored
 - `sortby` works on `/search` + `/catalogs/*/search` (item-search binding) and on items listings `?sortby=±field` (features binding); sortables at `/sortables` + `/collections/{id}/sortables`
 - `datetime` bounds must be full RFC3339 datetimes — date-only inputs (`2023-06-01`) are rejected at validation
 - No CQL2 / filter extension support
@@ -218,4 +220,4 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Concurrency** — all writes use optimistic concurrency via OpenSearch `_seq_no`/`_primary_term`: document PUTs re-stamp and retry up to 5 times (`Store::replace_document`/`put_document`), hierarchy link/unlink replay the edge mutation on a fresh read (`Store::mutate_node`), and POSTs use `op_type=create` for atomic repost-409s. Exhausted retries surface as HTTP 409.
 
-**Tests** — `tests/catalogs.rs` ports `stac-fastapi-elasticsearch-opensearch`'s `test_catalogs.py` (118 passing, 2 `#[ignore]`d pending: `stac-validate`, user-link merge semantics). CI also runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (core, item-search, features, browseable — all passing) as an advisory job. Each test gets isolated `it-*` indices (unique `Store` index prefix), so tests never touch dev data — `make test*` sweeps `it-*` afterwards, or `make test-clean` manually.
+**Tests** — `tests/catalogs.rs` ports `stac-fastapi-elasticsearch-opensearch`'s `test_catalogs.py` (118 passing, 2 `#[ignore]`d pending: `stac-validate`, user-link merge semantics). `tests/upstream/` vendors upstream's Python API suite verbatim — `make test-upstream` runs it over HTTP against `localhost:3000` (needs the API up with `ENABLE_TRANSACTIONS_EXTENSIONS`; adapter conftest skips tests needing in-process sfeos internals). CI also runs [`stac-api-validator`](https://github.com/stac-utils/stac-api-validator) (core, item-search, features, browseable — all passing) as an advisory job. Each test gets isolated `it-*` indices (unique `Store` index prefix), so tests never touch dev data — `make test*` sweeps `it-*` afterwards, or `make test-clean` manually.

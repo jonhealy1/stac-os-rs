@@ -837,6 +837,182 @@ impl Store {
     }
 }
 
+/// Fields extension (item-search#fields / ogcapi-features#fields): apply
+/// include/exclude to a returned document, ported from upstream sfeos
+/// `filter_fields`. `*` in a path segment is a glob within one key name.
+/// Include runs first; excludes then apply to the included result. When the
+/// include set produces an empty document only the identity keys
+/// (`id`, `collection`) are returned.
+pub fn filter_fields(
+    item: &mut serde_json::Map<String, Value>,
+    include: &[String],
+    exclude: &[String],
+) {
+    if include.is_empty() && exclude.is_empty() {
+        return;
+    }
+    let mut clean = if include.is_empty() {
+        item.clone()
+    } else {
+        include_fields(item, include)
+    };
+    if clean.is_empty() {
+        for key in ["id", "collection"] {
+            if let Some(v) = item.get(key) {
+                clean.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    exclude_fields(&mut clean, exclude);
+    *item = clean;
+}
+
+/// One `*` wildcard segment matched against a single key name (any chars).
+fn segment_match(pattern: &str, key: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let (p, s) = (pattern.as_bytes(), key.as_bytes());
+    let (mut pi, mut si, mut star, mut ss) = (0usize, 0usize, usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && p[pi] == s[si] {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            ss = si;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            ss += 1;
+            si = ss;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Deep-merge `from` into `to` (nested objects union, scalars overwrite).
+fn deep_merge(to: &mut serde_json::Map<String, Value>, from: serde_json::Map<String, Value>) {
+    for (k, v) in from {
+        match (to.get_mut(&k), v) {
+            (Some(Value::Object(t)), Value::Object(f)) => deep_merge(t, f),
+            (_, v) => {
+                to.insert(k, v);
+            }
+        }
+    }
+}
+
+fn include_fields(
+    source: &serde_json::Map<String, Value>,
+    fields: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut clean = serde_json::Map::new();
+    for key_path in fields {
+        if key_path.contains('*') {
+            let parts: Vec<&str> = key_path.split('.').collect();
+            let value = recursive_include(source, &parts);
+            deep_merge(&mut clean, value);
+            continue;
+        }
+        let parts: Vec<&str> = key_path.split('.').collect();
+        let root = parts[0];
+        if let Some(val) = source.get(root) {
+            if val.is_object() && parts.len() > 1 {
+                let sub = include_fields(val.as_object().unwrap(), &[parts[1..].join(".")]);
+                match clean.get_mut(root) {
+                    Some(Value::Object(existing)) => deep_merge(existing, sub),
+                    _ => {
+                        clean.insert(root.to_string(), Value::Object(sub));
+                    }
+                }
+            } else {
+                clean.insert(root.to_string(), val.clone());
+            }
+        }
+    }
+    clean
+}
+
+fn recursive_include(
+    source: &serde_json::Map<String, Value>,
+    parts: &[&str],
+) -> serde_json::Map<String, Value> {
+    if parts.is_empty() {
+        return source.clone();
+    }
+    let mut result = serde_json::Map::new();
+    for (key, val) in source {
+        if !segment_match(parts[0], key) {
+            continue;
+        }
+        if parts.len() > 1 {
+            if let Value::Object(inner) = val {
+                let sub = recursive_include(inner, &parts[1..]);
+                if !sub.is_empty() {
+                    result.insert(key.clone(), Value::Object(sub));
+                }
+            }
+        } else {
+            result.insert(key.clone(), val.clone());
+        }
+    }
+    result
+}
+
+fn exclude_fields(source: &mut serde_json::Map<String, Value>, fields: &[String]) {
+    for key_path in fields {
+        let parts: Vec<&str> = key_path.split('.').collect();
+        if key_path.contains('*') {
+            recursive_exclude(source, &parts);
+            continue;
+        }
+        let root = parts[0];
+        let mut prune = false;
+        if let Some(val) = source.get_mut(root) {
+            if val.is_object() && parts.len() > 1 {
+                exclude_fields(val.as_object_mut().unwrap(), &[parts[1..].join(".")]);
+                prune = val.as_object().map(|o| o.is_empty()).unwrap_or(false);
+            } else {
+                source.remove(root);
+            }
+        }
+        if prune {
+            source.remove(root);
+        }
+    }
+}
+
+fn recursive_exclude(source: &mut serde_json::Map<String, Value>, parts: &[&str]) {
+    if parts.is_empty() {
+        return;
+    }
+    let keys: Vec<String> = source
+        .keys()
+        .filter(|k| segment_match(parts[0], k))
+        .cloned()
+        .collect();
+    for key in keys {
+        if parts.len() > 1 {
+            let mut prune = false;
+            if let Some(Value::Object(inner)) = source.get_mut(&key) {
+                recursive_exclude(inner, &parts[1..]);
+                prune = inner.is_empty();
+            }
+            if prune {
+                source.remove(&key);
+            }
+        } else {
+            source.remove(&key);
+        }
+    }
+}
+
 /// sortby field -> document field. Top-level item fields pass through;
 /// anything else is a `properties.*` member (bare `datetime` included).
 fn sort_field(field: &str) -> String {
@@ -969,6 +1145,94 @@ mod tests {
         let mut parents = vec!["a".to_string(), "b".to_string()];
         apply_unlink(&mut parents, "a");
         assert_eq!(parents, vec!["b"]);
+    }
+
+    #[test]
+    fn test_filter_fields_include_single_property() {
+        let mut item = serde_json::Map::from_iter([
+            ("id".to_string(), json!("i1")),
+            ("collection".to_string(), json!("c1")),
+            (
+                "properties".to_string(),
+                json!({"datetime": "d", "other": "x"}),
+            ),
+            ("links".to_string(), json!([])),
+        ]);
+        filter_fields(&mut item, &["properties.datetime".to_string()], &[]);
+        assert_eq!(
+            item["properties"],
+            json!({"datetime": "d"}),
+            "include keeps only the named leaf"
+        );
+    }
+
+    #[test]
+    fn test_filter_fields_include_miss_returns_identity() {
+        let mut item = serde_json::Map::from_iter([
+            ("id".to_string(), json!("i1")),
+            ("collection".to_string(), json!("c1")),
+            ("properties".to_string(), json!({"datetime": "d"})),
+        ]);
+        filter_fields(&mut item, &["doesnotexist".to_string()], &[]);
+        assert_eq!(item.len(), 2);
+        assert_eq!(item["id"], "i1");
+        assert_eq!(item["collection"], "c1");
+    }
+
+    #[test]
+    fn test_filter_fields_wildcard_include() {
+        let mut item = serde_json::Map::from_iter([(
+            "properties".to_string(),
+            json!({"proj:centroid": {"lat": 1.0, "lon": 2.0}, "other": "x"}),
+        )]);
+        filter_fields(&mut item, &["properties.*.lat".to_string()], &[]);
+        assert_eq!(item["properties"], json!({"proj:centroid": {"lat": 1.0}}));
+    }
+
+    #[test]
+    fn test_filter_fields_exclude_after_include() {
+        let mut item = serde_json::Map::from_iter([(
+            "properties".to_string(),
+            json!({"a": {"lat": 1.0, "x": 1}, "b": {"lat": 2.0}}),
+        )]);
+        filter_fields(
+            &mut item,
+            &["properties.*.lat".to_string()],
+            &["properties.*.lat".to_string()],
+        );
+        assert_eq!(
+            item.len(),
+            0,
+            "exclude wins over include — empty parents prune"
+        );
+    }
+
+    #[test]
+    fn test_filter_fields_exclude_whole_object() {
+        let mut item = serde_json::Map::from_iter([
+            ("id".to_string(), json!("i1")),
+            ("properties".to_string(), json!({"datetime": "d"})),
+        ]);
+        filter_fields(&mut item, &[], &["properties".to_string()]);
+        assert!(!item.contains_key("properties"));
+        assert_eq!(item["id"], "i1");
+    }
+
+    #[test]
+    fn test_filter_fields_noop() {
+        let mut item = serde_json::Map::from_iter([("id".to_string(), json!("i1"))]);
+        filter_fields(&mut item, &[], &[]);
+        assert_eq!(item["id"], "i1");
+    }
+
+    #[test]
+    fn test_segment_match_glob() {
+        assert!(segment_match("*", "anything"));
+        assert!(segment_match("proj:*", "proj:epsg"));
+        assert!(segment_match("*centroid*", "proj:centroid"));
+        assert!(!segment_match("lat", "latitude"));
+        assert!(segment_match("a*z", "abz"));
+        assert!(!segment_match("a*z", "ab"));
     }
 
     #[test]
