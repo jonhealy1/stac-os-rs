@@ -423,6 +423,16 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.0.0/item-search",
         "https://api.stacspec.org/v1.0.0/item-search#fields",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#fields",
+        "https://api.stacspec.org/v1.0.0/item-search#query",
+        "https://api.stacspec.org/v1.0.0/ogcapi-features#query",
+        "https://api.stacspec.org/v1.0.0-rc.2/item-search#filter",
+        "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
+        "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/features-filter",
+        "http://www.opengis.net/spec/cql2/1.0/conf/cql2-json",
+        "http://www.opengis.net/spec/cql2/1.0/conf/cql2-text",
+        "http://www.opengis.net/spec/cql2/1.0/conf/basic-cql2",
+        "http://www.opengis.net/spec/cql2/1.0/conf/advanced-comparison-operators",
+        "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions",
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
         "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
@@ -915,9 +925,18 @@ async fn run_scoped_search(
     }
 
     // 3. Query OpenSearch — collections scope + bbox/datetime/intersects/ids
+    // + the `query` (STACQL) and `filter` (CQL2) extensions, translated
+    // to extra filter clauses (malformed expressions are a 400).
+    let mut extra_filters = Vec::new();
+    if let Some(query) = &search.items.query {
+        extra_filters.extend(crate::store::stacql_clauses(query).map_err(ApiError::BadRequest)?);
+    }
+    if let Some(filter) = &search.items.filter {
+        extra_filters.push(crate::store::cql2_clause(filter).map_err(ApiError::BadRequest)?);
+    }
     let (mut items, matched) = state
         .store
-        .search_items(&search.collections, &search)
+        .search_items(&search.collections, &search, extra_filters)
         .await?;
     let base = &state.base_url;
     let link_scope = (scope_id != ROOT_CATALOG_ID).then_some(scope_id);
@@ -996,6 +1015,11 @@ impl<'de> serde::Deserialize<'de> for SearchBody {
         if let Some(fields) = value.get_mut("fields").and_then(|f| f.as_object_mut()) {
             fields.entry("include").or_insert_with(|| json!([]));
             fields.entry("exclude").or_insert_with(|| json!([]));
+        }
+        // `filter` without `filter-lang` defaults to cql2-json per spec;
+        // the crate's Filter is adjacently tagged and requires it.
+        if value.get("filter").is_some() && value.get("filter-lang").is_none() {
+            value["filter-lang"] = json!("cql2-json");
         }
         serde_json::from_value::<Search>(value)
             .map(Self)
@@ -1554,7 +1578,10 @@ async fn items_page(
     if let Some(fields) = &query.fields {
         search.items.fields = Some(fields.parse().expect("infallible"));
     }
-    let (mut items, matched) = state.store.search_items(collections, &search).await?;
+    let (mut items, matched) = state
+        .store
+        .search_items(collections, &search, Vec::new())
+        .await?;
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
         if let Some(col) = item["collection"].as_str().map(str::to_owned) {

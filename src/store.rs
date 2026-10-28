@@ -687,12 +687,15 @@ impl Store {
     /// Returns (item docs, total_matched) — sources pass through verbatim
     /// since ItemCollection supports the fields extension.
     /// Translates collections/ids/bbox/intersects/datetime/limit plus
-    /// `offset` (unmodeled, arrives via `additional_fields`); sortby,
-    /// fields and cursor/deep pagination remain future work.
+    /// `offset` (unmodeled, arrives via `additional_fields`); `extra_filters`
+    /// carries caller-built clauses (`query`/`filter` extensions — see
+    /// [`stacql_clauses`]/[`cql2_clause`]). Cursor/deep pagination remains
+    /// future work.
     pub async fn search_items(
         &self,
         collections: &[String],
         search: &Search,
+        extra_filters: Vec<Value>,
     ) -> Result<(Vec<Map<String, Value>>, u64), opensearch::Error> {
         let limit = search
             .items
@@ -729,7 +732,7 @@ impl Store {
             .sortby
             .iter()
             .map(|s| {
-                json!({sort_field(s.field.trim()): {
+                json!({item_field(s.field.trim()): {
                     "order": s.direction,
                     "missing": "_last",
                     "unmapped_type": "keyword"
@@ -739,6 +742,8 @@ impl Store {
         if !sort.is_empty() {
             sort.push(json!({"_id": {"order": "asc"}}));
         }
+
+        filter.extend(extra_filters);
 
         let index = self.idx(ITEMS_INDEX);
         let mut body = json!({
@@ -1013,9 +1018,11 @@ fn recursive_exclude(source: &mut serde_json::Map<String, Value>, parts: &[&str]
     }
 }
 
-/// sortby field -> document field. Top-level item fields pass through;
+/// Field name -> document field. Well-known top-level item fields pass
+/// through, as does any dotted path (`properties.x`, `assets.x`);
 /// anything else is a `properties.*` member (bare `datetime` included).
-fn sort_field(field: &str) -> String {
+/// Shared by `sortby`, `query`, and `filter` field resolution.
+fn item_field(field: &str) -> String {
     match field {
         "id" | "collection" | "bbox" | "geometry" | "type" => field.to_string(),
         f if f.contains('.') => f.to_string(),
@@ -1094,6 +1101,209 @@ fn datetime_filter(datetime: &str) -> Value {
         {"range": {"properties.datetime": instant_range}},
         {"bool": {"filter": ranged}}
     ], "minimum_should_match": 1}})
+}
+
+/// STAC `query` extension -> OpenSearch filter clauses.
+/// `{"eo:cloud_cover": {"lt": 10}}` — bare names resolve under
+/// `properties.*` (same mapping upstream applies), `eq`/`ne`/`neq`/
+/// `gt`/`gte`/`lt`/`lte`/`in`/`contains` operators supported.
+pub fn stacql_clauses(query: &Map<String, Value>) -> Result<Vec<Value>, String> {
+    let mut clauses = Vec::new();
+    for (name, expr) in query {
+        let ops = expr
+            .as_object()
+            .ok_or_else(|| format!("query.{name} must be an object of operators"))?;
+        let field = item_field(name);
+        for (op, value) in ops {
+            clauses.push(stacql_clause(&field, op, value)?);
+        }
+    }
+    Ok(clauses)
+}
+
+fn stacql_clause(field: &str, op: &str, value: &Value) -> Result<Value, String> {
+    Ok(match op {
+        "eq" | "contains" => json!({"term": {field: value}}),
+        "ne" | "neq" => json!({"bool": {"must_not": [{"term": {field: value}}]}}),
+        "gt" | "gte" | "lt" | "lte" => json!({"range": {field: {op: value}}}),
+        "in" => match value {
+            Value::Array(_) => json!({"terms": {field: value}}),
+            _ => json!({"term": {field: value}}),
+        },
+        other => return Err(format!("unsupported query operator '{other}'")),
+    })
+}
+
+/// CQL2 `filter` (json or text form) -> an OpenSearch clause.
+/// Covers basic-cql2 (comparisons, and/or/not, IS NULL), advanced
+/// comparisons (LIKE, BETWEEN, IN) and the basic spatial predicates;
+/// anything else is a 400 via the caller.
+pub fn cql2_clause(filter: &stac_api::Filter) -> Result<Value, String> {
+    let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| e.to_string())?;
+    expr_clause(&expr)
+}
+
+fn expr_clause(expr: &cql2::Expr) -> Result<Value, String> {
+    use cql2::Expr;
+    match expr {
+        Expr::Bool(true) => Ok(json!({"match_all": {}})),
+        Expr::Bool(false) => Ok(json!({"match_none": {}})),
+        Expr::Operation { op, args } => match op.as_str() {
+            "and" | "or" => {
+                let clauses = args
+                    .iter()
+                    .map(|a| expr_clause(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(if op == "and" {
+                    json!({"bool": {"filter": clauses}})
+                } else {
+                    json!({"bool": {"should": clauses, "minimum_should_match": 1}})
+                })
+            }
+            "not" => {
+                let [a] = args.as_slice() else {
+                    return Err("'not' expects one operand".into());
+                };
+                Ok(json!({"bool": {"must_not": [expr_clause(a)?]}}))
+            }
+            "=" | "<>" | "<" | "<=" | ">" | ">=" => comparison_clause(op, args),
+            "in" => in_clause(args),
+            "between" => between_clause(args),
+            "like" => like_clause(args),
+            "isNull" => {
+                let [arg] = args.as_slice() else {
+                    return Err("isNull expects a single property".into());
+                };
+                let Expr::Property { property } = arg.as_ref() else {
+                    return Err("isNull expects a property operand".into());
+                };
+                let field = item_field(property);
+                Ok(json!({"bool": {"must_not": [{"exists": {"field": field}}]}}))
+            }
+            "s_intersects" | "s_within" | "s_contains" | "s_disjoint" => spatial_clause(op, args),
+            other => Err(format!("unsupported cql2 operator '{other}'")),
+        },
+        _ => Err("unsupported cql2 expression".into()),
+    }
+}
+
+fn two_args<'a>(
+    op: &str,
+    args: &'a [Box<cql2::Expr>],
+) -> Result<(&'a cql2::Expr, &'a cql2::Expr), String> {
+    match args {
+        [a, b] => Ok((a, b)),
+        _ => Err(format!("'{op}' expects two operands")),
+    }
+}
+
+fn comparison_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+    use cql2::Expr;
+    let (a, b) = two_args(op, args)?;
+    // The property operand may sit on either side of the literal.
+    let (property, lit, flip) = match (a, b) {
+        (Expr::Property { property }, lit) => (property, lit, false),
+        (lit, Expr::Property { property }) => (property, lit, true),
+        _ => return Err(format!("'{op}' expects a property operand")),
+    };
+    let op = match (op, flip) {
+        ("<", true) => ">",
+        ("<=", true) => ">=",
+        (">", true) => "<",
+        (">=", true) => "<=",
+        (same, _) => same,
+    };
+    let field = item_field(property);
+    let value = literal_value(lit)?;
+    Ok(match op {
+        "=" => json!({"term": {field: value}}),
+        "<>" => json!({"bool": {"must_not": [{"term": {field: value}}]}}),
+        "<" => json!({"range": {field: {"lt": value}}}),
+        "<=" => json!({"range": {field: {"lte": value}}}),
+        ">" => json!({"range": {field: {"gt": value}}}),
+        ">=" => json!({"range": {field: {"gte": value}}}),
+        _ => unreachable!(),
+    })
+}
+
+fn in_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+    let (a, b) = two_args("in", args)?;
+    let (cql2::Expr::Property { property }, cql2::Expr::Array(values)) = (a, b) else {
+        return Err("'in' expects a property and an array".into());
+    };
+    let field = item_field(property);
+    let values = values
+        .iter()
+        .map(|v| literal_value(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"terms": {field: values}}))
+}
+
+fn between_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+    // cql2-json encodes between as (scalar, [lo, hi]); accept the
+    // three-operand spelling too.
+    let (prop, lo, hi) = match args {
+        [p, range] => match range.as_ref() {
+            cql2::Expr::Array(b) if b.len() == 2 => (p.as_ref(), &*b[0], &*b[1]),
+            _ => return Err("'between' expects a [lo, hi] array".into()),
+        },
+        [p, lo, hi] => (p.as_ref(), lo.as_ref(), hi.as_ref()),
+        _ => return Err("'between' expects three operands".into()),
+    };
+    let cql2::Expr::Property { property } = prop else {
+        return Err("'between' expects a property first".into());
+    };
+    let field = item_field(property);
+    Ok(json!({"range": {field: {
+        "gte": literal_value(lo)?,
+        "lte": literal_value(hi)?,
+    }}}))
+}
+
+fn like_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+    let (a, b) = two_args("like", args)?;
+    let (cql2::Expr::Property { property }, cql2::Expr::Literal(pattern)) = (a, b) else {
+        return Err("'like' expects a property and a string pattern".into());
+    };
+    // LIKE wildcards -> wildcard-query wildcards; string fields get a
+    // `.keyword` subfield from the default dynamic mapping.
+    let field = format!("{}.keyword", item_field(property));
+    let pattern = pattern.replace('%', "*").replace('_', "?");
+    Ok(json!({"wildcard": {field: {"value": pattern}}}))
+}
+
+fn spatial_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+    let (a, b) = two_args(op, args)?;
+    let (property, geom) = match (a, b) {
+        (cql2::Expr::Property { property }, g) => (property, g),
+        (g, cql2::Expr::Property { property }) => (property, g),
+        _ => return Err(format!("'{op}' expects a property operand")),
+    };
+    let field = item_field(property);
+    let shape = serde_json::to_value(geom).map_err(|e| e.to_string())?;
+    let relation = match op {
+        "s_intersects" => "intersects",
+        "s_within" => "within",
+        "s_contains" => "contains",
+        _ => "disjoint",
+    };
+    Ok(json!({"geo_shape": {field: {"shape": shape, "relation": relation}}}))
+}
+
+fn literal_value(expr: &cql2::Expr) -> Result<Value, String> {
+    use cql2::Expr;
+    match expr {
+        // Integral floats emit as integers so term/range JSON stays tidy
+        // (exact anyway below 2^53 — covers the big-int search cases).
+        Expr::Float(f) if f.fract() == 0.0 && f.abs() <= 9.0e15 => Ok(json!(*f as i64)),
+        Expr::Float(f) => Ok(json!(f)),
+        Expr::Literal(s) => Ok(json!(s)),
+        Expr::Bool(b) => Ok(json!(b)),
+        Expr::Timestamp { timestamp } => literal_value(timestamp),
+        Expr::Date { date } => literal_value(date),
+        Expr::Null => Ok(Value::Null),
+        other => Err(format!("unsupported cql2 literal {other:?}")),
+    }
 }
 
 /// Mode B link semantics on a node's parent list: linking to a real
@@ -1237,11 +1447,11 @@ mod tests {
 
     #[test]
     fn test_sort_field_mapping() {
-        assert_eq!(sort_field("id"), "id");
-        assert_eq!(sort_field("collection"), "collection");
-        assert_eq!(sort_field("datetime"), "properties.datetime");
-        assert_eq!(sort_field("properties.created"), "properties.created");
-        assert_eq!(sort_field("eo:cloud_cover"), "properties.eo:cloud_cover");
+        assert_eq!(item_field("id"), "id");
+        assert_eq!(item_field("collection"), "collection");
+        assert_eq!(item_field("datetime"), "properties.datetime");
+        assert_eq!(item_field("properties.created"), "properties.created");
+        assert_eq!(item_field("eo:cloud_cover"), "properties.eo:cloud_cover");
     }
 
     #[test]
@@ -1254,6 +1464,122 @@ mod tests {
             json!([[-122.6, 38.2], [-120.3, 36.9]])
         );
         assert_eq!(q["geo_shape"]["geometry"]["relation"], "intersects");
+    }
+
+    #[test]
+    fn test_stacql_operators() {
+        let q = serde_json::json!({
+            "proj:epsg": {"gt": 1000},
+            "platform": {"eq": "landsat"},
+            "mission": {"ne": "x"},
+            "id": {"in": ["a", "b"]}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let clauses = stacql_clauses(&q).unwrap();
+        assert!(clauses.contains(&json!({"range": {"properties.proj:epsg": {"gt": 1000}}})));
+        assert!(clauses.contains(&json!({"term": {"properties.platform": "landsat"}})));
+        assert!(clauses
+            .contains(&json!({"bool": {"must_not": [{"term": {"properties.mission": "x"}}]}})));
+        // `id` is a top-level item field — not forced under properties.*
+        assert!(clauses.contains(&json!({"terms": {"id": ["a", "b"]}})));
+    }
+
+    #[test]
+    fn test_stacql_invalid() {
+        // operator expressions must be objects
+        let q = serde_json::json!({"proj:epsg": 5})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(stacql_clauses(&q).is_err());
+        // unknown operators are a 400, not silently ignored
+        let q = serde_json::json!({"proj:epsg": {"approx": 5}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(stacql_clauses(&q).is_err());
+    }
+
+    #[test]
+    fn test_cql2_comparisons_and_logic() {
+        use stac_api::Filter;
+        let filter = Filter::Cql2Json(
+            serde_json::json!({
+                "op": "and", "args": [
+                    {"op": "=", "args": [{"property": "properties.eo:x"}, 42]},
+                    {"op": "or", "args": [
+                        {"op": ">", "args": [{"property": "eo:y"}, 1]},
+                        {"op": "<>", "args": [{"property": "properties.eo:z"}, "v"]}
+                    ]}
+                ]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let clause = cql2_clause(&filter).unwrap();
+        let must = clause["bool"]["filter"].as_array().unwrap();
+        assert_eq!(must[0], json!({"term": {"properties.eo:x": 42}}));
+        let should = must[1]["bool"]["should"].as_array().unwrap();
+        assert_eq!(should[0], json!({"range": {"properties.eo:y": {"gt": 1}}}));
+        assert_eq!(
+            should[1],
+            json!({"bool": {"must_not": [{"term": {"properties.eo:z": "v"}}]}})
+        );
+    }
+
+    #[test]
+    fn test_cql2_between_in_like_isnull() {
+        use stac_api::Filter;
+        let clause = |v: serde_json::Value| {
+            cql2_clause(&Filter::Cql2Json(v.as_object().unwrap().clone())).unwrap()
+        };
+        assert_eq!(
+            clause(json!({"op": "between", "args": [{"property": "eo:x"}, [1, 5]]})),
+            json!({"range": {"properties.eo:x": {"gte": 1, "lte": 5}}})
+        );
+        assert_eq!(
+            clause(json!({"op": "in", "args": [{"property": "collection"}, ["a", "b"]]})),
+            json!({"terms": {"collection": ["a", "b"]}})
+        );
+        assert_eq!(
+            clause(json!({"op": "like", "args": [{"property": "platform"}, "sent%"]})),
+            json!({"wildcard": {"properties.platform.keyword": {"value": "sent*"}}})
+        );
+        assert_eq!(
+            clause(json!({"op": "isNull", "args": [{"property": "eo:x"}]})),
+            json!({"bool": {"must_not": [{"exists": {"field": "properties.eo:x"}}]}})
+        );
+    }
+
+    #[test]
+    fn test_cql2_text_and_spatial() {
+        use stac_api::Filter;
+        // cql2-text form (GET ?filter=) parses through the same path
+        let filter = Filter::Cql2Text("properties.eo:cloud_cover <= 10".to_string());
+        assert_eq!(
+            cql2_clause(&filter).unwrap(),
+            json!({"range": {"properties.eo:cloud_cover": {"lte": 10}}})
+        );
+        let spatial = Filter::Cql2Json(
+            serde_json::json!({
+                "op": "s_intersects",
+                "args": [{"property": "geometry"}, {
+                    "type": "Point", "coordinates": [1.0, 2.0]
+                }]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let clause = cql2_clause(&spatial).unwrap();
+        assert_eq!(clause["geo_shape"]["geometry"]["relation"], "intersects");
+        assert_eq!(
+            clause["geo_shape"]["geometry"]["shape"]["type"],
+            json!("Point")
+        );
     }
 
     #[test]

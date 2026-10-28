@@ -42,7 +42,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
-| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields` → `next`/`prev` links |
+| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry |
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
@@ -65,9 +65,13 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search` |
 | GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections |
 
-GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes) as query params; POST takes the full `Search` body (`intersects` and `fields: {include, exclude}` object included). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query. `query` and CQL2 `filter` are parsed but not yet applied.
+GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes), `filter` (cql2-text) as query params; POST takes the full `Search` body (`intersects`, `fields: {include, exclude}`, `query`, `filter` + `filter-lang` — defaults to `cql2-json`). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query.
 
 `fields` implements the [Fields extension](https://github.com/stac-api-extensions/fields): include/exclude with nested paths (`properties.datetime`) and `*` wildcards (`properties.eo:*`); when an include selection matches nothing, items fall back to `{id, collection}` per spec.
+
+`query` implements the [Query extension](https://github.com/stac-api-extensions/query) — `{"eo:cloud_cover": {"lt": 10}}` with `eq`/`ne`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`contains`; bare property names resolve under `properties.*` (top-level fields like `id`/`collection` pass through).
+
+`filter` implements the [Filter extension](https://github.com/stac-api-extensions/filter) — CQL2 in both `cql2-json` (POST) and `cql2-text` (GET) forms. Coverage: basic-cql2 (comparisons, `and`/`or`/`not`, `IS NULL`), advanced comparisons (`LIKE`, `BETWEEN`, `IN`), and basic spatial predicates (`s_intersects`/`s_within`/`s_contains`/`s_disjoint`). Temporal functions and arithmetic are not yet supported — unsupported operators return 400.
 
 ### Transactions — require `ENABLE_TRANSACTIONS_EXTENSIONS`
 
@@ -197,7 +201,8 @@ Then try scoped search: `POST /catalogs/earth-observation/search` returns its 4 
 This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Search**
-- `collections`, `ids`, `bbox` (incl. antimeridian crossing), `intersects`, `datetime`, `sortby`, `limit`, and `fields` are applied — `query` and CQL2 `filter` are parsed but ignored
+- `collections`, `ids`, `bbox` (incl. antimeridian crossing), `intersects`, `datetime`, `sortby`, `limit`, `fields`, `query` (STACQL), and `filter` (CQL2 json + text) are applied
+- `filter` coverage is basic-cql2 + advanced comparisons + basic spatial predicates — temporal functions (`t_*`), arithmetic, and array ops are not yet supported (400)
 - `sortby` works on `/search` + `/catalogs/*/search` (item-search binding) and on items listings `?sortby=±field` (features binding); sortables at `/sortables` + `/collections/{id}/sortables`
 - `datetime` bounds must be full RFC3339 datetimes — date-only inputs (`2023-06-01`) are rejected at validation
 - No CQL2 / filter extension support

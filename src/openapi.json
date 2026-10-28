@@ -24,7 +24,10 @@
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "offset", "in": "query", "schema": { "type": "integer" } },
           { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes. Nested paths and `*` wildcards supported, e.g. `id,properties.datetime,-geometry`" }
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes. Nested paths and `*` wildcards supported, e.g. `id,properties.datetime,-geometry`" },
+          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
+          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
+          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" } }
       },
@@ -206,7 +209,10 @@
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "offset", "in": "query", "schema": { "type": "integer" } },
           { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" },
+          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
+          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
+          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" } }
       },
@@ -229,7 +235,10 @@
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "offset", "in": "query", "schema": { "type": "integer" } },
           { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" },
+          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
+          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
+          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
       },
@@ -253,7 +262,11 @@
           "limit": { "type": "integer", "minimum": 1 },
           "offset": { "type": "integer", "minimum": 0 },
           "sortby": { "type": "array", "items": { "type": "object", "properties": { "field": { "type": "string" }, "direction": { "type": "string", "enum": ["asc", "desc"] } } } },
-          "fields": { "$ref": "#/components/schemas/Fields" }
+          "fields": { "$ref": "#/components/schemas/Fields" },
+          "query": { "type": "object", "additionalProperties": { "type": "object" }, "description": "Query extension — {property: {op: value}} with eq/ne/neq/gt/gte/lt/lte/in/contains" },
+          "filter": { "description": "Filter extension — CQL2 expression object (cql2-json) or string (cql2-text, per filter-lang)", "oneOf": [{ "type": "object" }, { "type": "string" }] },
+          "filter-lang": { "type": "string", "enum": ["cql2-json", "cql2-text"], "default": "cql2-json" },
+          "filter-crs": { "type": "string", "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }
         }
       },
       "Fields": {

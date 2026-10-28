@@ -26,6 +26,7 @@ opensearch = { version = "2.4.0", default-features = false, features = ["rustls-
 tracing = "0.1"
 tracing-subscriber = "0.3"
 geojson = "0.24.2"
+cql2 = "0.4.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
