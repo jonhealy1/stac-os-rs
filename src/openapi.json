@@ -23,11 +23,16 @@
           { "name": "datetime", "in": "query", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "offset", "in": "query", "schema": { "type": "integer" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } }
+          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes. Nested paths and `*` wildcards supported, e.g. `id,properties.datetime,-geometry`" }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" } }
       },
-      "post": { "summary": "Item search (registry-wide)", "responses": { "200": { "description": "GeoJSON ItemCollection" } } }
+      "post": {
+        "summary": "Item search (registry-wide)",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
+        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+      }
     },
     "/collections": {
       "get": {
@@ -63,7 +68,8 @@
           { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "token", "in": "query", "schema": { "type": "string" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } }
+          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
       },
@@ -173,7 +179,8 @@
           { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer" } },
           { "name": "token", "in": "query", "schema": { "type": "string" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } }
+          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
       },
@@ -188,18 +195,75 @@
       "delete": { "summary": "Delete item (transactions)", "responses": { "204": { "description": "Deleted" } } }
     },
     "/catalogs/search": {
-      "get": { "summary": "Item search (registry-wide)", "responses": { "200": { "description": "GeoJSON ItemCollection" } } },
-      "post": { "summary": "Item search (registry-wide)", "responses": { "200": { "description": "GeoJSON ItemCollection" } } }
+      "get": {
+        "summary": "Item search (registry-wide)",
+        "parameters": [
+          { "name": "collections", "in": "query", "schema": { "type": "string" } },
+          { "name": "ids", "in": "query", "schema": { "type": "string" } },
+          { "name": "bbox", "in": "query", "schema": { "type": "string" } },
+          { "name": "intersects", "in": "query", "schema": { "type": "string" } },
+          { "name": "datetime", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer" } },
+          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
+        ],
+        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+      },
+      "post": {
+        "summary": "Item search (registry-wide)",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
+        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+      }
     },
     "/catalogs/{catalogId}/search": {
       "get": {
         "summary": "Catalog-scoped item search",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "collections", "in": "query", "schema": { "type": "string" } },
+          { "name": "ids", "in": "query", "schema": { "type": "string" } },
+          { "name": "bbox", "in": "query", "schema": { "type": "string" } },
+          { "name": "intersects", "in": "query", "schema": { "type": "string" } },
+          { "name": "datetime", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer" } },
+          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
+          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
         ],
         "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
       },
-      "post": { "summary": "Catalog-scoped item search", "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } } }
+      "post": {
+        "summary": "Catalog-scoped item search",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
+        "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SearchBody": {
+        "type": "object",
+        "properties": {
+          "collections": { "type": "array", "items": { "type": "string" } },
+          "ids": { "type": "array", "items": { "type": "string" } },
+          "bbox": { "type": "array", "items": { "type": "number" }, "description": "2D/3D bbox; xmin > xmax crosses the antimeridian" },
+          "intersects": { "type": "object", "description": "GeoJSON geometry" },
+          "datetime": { "type": "string", "description": "RFC3339 instant or interval" },
+          "limit": { "type": "integer", "minimum": 1 },
+          "offset": { "type": "integer", "minimum": 0 },
+          "sortby": { "type": "array", "items": { "type": "object", "properties": { "field": { "type": "string" }, "direction": { "type": "string", "enum": ["asc", "desc"] } } } },
+          "fields": { "$ref": "#/components/schemas/Fields" }
+        }
+      },
+      "Fields": {
+        "type": "object",
+        "description": "STAC Fields extension — include/exclude field paths applied to returned items. Nested paths and `*` wildcards supported; if include matches nothing, items fall back to {id, collection}.",
+        "properties": {
+          "include": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "exclude": { "type": "array", "items": { "type": "string" }, "default": [] }
+        }
+      }
     }
   }
 }
