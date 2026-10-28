@@ -48,6 +48,11 @@ pub async fn test_state_full(
         links: LinkEngine::new("http://test"),
         enable_transactions,
         hide_alternate_parents,
+        default_collection_limit: 10,
+        max_collection_limit: None,
+        default_item_limit: 10,
+        max_item_limit: None,
+        excluded_item_fields: Vec::new(),
     }))
 }
 

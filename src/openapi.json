@@ -1,251 +1,1103 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "stac-os-rs — STAC API with Multi-Tenant Catalogs",
+    "title": "stac-os-rs \u2014 STAC API with Multi-Tenant Catalogs",
     "description": "STAC API implementing the Multi-Tenant Catalogs extension, backed by OpenSearch. Transaction routes exist only when ENABLE_TRANSACTIONS_EXTENSIONS is set.",
     "version": "0.1.0"
   },
   "paths": {
     "/": {
-      "get": { "summary": "Landing page", "responses": { "200": { "description": "STAC Catalog root with conformsTo and navigation links" } } }
+      "get": {
+        "summary": "Landing page",
+        "responses": {
+          "200": {
+            "description": "STAC Catalog root with conformsTo and navigation links"
+          }
+        }
+      }
     },
     "/conformance": {
-      "get": { "summary": "Conformance classes", "responses": { "200": { "description": "OGC conformance class URIs" } } }
+      "get": {
+        "summary": "Conformance classes",
+        "responses": {
+          "200": {
+            "description": "OGC conformance class URIs"
+          }
+        }
+      }
     },
     "/search": {
       "get": {
         "summary": "Item search (registry-wide)",
         "parameters": [
-          { "name": "collections", "in": "query", "schema": { "type": "string" } },
-          { "name": "ids", "in": "query", "schema": { "type": "string" } },
-          { "name": "bbox", "in": "query", "schema": { "type": "string" } },
-          { "name": "intersects", "in": "query", "schema": { "type": "string" } },
-          { "name": "datetime", "in": "query", "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes. Nested paths and `*` wildcards supported, e.g. `id,properties.datetime,-geometry`" },
-          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
-          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
-          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "collections",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "bbox",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "intersects",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "datetime",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes. Nested paths and `*` wildcards supported, e.g. `id,properties.datetime,-geometry`"
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
+          },
+          {
+            "name": "filter-crs",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          }
+        }
       },
       "post": {
         "summary": "Item search (registry-wide)",
-        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
-        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          }
+        }
       }
     },
     "/collections": {
       "get": {
         "summary": "List all collections",
         "parameters": [
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "Collections list" } }
+        "responses": {
+          "200": {
+            "description": "Collections list"
+          }
+        }
       },
-      "post": { "summary": "Create collection under root (transactions)", "responses": { "201": { "description": "Created" }, "409": { "description": "ID exists" } } }
+      "post": {
+        "summary": "Create collection under root (transactions)",
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "409": {
+            "description": "ID exists"
+          }
+        }
+      }
     },
     "/collections/{collectionId}": {
       "get": {
         "summary": "Collection document",
-        "parameters": [{ "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "STAC Collection" }, "404": { "description": "Not found" } }
+        "parameters": [
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "STAC Collection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "put": { "summary": "Update collection (transactions)", "responses": { "200": { "description": "Updated" }, "400": { "description": "ID mismatch" }, "404": { "description": "Not found" } } },
-      "delete": { "summary": "Delete collection and its items (transactions)", "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } } }
+      "put": {
+        "summary": "Update collection (transactions)",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          },
+          "400": {
+            "description": "ID mismatch"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete collection and its items (transactions)",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch collection (transactions)",
+        "description": "JSON Merge Patch (`application/json` or `application/merge-patch+json`) or RFC 6902 JSON Patch (`application/json-patch+json`). Immutable `id` changes are rejected.",
+        "responses": {
+          "200": {
+            "description": "Patched"
+          },
+          "400": {
+            "description": "Malformed patch or immutable-field change"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "405": {
+            "description": "Transactions disabled"
+          }
+        }
+      }
     },
     "/collections/{collectionId}/sortables": {
       "get": {
         "summary": "Per-collection Sortables schema",
-        "parameters": [{ "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "JSON Schema of sortable fields" }, "404": { "description": "Not found" } }
+        "parameters": [
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON Schema of sortable fields"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       }
     },
     "/collections/{collectionId}/items": {
       "get": {
         "summary": "Collection items",
         "parameters": [
-          { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes"
+          }
         ],
-        "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "post": { "summary": "Create item (transactions)", "responses": { "201": { "description": "Created" }, "404": { "description": "Collection missing" }, "409": { "description": "ID exists" } } }
+      "post": {
+        "summary": "Create item (transactions)",
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "404": {
+            "description": "Collection missing"
+          },
+          "409": {
+            "description": "ID exists"
+          }
+        }
+      }
     },
     "/collections/{collectionId}/items/{itemId}": {
       "get": {
         "summary": "Item document",
         "parameters": [
-          { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "itemId", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "itemId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "STAC Item" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "STAC Item"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "put": { "summary": "Update item (transactions)", "responses": { "200": { "description": "Updated" }, "400": { "description": "ID mismatch" }, "404": { "description": "Not found" } } },
-      "delete": { "summary": "Delete item (transactions)", "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } } }
+      "put": {
+        "summary": "Update item (transactions)",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          },
+          "400": {
+            "description": "ID mismatch"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete item (transactions)",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch item (transactions)",
+        "description": "JSON Merge Patch (`application/json` or `application/merge-patch+json`) or RFC 6902 JSON Patch (`application/json-patch+json`). Immutable `id`/`collection` changes are rejected.",
+        "responses": {
+          "200": {
+            "description": "Patched"
+          },
+          "400": {
+            "description": "Malformed patch or immutable-field change"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "405": {
+            "description": "Transactions disabled"
+          }
+        }
+      }
     },
     "/sortables": {
-      "get": { "summary": "Sortables schema", "responses": { "200": { "description": "JSON Schema of sortable fields" } } }
+      "get": {
+        "summary": "Sortables schema",
+        "responses": {
+          "200": {
+            "description": "JSON Schema of sortable fields"
+          }
+        }
+      }
     },
     "/catalogs": {
       "get": {
         "summary": "List root-level catalogs",
         "parameters": [
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "Catalog list" } }
+        "responses": {
+          "200": {
+            "description": "Catalog list"
+          }
+        }
       },
-      "post": { "summary": "Create root-level catalog (transactions)", "responses": { "201": { "description": "Created" }, "409": { "description": "ID exists" } } }
+      "post": {
+        "summary": "Create root-level catalog (transactions)",
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "409": {
+            "description": "ID exists"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}": {
       "get": {
         "summary": "Catalog document",
-        "parameters": [{ "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "STAC Catalog" }, "404": { "description": "Not found" } }
+        "parameters": [
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "STAC Catalog"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "put": { "summary": "Update catalog (transactions)", "responses": { "200": { "description": "Updated" }, "404": { "description": "Not found" } } },
-      "delete": { "summary": "Disband catalog (transactions, non-cascading)", "responses": { "204": { "description": "Disbanded" }, "404": { "description": "Not found" } } }
+      "put": {
+        "summary": "Update catalog (transactions)",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Disband catalog (transactions, non-cascading)",
+        "responses": {
+          "204": {
+            "description": "Disbanded"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}/conformance": {
       "get": {
         "summary": "Catalog-scoped conformance",
-        "parameters": [{ "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Conformance class URIs" }, "404": { "description": "Not found" } }
+        "parameters": [
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conformance class URIs"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       }
     },
     "/catalogs/{catalogId}/children": {
       "get": {
         "summary": "Catalog children",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "type", "in": "query", "schema": { "type": "string", "enum": ["Catalog", "Collection"] } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "Catalog",
+                "Collection"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "Child resources" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "Child resources"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       }
     },
     "/catalogs/{catalogId}/catalogs": {
       "get": {
         "summary": "Sub-catalogs",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "Catalog list" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "Catalog list"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "post": { "summary": "Create or link sub-catalog (transactions: Mode A=create 201, Mode B=link 200/404)", "responses": { "200": { "description": "Linked" }, "201": { "description": "Created" }, "404": { "description": "Target missing" }, "409": { "description": "ID exists" } } }
+      "post": {
+        "summary": "Create or link sub-catalog (transactions: Mode A=create 201, Mode B=link 200/404)",
+        "responses": {
+          "200": {
+            "description": "Linked"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "404": {
+            "description": "Target missing"
+          },
+          "409": {
+            "description": "ID exists"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}/catalogs/{subId}": {
       "delete": {
         "summary": "Unlink sub-catalog (transactions, non-cascading)",
-        "responses": { "204": { "description": "Unlinked" }, "404": { "description": "Not found or not a child" } }
+        "responses": {
+          "204": {
+            "description": "Unlinked"
+          },
+          "404": {
+            "description": "Not found or not a child"
+          }
+        }
       }
     },
     "/catalogs/{catalogId}/collections": {
       "get": {
         "summary": "Scoped collections",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "Collections list" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "Collections list"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "post": { "summary": "Create or link collection (transactions: Mode A=create 201, Mode B=link 200/404)", "responses": { "200": { "description": "Linked" }, "201": { "description": "Created" }, "404": { "description": "Target missing" }, "409": { "description": "ID exists" } } }
+      "post": {
+        "summary": "Create or link collection (transactions: Mode A=create 201, Mode B=link 200/404)",
+        "responses": {
+          "200": {
+            "description": "Linked"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "404": {
+            "description": "Target missing"
+          },
+          "409": {
+            "description": "ID exists"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}/collections/{collectionId}": {
       "get": {
         "summary": "Scoped collection document",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "STAC Collection" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "STAC Collection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "put": { "summary": "Update collection (transactions)", "responses": { "200": { "description": "Updated" }, "404": { "description": "Not found" } } },
-      "delete": { "summary": "Unlink collection (transactions, non-cascading)", "responses": { "204": { "description": "Unlinked" }, "404": { "description": "Not found or not a child" } } }
+      "put": {
+        "summary": "Update collection (transactions)",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Unlink collection (transactions, non-cascading)",
+        "responses": {
+          "204": {
+            "description": "Unlinked"
+          },
+          "404": {
+            "description": "Not found or not a child"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}/collections/{collectionId}/items": {
       "get": {
         "summary": "Scoped collection items",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "collectionId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "token", "in": "query", "schema": { "type": "string" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes"
+          }
         ],
-        "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "post": { "summary": "Create item (transactions)", "responses": { "201": { "description": "Created" } } }
+      "post": {
+        "summary": "Create item (transactions)",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
     },
     "/catalogs/{catalogId}/collections/{collectionId}/items/{itemId}": {
       "get": {
         "summary": "Scoped item document",
-        "responses": { "200": { "description": "STAC Item" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "STAC Item"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
-      "put": { "summary": "Update item (transactions)", "responses": { "200": { "description": "Updated" } } },
-      "delete": { "summary": "Delete item (transactions)", "responses": { "204": { "description": "Deleted" } } }
+      "put": {
+        "summary": "Update item (transactions)",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete item (transactions)",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
     },
     "/catalogs/search": {
       "get": {
         "summary": "Item search (registry-wide)",
         "parameters": [
-          { "name": "collections", "in": "query", "schema": { "type": "string" } },
-          { "name": "ids", "in": "query", "schema": { "type": "string" } },
-          { "name": "bbox", "in": "query", "schema": { "type": "string" } },
-          { "name": "intersects", "in": "query", "schema": { "type": "string" } },
-          { "name": "datetime", "in": "query", "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" },
-          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
-          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
-          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "collections",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "bbox",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "intersects",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "datetime",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes"
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
+          },
+          {
+            "name": "filter-crs",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          }
+        }
       },
       "post": {
         "summary": "Item search (registry-wide)",
-        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
-        "responses": { "200": { "description": "GeoJSON ItemCollection" } }
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          }
+        }
       }
     },
     "/catalogs/{catalogId}/search": {
       "get": {
         "summary": "Catalog-scoped item search",
         "parameters": [
-          { "name": "catalogId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "collections", "in": "query", "schema": { "type": "string" } },
-          { "name": "ids", "in": "query", "schema": { "type": "string" } },
-          { "name": "bbox", "in": "query", "schema": { "type": "string" } },
-          { "name": "intersects", "in": "query", "schema": { "type": "string" } },
-          { "name": "datetime", "in": "query", "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer" } },
-          { "name": "sortby", "in": "query", "schema": { "type": "string" } },
-          { "name": "fields", "in": "query", "schema": { "type": "string" }, "description": "Fields extension — comma-separated field paths, `-` prefix excludes" },
-          { "name": "filter", "in": "query", "schema": { "type": "string" }, "description": "Filter extension — CQL2 expression in `filter-lang` (default cql2-text)" },
-          { "name": "filter-lang", "in": "query", "schema": { "type": "string", "enum": ["cql2-text", "cql2-json"] } },
-          { "name": "filter-crs", "in": "query", "schema": { "type": "string" } }
+          {
+            "name": "catalogId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "collections",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "bbox",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "intersects",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "datetime",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes"
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
+          },
+          {
+            "name": "filter-crs",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
-        "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       },
       "post": {
         "summary": "Catalog-scoped item search",
-        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchBody" } } } },
-        "responses": { "200": { "description": "GeoJSON ItemCollection" }, "404": { "description": "Not found" } }
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GeoJSON ItemCollection"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
       }
     }
   },
@@ -254,27 +1106,112 @@
       "SearchBody": {
         "type": "object",
         "properties": {
-          "collections": { "type": "array", "items": { "type": "string" } },
-          "ids": { "type": "array", "items": { "type": "string" } },
-          "bbox": { "type": "array", "items": { "type": "number" }, "description": "2D/3D bbox; xmin > xmax crosses the antimeridian" },
-          "intersects": { "type": "object", "description": "GeoJSON geometry" },
-          "datetime": { "type": "string", "description": "RFC3339 instant or interval" },
-          "limit": { "type": "integer", "minimum": 1 },
-          "offset": { "type": "integer", "minimum": 0 },
-          "sortby": { "type": "array", "items": { "type": "object", "properties": { "field": { "type": "string" }, "direction": { "type": "string", "enum": ["asc", "desc"] } } } },
-          "fields": { "$ref": "#/components/schemas/Fields" },
-          "query": { "type": "object", "additionalProperties": { "type": "object" }, "description": "Query extension — {property: {op: value}} with eq/ne/neq/gt/gte/lt/lte/in/contains" },
-          "filter": { "description": "Filter extension — CQL2 expression object (cql2-json) or string (cql2-text, per filter-lang)", "oneOf": [{ "type": "object" }, { "type": "string" }] },
-          "filter-lang": { "type": "string", "enum": ["cql2-json", "cql2-text"], "default": "cql2-json" },
-          "filter-crs": { "type": "string", "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }
+          "collections": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "bbox": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "2D/3D bbox; xmin > xmax crosses the antimeridian"
+          },
+          "intersects": {
+            "type": "object",
+            "description": "GeoJSON geometry"
+          },
+          "datetime": {
+            "type": "string",
+            "description": "RFC3339 instant or interval"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sortby": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string",
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ]
+                }
+              }
+            }
+          },
+          "fields": {
+            "$ref": "#/components/schemas/Fields"
+          },
+          "query": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object"
+            },
+            "description": "Query extension \u2014 {property: {op: value}} with eq/ne/neq/gt/gte/lt/lte/in/contains"
+          },
+          "filter": {
+            "description": "Filter extension \u2014 CQL2 expression object (cql2-json) or string (cql2-text, per filter-lang)",
+            "oneOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "filter-lang": {
+            "type": "string",
+            "enum": [
+              "cql2-json",
+              "cql2-text"
+            ],
+            "default": "cql2-json"
+          },
+          "filter-crs": {
+            "type": "string",
+            "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+          }
         }
       },
       "Fields": {
         "type": "object",
-        "description": "STAC Fields extension — include/exclude field paths applied to returned items. Nested paths and `*` wildcards supported; if include matches nothing, items fall back to {id, collection}.",
+        "description": "STAC Fields extension \u2014 include/exclude field paths applied to returned items. Nested paths and `*` wildcards supported; if include matches nothing, items fall back to {id, collection}.",
         "properties": {
-          "include": { "type": "array", "items": { "type": "string" }, "default": [] },
-          "exclude": { "type": "array", "items": { "type": "string" }, "default": [] }
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
         }
       }
     }

@@ -45,6 +45,19 @@ pub struct AppState {
     /// When true, poly-hierarchy alternates (extra `parent` links on
     /// catalogs, `related`/`duplicate` on collections) are suppressed.
     pub hide_alternate_parents: bool,
+    /// `STAC_DEFAULT_COLLECTION_LIMIT` — `/collections` page size when
+    /// `?limit=` is absent.
+    pub default_collection_limit: u64,
+    /// `STAC_GLOBAL_COLLECTION_MAX_LIMIT` — hard cap on collection page
+    /// size (`None` = uncapped).
+    pub max_collection_limit: Option<u64>,
+    /// `STAC_DEFAULT_ITEM_LIMIT` / `STAC_GLOBAL_ITEM_MAX_LIMIT` — same
+    /// knobs for item listings.
+    pub default_item_limit: u64,
+    pub max_item_limit: Option<u64>,
+    /// `EXCLUDED_FROM_ITEMS` — field paths stripped from every item
+    /// response (e.g. `private_data,properties.private_data`).
+    pub excluded_item_fields: Vec<String>,
 }
 
 /// Default page size for catalog/collection/children list endpoints.
@@ -73,10 +86,19 @@ pub struct ListQuery {
     pub fields: Option<String>,
 }
 
-/// Resolve `?limit=&token=` into `(limit, offset)`. `limit=0` is a 400;
-/// an unparseable token restarts from 0 (matching upstream leniency).
-fn list_window(q: &ListQuery) -> Result<(u64, u64), ApiError> {
-    let limit = q.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+/// Resolve `?limit=&token=` into `(limit, offset)` — absent limit falls
+/// back to the endpoint's configured default, then the configured max
+/// caps it (`None` = uncapped). `limit=0` is a 400; an unparseable token
+/// restarts from 0 (matching upstream leniency).
+fn list_window(
+    q: &ListQuery,
+    default_limit: u64,
+    max_limit: Option<u64>,
+) -> Result<(u64, u64), ApiError> {
+    let limit = q
+        .limit
+        .unwrap_or(default_limit)
+        .min(max_limit.unwrap_or(u64::MAX));
     if limit == 0 {
         return Err(ApiError::BadRequest("limit must be >= 1".to_string()));
     }
@@ -86,6 +108,17 @@ fn list_window(q: &ListQuery) -> Result<(u64, u64), ApiError> {
         .and_then(|t| t.parse::<u64>().ok())
         .unwrap_or(0);
     Ok((limit, offset))
+}
+
+/// Strip `EXCLUDED_FROM_ITEMS` paths from an item — applied before the
+/// user's `fields` filter so server-side privacy always wins.
+fn strip_excluded_item_fields(
+    state: &AppState,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if !state.excluded_item_fields.is_empty() {
+        crate::store::filter_fields(obj, &[], &state.excluded_item_fields);
+    }
 }
 
 /// `next` link for a paginated list response.
@@ -538,7 +571,7 @@ pub async fn list_catalogs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (limit, offset) = list_window(&query)?;
+    let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
         .store
         .get_children_by_kind(ROOT_CATALOG_ID, NodeKind::Catalog)
@@ -660,12 +693,16 @@ pub async fn get_catalog_children(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
-    let (limit, offset) = list_window(&ListQuery {
-        limit: query.limit,
-        token: query.token.clone(),
-        sortby: None,
-        fields: None,
-    })?;
+    let (limit, offset) = list_window(
+        &ListQuery {
+            limit: query.limit,
+            token: query.token.clone(),
+            sortby: None,
+            fields: None,
+        },
+        DEFAULT_LIST_LIMIT,
+        None,
+    )?;
     let kind = parse_kind(query.r#type.as_deref());
     let nodes = state.store.get_child_nodes(&catalog_id, kind).await?;
     let matched = nodes.len();
@@ -753,7 +790,7 @@ pub async fn list_sub_catalogs(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
-    let (limit, offset) = list_window(&query)?;
+    let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Catalog)
@@ -948,6 +985,9 @@ async fn run_scoped_search(
                 json!(item_links(state, &item_id, &col, link_scope)),
             );
         }
+    }
+    for item in items.iter_mut() {
+        strip_excluded_item_fields(state, item);
     }
     // Fields extension runs last — it strips generated links too.
     if let Some(fields) = &search.items.fields {
@@ -1158,7 +1198,11 @@ pub async fn list_scoped_collections(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
-    let (limit, offset) = list_window(&query)?;
+    let (limit, offset) = list_window(
+        &query,
+        state.default_collection_limit,
+        state.max_collection_limit,
+    )?;
     let ids = state
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Collection)
@@ -1353,7 +1397,11 @@ pub async fn list_collections(
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (limit, offset) = list_window(&query)?;
+    let (limit, offset) = list_window(
+        &query,
+        state.default_collection_limit,
+        state.max_collection_limit,
+    )?;
     let mut ids: Vec<String> = state
         .store
         .get_descendant_collections(ROOT_CATALOG_ID)
@@ -1466,6 +1514,9 @@ pub async fn get_collection_item(
     match state.store.get_document(ITEMS_INDEX, &item_id).await? {
         Some(mut doc) if doc["collection"] == collection_id => {
             doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
+            if let Some(obj) = doc.as_object_mut() {
+                strip_excluded_item_fields(&state, obj);
+            }
             Ok(geo_json(doc))
         }
         _ => Err(ApiError::NotFound(item_id)),
@@ -1562,7 +1613,7 @@ async fn items_page(
     query: &ListQuery,
     scoped_catalog_id: Option<&str>,
 ) -> Result<ItemCollection, ApiError> {
-    let (limit, offset) = list_window(query)?;
+    let (limit, offset) = list_window(query, state.default_item_limit, state.max_item_limit)?;
     let mut search = Search::default();
     search.items.limit = Some(limit);
     search
@@ -1590,6 +1641,9 @@ async fn items_page(
                 json!(item_links(state, &item_id, &col, scoped_catalog_id)),
             );
         }
+    }
+    for item in items.iter_mut() {
+        strip_excluded_item_fields(state, item);
     }
     // Fields extension runs last — it strips generated links too.
     if let Some(fields) = &search.items.fields {
@@ -1644,6 +1698,9 @@ pub async fn get_scoped_item(
                 &collection_id,
                 Some(&catalog_id)
             ));
+            if let Some(obj) = doc.as_object_mut() {
+                strip_excluded_item_fields(&state, obj);
+            }
             Ok(geo_json(doc))
         }
         _ => Err(ApiError::NotFound(item_id)),
@@ -1889,6 +1946,148 @@ pub async fn delete_root_item(
         Some(doc) if doc["collection"] == collection_id => {
             state.store.delete_document(ITEMS_INDEX, &item_id).await?;
             Ok(StatusCode::NO_CONTENT)
+        }
+        _ => Err(ApiError::NotFound(item_id)),
+    }
+}
+
+/// Apply a request body as a patch. `application/json-patch+json` + an
+/// array body is RFC 6902 JSON-Patch; an object body under
+/// `application/merge-patch+json` or `application/json` is RFC 7386
+/// JSON Merge Patch (same split as upstream).
+fn apply_patch(
+    doc: &mut serde_json::Value,
+    content_type: &str,
+    patch: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match patch {
+        serde_json::Value::Array(ops) if content_type == "application/json-patch+json" => {
+            let ops: Vec<json_patch::PatchOperation> =
+                serde_json::from_value(serde_json::Value::Array(ops.clone()))
+                    .map_err(|e| ApiError::BadRequest(format!("invalid JSON-Patch: {e}")))?;
+            json_patch::patch(doc, &ops)
+                .map_err(|e| ApiError::BadRequest(format!("JSON-Patch failed: {e}")))
+        }
+        serde_json::Value::Object(_)
+            if matches!(
+                content_type.as_str(),
+                "application/merge-patch+json" | "application/json"
+            ) =>
+        {
+            merge_patch(doc, patch);
+            Ok(())
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "Content-Type '{content_type}' with this body is not a supported patch"
+        ))),
+    }
+}
+
+/// RFC 7386 JSON Merge Patch: `null` deletes the member, objects merge
+/// recursively, any other value replaces wholesale.
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                if value.is_null() {
+                    target.remove(key);
+                } else {
+                    merge_patch(
+                        target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                        value,
+                    );
+                }
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
+/// PATCH /collections/{id} — JSON Merge Patch or JSON-Patch on the
+/// collection document; `id` is immutable (400 if a patch changes it).
+pub async fn patch_root_collection(
+    Path(collection_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    StacJson(patch): StacJson<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut doc = state
+        .store
+        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
+    apply_patch(
+        &mut doc,
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+        &patch,
+    )?;
+    if doc["id"].as_str() != Some(collection_id.as_str()) {
+        return Err(ApiError::BadRequest(
+            "a patch may not change the collection id".to_string(),
+        ));
+    }
+    if !state
+        .store
+        .replace_document(COLLECTIONS_INDEX, &collection_id, &doc)
+        .await?
+    {
+        return Err(ApiError::WriteConflict(collection_id));
+    }
+    Ok(Json(global_collection_doc(&state, &collection_id).await?))
+}
+
+/// PATCH /collections/{id}/items/{item_id} — JSON Merge Patch or
+/// JSON-Patch on the item document; `id` and `collection` are immutable
+/// (400 if a patch changes them).
+pub async fn patch_root_item(
+    Path((collection_id, item_id)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    StacJson(patch): StacJson<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    if state
+        .store
+        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(collection_id));
+    }
+    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+        Some(mut doc) if doc["collection"] == collection_id => {
+            apply_patch(
+                &mut doc,
+                headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+                &patch,
+            )?;
+            if doc["id"].as_str() != Some(item_id.as_str())
+                || doc["collection"].as_str() != Some(collection_id.as_str())
+            {
+                return Err(ApiError::BadRequest(
+                    "a patch may not change the item id or collection".to_string(),
+                ));
+            }
+            if !state
+                .store
+                .replace_document(ITEMS_INDEX, &item_id, &doc)
+                .await?
+            {
+                return Err(ApiError::WriteConflict(item_id));
+            }
+            doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
+            Ok(geo_json(doc))
         }
         _ => Err(ApiError::NotFound(item_id)),
     }

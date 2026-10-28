@@ -91,12 +91,16 @@ pub fn transaction_router() -> Router<Arc<AppState>> {
         .route("/collections", post(create_root_collection))
         .route(
             "/collections/{collection_id}",
-            put(update_root_collection).delete(delete_root_collection),
+            put(update_root_collection)
+                .delete(delete_root_collection)
+                .patch(patch_root_collection),
         )
         .route("/collections/{collection_id}/items", post(create_root_item))
         .route(
             "/collections/{collection_id}/items/{item_id}",
-            put(update_root_item).delete(delete_root_item),
+            put(update_root_item)
+                .delete(delete_root_item)
+                .patch(patch_root_item),
         )
         // Catalog-extension transaction routes (scoped surface)
         .route("/catalogs", post(create_root_catalog))

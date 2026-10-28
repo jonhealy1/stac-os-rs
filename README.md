@@ -81,9 +81,11 @@ GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+
 |---|---|---|
 | POST | `/collections` | Create under root; `409` on id collision |
 | PUT | `/collections/{collection_id}` | Update; `400` id mismatch, `404` missing; DAG memberships preserved |
+| PATCH | `/collections/{collection_id}` | JSON Merge Patch (`application/merge-patch+json`) or RFC 6902 JSON Patch (`application/json-patch+json`); `400` immutable `id` change |
 | DELETE | `/collections/{collection_id}` | Delete collection **and its items**; `404` if missing |
 | POST | `/collections/{collection_id}/items` | Create; `404` missing collection, `409` repost, `400` collection mismatch |
 | PUT | `/collections/{collection_id}/items/{item_id}` | Update; `404` missing item/collection, `400` id mismatch |
+| PATCH | `/collections/{collection_id}/items/{item_id}` | Merge Patch / JSON Patch; `400` immutable `id`/`collection` change |
 | DELETE | `/collections/{collection_id}/items/{item_id}` | Delete; `404` unless item is in this collection |
 
 **Catalog transactions** — Multi-Tenant Catalogs extension (scoped, poly-hierarchy)
@@ -138,7 +140,7 @@ docker compose up -d opensearch
 cargo run     # API on http://localhost:3000
 ```
 
-Config via env vars: `OPENSEARCH_URL` (default `http://localhost:9200`), `ENABLE_TRANSACTIONS_EXTENSIONS` (enables all write endpoints; set in `compose.yml` by default), `CATALOGS_HIDE_ALTERNATE_PARENTS` (suppresses `related`/`duplicate` links and extra `parent` links on poly-hierarchy resources).
+Config via env vars: `OPENSEARCH_URL` (default `http://localhost:9200`), `ENABLE_TRANSACTIONS_EXTENSIONS` (enables all write endpoints; set in `compose.yml` by default), `CATALOGS_HIDE_ALTERNATE_PARENTS` (suppresses `related`/`duplicate` links and extra `parent` links on poly-hierarchy resources), `STAC_DEFAULT_COLLECTION_LIMIT` / `STAC_GLOBAL_COLLECTION_MAX_LIMIT` and `STAC_DEFAULT_ITEM_LIMIT` / `STAC_GLOBAL_ITEM_MAX_LIMIT` (page-size defaults and hard caps for collection/item listings), `EXCLUDED_FROM_ITEMS` (comma-separated field paths stripped from every item response — e.g. `private_data,properties.private_data`), `USE_DATETIME` (default `true`; `false` = items carrying `start_datetime`/`end_datetime` are filtered on the range alone, ignoring `properties.datetime`). All are read once at startup.
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 
@@ -205,7 +207,6 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 - `filter` coverage is basic-cql2 + advanced comparisons + basic spatial predicates — temporal functions (`t_*`), arithmetic, and array ops are not yet supported (400)
 - `sortby` works on `/search` + `/catalogs/*/search` (item-search binding) and on items listings `?sortby=±field` (features binding); sortables at `/sortables` + `/collections/{id}/sortables`
 - `datetime` bounds require full RFC3339 date-times — date-only inputs (`2023-06-01`) 400, matching the spec and upstream. Accepting them as whole-day intervals (OGC Features' leniency) would be a client-friendliness enhancement: normalize bounds to `T00:00:00Z`/`T23:59:59.999Z` before `valid()` runs — OpenSearch's `date` mapping already accepts date-only
-- No CQL2 / filter extension support
 - Offset pagination exists: `{"offset": n}` in the POST body or `?offset=` on GET + `next`/`prev` links (`method: POST`, `body`) in search responses; items listings use `?limit=&token=` with `method: GET` `next` links. All paged responses include `numberMatched`/`numberReturned`. Deep paging (>10k) needs `search_after`/cursor — not implemented
 
 **Core STAC routes**

@@ -80,6 +80,10 @@ pub struct ChildNode {
 pub struct Store {
     client: OpenSearch,
     prefix: String,
+    /// `USE_DATETIME` (default true): when false, an item carrying both
+    /// `properties.datetime` and `start_datetime`/`end_datetime` is
+    /// filtered on the range only — upstream's ranged-item semantics.
+    use_datetime: bool,
 }
 
 impl Store {
@@ -90,6 +94,7 @@ impl Store {
         Ok(Self {
             client: OpenSearch::new(transport),
             prefix: "stac".to_string(),
+            use_datetime: true,
         })
     }
 
@@ -97,6 +102,13 @@ impl Store {
     /// get fully isolated indices.
     pub fn with_index_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
+        self
+    }
+
+    /// `USE_DATETIME=false` — prefer `start_datetime`/`end_datetime` over
+    /// `datetime` whenever both are present on an item.
+    pub fn with_use_datetime(mut self, use_datetime: bool) -> Self {
+        self.use_datetime = use_datetime;
         self
     }
 
@@ -720,7 +732,7 @@ impl Store {
             }}}));
         }
         if let Some(datetime) = &search.items.datetime {
-            filter.push(datetime_filter(datetime));
+            filter.push(datetime_filter(datetime, self.use_datetime));
         }
 
         // sortby -> OpenSearch `sort` clauses; `_id` is appended as a
@@ -1069,7 +1081,9 @@ fn dt_bound(s: &str) -> Option<&str> {
 /// (`properties.datetime`) and ranged items (`datetime: null` +
 /// `start_datetime`/`end_datetime`), matching either if it overlaps the
 /// query interval. A bare instant is treated as a zero-width interval.
-fn datetime_filter(datetime: &str) -> Value {
+/// `use_datetime=false`: items carrying a range ignore `datetime`
+/// entirely (upstream `USE_DATETIME` semantics).
+fn datetime_filter(datetime: &str, use_datetime: bool) -> Value {
     let (start, end) = match datetime.split_once('/') {
         Some((s, e)) => (dt_bound(s), dt_bound(e)),
         None => (dt_bound(datetime), dt_bound(datetime)),
@@ -1095,10 +1109,25 @@ fn datetime_filter(datetime: &str) -> Value {
     if let Some(s) = start {
         ranged.push(json!({"range": {"properties.end_datetime": {"gte": s}}}));
     }
-    ranged.push(json!({"bool": {"must_not": {"exists": {"field": "properties.datetime"}}}}));
+
+    let instant_clause = if use_datetime {
+        // Instant items: `datetime` matches and no range is present.
+        // Ranged-only items fall to the ranged clause, which excludes
+        // `datetime` so an item never matches on both.
+        ranged.push(json!({"bool": {"must_not": {"exists": {"field": "properties.datetime"}}}}));
+        json!({"range": {"properties.datetime": instant_range}})
+    } else {
+        // `datetime` counts only when NO range fields are present — a
+        // ranged item is filtered on its range alone.
+        json!({"bool": {"filter": [
+            {"range": {"properties.datetime": instant_range}},
+            {"bool": {"must_not": {"exists": {"field": "properties.start_datetime"}}}},
+            {"bool": {"must_not": {"exists": {"field": "properties.end_datetime"}}}}
+        ]}})
+    };
 
     json!({"bool": {"should": [
-        {"range": {"properties.datetime": instant_range}},
+        instant_clause,
         {"bool": {"filter": ranged}}
     ], "minimum_should_match": 1}})
 }
@@ -1584,7 +1613,7 @@ mod tests {
 
     #[test]
     fn test_datetime_filter_instant() {
-        let q = datetime_filter("2023-06-15T00:00:00Z");
+        let q = datetime_filter("2023-06-15T00:00:00Z", true);
         let should = q["bool"]["should"].as_array().unwrap();
         // instant items: exact instant; ranged items: start<=v<=end
         assert_eq!(
@@ -1595,7 +1624,7 @@ mod tests {
 
     #[test]
     fn test_datetime_filter_interval() {
-        let q = datetime_filter("2023-06-01/2023-07-01");
+        let q = datetime_filter("2023-06-01/2023-07-01", true);
         let should = q["bool"]["should"].as_array().unwrap();
         assert_eq!(
             should[0]["range"]["properties.datetime"],
@@ -1613,9 +1642,31 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_filter_use_datetime_false() {
+        // use_datetime=false: the instant branch additionally requires
+        // neither start_datetime nor end_datetime to exist — an item
+        // carrying a range is filtered on the range alone.
+        let q = datetime_filter("2023-06-01/2023-07-01", false);
+        let instant = &q["bool"]["should"][0];
+        let filters = instant["bool"]["filter"].as_array().unwrap();
+        assert_eq!(filters.len(), 3);
+        assert_eq!(
+            filters[0]["range"]["properties.datetime"],
+            json!({"gte": "2023-06-01", "lte": "2023-07-01"})
+        );
+        assert_eq!(
+            filters[1]["bool"]["must_not"]["exists"]["field"],
+            "properties.start_datetime"
+        );
+        // and the ranged branch no longer excludes `datetime`
+        let ranged = q["bool"]["should"][1]["bool"]["filter"].as_array().unwrap();
+        assert_eq!(ranged.len(), 2);
+    }
+
+    #[test]
     fn test_datetime_filter_open_interval() {
         // "2023-06-01/.." -> only a lower bound on both branches
-        let q = datetime_filter("2023-06-01/..");
+        let q = datetime_filter("2023-06-01/..", true);
         let should = q["bool"]["should"].as_array().unwrap();
         assert_eq!(
             should[0]["range"]["properties.datetime"],
