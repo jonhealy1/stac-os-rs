@@ -22,7 +22,7 @@ A **hybrid** of the STAC API core spec and the [multi-tenant-catalogs extension]
 
 The catalog DAG is stored in OpenSearch as one `{kind, parents}` document per node (`stac-hierarchy` index) — children are derived via `term` queries on `parents`, so linking a shared resource is a single-document write, and orphans are automatically adopted under `root`.
 
-**Beyond the spec:** this project also exposes full STAC *transaction* capabilities inside the `/catalogs` scope (create/update/delete catalogs, collections, and items). That goes beyond what the multi-tenant-catalogs extension currently specifies — we're prototyping it here with the intent of feeding it back into the spec. All write endpoints are gated behind a flag:
+The multi-tenant-catalogs extension includes a **transaction spec**, which this project implements: full create/update/delete of catalogs, collections, and items inside the `/catalogs` scope (`multi-tenant-catalogs/transaction` conformance class). All write endpoints are gated behind a flag:
 
 ```bash
 ENABLE_TRANSACTIONS_EXTENSIONS=true   # unsets → every mutating route returns 405
