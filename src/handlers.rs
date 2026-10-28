@@ -18,6 +18,25 @@ use stac_api::{GetSearch, ItemCollection, Search};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// `Json` extractor that maps every rejection to `400 Bad Request` — STAC
+/// returns 400, not axum's default 422, for malformed request bodies.
+pub struct StacJson<T>(pub T);
+
+impl<S, T> axum::extract::FromRequest<S> for StacJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::BadRequest(rejection.body_text())),
+        }
+    }
+}
+
 pub struct AppState {
     pub base_url: String,
     pub store: Store,
@@ -544,7 +563,7 @@ pub async fn list_catalogs(
 
 pub async fn create_root_catalog(
     State(state): State<Arc<AppState>>,
-    Json(catalog): Json<Catalog>,
+    StacJson(catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
     // 409 on collision with an existing catalog OR collection id
     for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
@@ -602,7 +621,7 @@ pub async fn get_catalog(
 pub async fn update_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(catalog): Json<Catalog>,
+    StacJson(catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
     if catalog.id != catalog_id {
@@ -957,7 +976,7 @@ fn page_link(rel: &str, href: &str, search: &Search, offset: u64) -> Link {
 pub async fn scoped_search_post(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(search): Json<Search>,
+    StacJson(search): StacJson<Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     run_scoped_search(&state, &catalog_id, search).await
 }
@@ -975,7 +994,7 @@ pub async fn scoped_search_get(
 /// `root`, since every orphan is adopted there.
 pub async fn catalogs_search_post(
     State(state): State<Arc<AppState>>,
-    Json(search): Json<Search>,
+    StacJson(search): StacJson<Search>,
 ) -> Result<impl IntoResponse, ApiError> {
     run_scoped_search(&state, ROOT_CATALOG_ID, search).await
 }
@@ -993,7 +1012,7 @@ pub async fn catalogs_search_get(
 pub async fn link_or_create_sub_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<CreateOrLinkPayload<Catalog>>,
+    StacJson(payload): StacJson<CreateOrLinkPayload<Catalog>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
     match payload {
@@ -1132,7 +1151,7 @@ pub async fn list_scoped_collections(
 pub async fn link_or_create_scoped_collection(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<CreateOrLinkPayload<Collection>>,
+    StacJson(payload): StacJson<CreateOrLinkPayload<Collection>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
     match payload {
@@ -1227,7 +1246,7 @@ pub async fn get_scoped_collection(
 pub async fn update_scoped_collection(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(collection): Json<Collection>,
+    StacJson(collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     if collection.id != collection_id {
@@ -1568,7 +1587,7 @@ pub async fn get_scoped_item(
 pub async fn create_scoped_item(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(mut item): Json<Item>,
+    StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     validate_item_collection(&mut item, &collection_id)?;
@@ -1589,7 +1608,7 @@ pub async fn create_scoped_item(
 pub async fn update_scoped_item(
     Path((catalog_id, collection_id, item_id)): Path<(String, String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(mut item): Json<Item>,
+    StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     validate_item_collection(&mut item, &collection_id)?;
@@ -1622,7 +1641,7 @@ pub async fn delete_scoped_item(
 /// POST /collections — create a collection parented under root.
 pub async fn create_root_collection(
     State(state): State<Arc<AppState>>,
-    Json(collection): Json<Collection>,
+    StacJson(collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     if state
         .store
@@ -1665,7 +1684,7 @@ pub async fn create_root_collection(
 pub async fn update_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(mut collection): Json<Collection>,
+    StacJson(mut collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     if collection.id != collection_id {
         return Err(ApiError::BadRequest(format!(
@@ -1722,7 +1741,7 @@ pub async fn delete_root_collection(
 pub async fn create_root_item(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(mut item): Json<Item>,
+    StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     if state
         .store
@@ -1755,7 +1774,7 @@ pub async fn create_root_item(
 pub async fn update_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(mut item): Json<Item>,
+    StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     if item.id != item_id {
         return Err(ApiError::BadRequest(format!(
