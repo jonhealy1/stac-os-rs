@@ -136,17 +136,34 @@ impl Store {
             ),
             (
                 ITEMS_INDEX,
-                json!({"properties": {
-                    "id": {"type": "keyword"},
-                    "collection": {"type": "keyword"},
-                    "bbox": {"type": "float"},
-                    "geometry": {"type": "geo_shape"},
-                    "properties": {"properties": {
-                        "datetime": {"type": "date"},
-                        "start_datetime": {"type": "date"},
-                        "end_datetime": {"type": "date"}
-                    }}
-                }}),
+                // long->double: with every collection's items in one index,
+                // dynamic mapping would otherwise lock a property name to the
+                // first numeric type seen and reject the other (e.g. one
+                // collection's `eo:bands.center_wavelength` int colliding
+                // with another's float).
+                json!({
+                    "dynamic_templates": [
+                        {"ints_as_double": {
+                            "match_mapping_type": "long",
+                            "mapping": {"type": "double"}
+                        }},
+                        {"floats_as_double": {
+                            "match_mapping_type": "double",
+                            "mapping": {"type": "double"}
+                        }}
+                    ],
+                    "properties": {
+                        "id": {"type": "keyword"},
+                        "collection": {"type": "keyword"},
+                        "bbox": {"type": "float"},
+                        "geometry": {"type": "geo_shape"},
+                        "properties": {"properties": {
+                            "datetime": {"type": "date"},
+                            "start_datetime": {"type": "date"},
+                            "end_datetime": {"type": "date"}
+                        }}
+                    }
+                }),
             ),
         ];
 
@@ -353,6 +370,7 @@ impl Store {
             }))
             .send()
             .await?;
+        resp.error_for_status_code_ref()?;
         let body = resp.json::<Value>().await?;
         Ok(body["hits"]["hits"]
             .as_array()
@@ -384,6 +402,7 @@ impl Store {
             .body(json!({"ids": ids}))
             .send()
             .await?;
+        resp.error_for_status_code_ref()?;
         let body = resp.json::<Value>().await?;
         Ok(body["docs"]
             .as_array()
@@ -422,6 +441,7 @@ impl Store {
                 }))
                 .send()
                 .await?;
+            resp.error_for_status_code_ref()?;
             let body = resp.json::<Value>().await?;
             let mut next = Vec::new();
             if let Some(hits) = body["hits"]["hits"].as_array() {
@@ -631,7 +651,8 @@ impl Store {
             .body(json!({"query": {"term": {"collection": collection_id}}}))
             .refresh(true)
             .send()
-            .await?;
+            .await?
+            .error_for_status_code()?;
         Ok(())
     }
 
@@ -651,6 +672,7 @@ impl Store {
             .body(json!({"ids": ids}))
             .send()
             .await?;
+        resp.error_for_status_code_ref()?;
         let body = resp.json::<Value>().await?;
         Ok(body["docs"]
             .as_array()
@@ -699,15 +721,18 @@ impl Store {
         }
 
         // sortby -> OpenSearch `sort` clauses; `_id` is appended as a
-        // tiebreaker so paging is deterministic.
+        // tiebreaker so paging is deterministic. Fields are trimmed because
+        // `?sortby=+x` URL-decodes to a leading space; `unmapped_type` keeps
+        // sorting by a not-yet-indexed property from raising a shard error.
         let mut sort: Vec<Value> = search
             .items
             .sortby
             .iter()
             .map(|s| {
-                json!({sort_field(&s.field): {
+                json!({sort_field(s.field.trim()): {
                     "order": s.direction,
-                    "missing": "_last"
+                    "missing": "_last",
+                    "unmapped_type": "keyword"
                 }})
             })
             .collect();
@@ -731,6 +756,7 @@ impl Store {
             .body(body)
             .send()
             .await?;
+        resp.error_for_status_code_ref()?;
         let body = resp.json::<Value>().await?;
         let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
         let items = body["hits"]["hits"]

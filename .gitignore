@@ -1,1 +1,4 @@
 /target/
+tests/upstream/.venv/
+tests/upstream/**/__pycache__/
+validator-report.txt

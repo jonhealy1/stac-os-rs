@@ -2,7 +2,7 @@ OPENSEARCH_URL ?= http://localhost:9200
 STAC_API_URL ?= http://localhost:3000
 COMPOSE := docker compose
 
-.PHONY: up down reset opensearch test test-integration test-unit test-clean ingest validate check fmt
+.PHONY: up down reset opensearch test test-integration test-unit test-clean test-upstream ingest validate check fmt
 
 up: ## Start the full stack (api + opensearch + dashboards)
 	$(COMPOSE) up -d --build --wait
@@ -34,6 +34,15 @@ test-unit: ## Unit tests only (no OpenSearch needed)
 
 test-clean: ## Delete leftover it-* test indices without running tests
 	curl -sf -XDELETE '$(OPENSEARCH_URL)/it-*' || true
+
+# Vendored sfeos API suite (tests/upstream). Runs against a live API — start
+# one first via `make up`, or `make opensearch` + `cargo run`.
+test-upstream: ## Run vendored upstream sfeos API tests against the API on :3000
+	@test -d tests/upstream/.venv || python3 -m venv tests/upstream/.venv
+	@tests/upstream/.venv/bin/pip install -q -r tests/upstream/requirements.txt
+	@curl -sf $(STAC_API_URL)/ > /dev/null || { echo "API not reachable at $(STAC_API_URL) — run 'make up' first"; exit 1; }
+	STAC_API_URL=$(STAC_API_URL) OPENSEARCH_URL=$(OPENSEARCH_URL) \
+		tests/upstream/.venv/bin/pytest tests/upstream -v
 
 ingest: ## Load sample_data into the running API
 	STAC_API_URL=$(STAC_API_URL) python3 scripts/ingest_sample_data.py
