@@ -204,7 +204,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 - `collections`, `ids`, `bbox` (incl. antimeridian crossing), `intersects`, `datetime`, `sortby`, `limit`, `fields`, `query` (STACQL), and `filter` (CQL2 json + text) are applied
 - `filter` coverage is basic-cql2 + advanced comparisons + basic spatial predicates — temporal functions (`t_*`), arithmetic, and array ops are not yet supported (400)
 - `sortby` works on `/search` + `/catalogs/*/search` (item-search binding) and on items listings `?sortby=±field` (features binding); sortables at `/sortables` + `/collections/{id}/sortables`
-- `datetime` bounds must be full RFC3339 datetimes — date-only inputs (`2023-06-01`) are rejected at validation
+- `datetime` bounds require full RFC3339 date-times — date-only inputs (`2023-06-01`) 400, matching the spec and upstream. Accepting them as whole-day intervals (OGC Features' leniency) would be a client-friendliness enhancement: normalize bounds to `T00:00:00Z`/`T23:59:59.999Z` before `valid()` runs — OpenSearch's `date` mapping already accepts date-only
 - No CQL2 / filter extension support
 - Offset pagination exists: `{"offset": n}` in the POST body or `?offset=` on GET + `next`/`prev` links (`method: POST`, `body`) in search responses; items listings use `?limit=&token=` with `method: GET` `next` links. All paged responses include `numberMatched`/`numberReturned`. Deep paging (>10k) needs `search_after`/cursor — not implemented
 
