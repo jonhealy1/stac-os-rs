@@ -206,6 +206,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 **Core STAC routes**
 - `GET /queryables` endpoints (root + per-collection) — not implemented
 - `service-doc` (human-readable API docs page) — OpenAPI JSON exists at `/api`; no HTML variant
+- `src/openapi.json` is hand-maintained and drifts as features land — generate it from the route types instead (`utoipa` or `aide`)
 
 **Hierarchy & data**
 - Children/descendants capped at 10k per level — real pagination needed on the DAG itself
