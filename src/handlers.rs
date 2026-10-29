@@ -421,6 +421,7 @@ async fn global_collection_doc(
         .await?
         .filter(is_collection_doc)
         .ok_or_else(|| ApiError::NotFound(collection_id.to_string()))?;
+    strip_collection_internals(&mut doc);
     let parents = state.store.get_parents(collection_id).await?;
     doc["links"] = json!(global_collection_links(state, collection_id, &parents));
     Ok(doc)
@@ -442,6 +443,61 @@ async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::
 /// — so the same item id may exist in different collections.
 fn item_key(item_id: &str, collection_id: &str) -> String {
     format!("{item_id}|{collection_id}")
+}
+
+/// Derived search fields stored on a collection doc: `bbox_shape`, a
+/// GeoJSON polygon of the first spatial extent bbox (upstream stores
+/// the same derived field; it is stripped back out on reads).
+fn collection_search_fields(doc: &mut serde_json::Map<String, serde_json::Value>) {
+    if doc.contains_key("bbox_shape") {
+        return;
+    }
+    let Some(first) = doc
+        .get("extent")
+        .and_then(|e| e.get("spatial"))
+        .and_then(|s| s.get("bbox"))
+        .and_then(|b| b.as_array())
+        .and_then(|arr| arr.first().cloned())
+    else {
+        return;
+    };
+    let nums: Vec<f64> = match &first {
+        serde_json::Value::Array(a) if a.first().is_some_and(|v| v.is_array()) => a[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_f64())
+            .collect(),
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_f64()).collect(),
+        _ => return,
+    };
+    let Ok([minx, miny, maxx, maxy]) = normalize_bbox(nums) else {
+        return;
+    };
+    doc.insert(
+        "bbox_shape".to_string(),
+        json!({
+            "type": "Polygon",
+            "coordinates": [[[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]]
+        }),
+    );
+}
+
+/// Drop derived storage fields (`bbox_shape`) — upstream pops them in
+/// `db_to_stac`, they are search plumbing, not API surface.
+fn strip_collection_internals(doc: &mut serde_json::Value) {
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("bbox_shape");
+    }
+}
+
+/// Collection doc as stored — serialized plus derived search fields.
+fn stored_collection_doc(collection: &Collection) -> serde_json::Value {
+    let mut doc = serde_json::to_value(collection).unwrap_or_default();
+    if let Some(obj) = doc.as_object_mut() {
+        collection_search_fields(obj);
+    }
+    doc
 }
 
 /// Strong ETag for a stored document version:
@@ -503,9 +559,8 @@ fn etag_response(status: StatusCode, etag: &str, body: impl IntoResponse) -> imp
         status,
         [(
             header::ETAG,
-            axum::http::HeaderValue::from_str(etag).unwrap_or_else(|_| {
-                axum::http::HeaderValue::from_static("\"invalid\"")
-            }),
+            axum::http::HeaderValue::from_str(etag)
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"invalid\"")),
         )],
         body,
     )
@@ -1108,9 +1163,9 @@ async fn run_scoped_search(
         if !t.is_null() {
             let offset = match &t {
                 serde_json::Value::String(s) => decode_item_token(s)?,
-                serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
-                    ApiError::BadRequest("Invalid pagination token.".to_string())
-                })?,
+                serde_json::Value::Number(n) => n
+                    .as_u64()
+                    .ok_or_else(|| ApiError::BadRequest("Invalid pagination token.".to_string()))?,
                 _ => {
                     return Err(ApiError::BadRequest(
                         "Invalid pagination token.".to_string(),
@@ -1606,6 +1661,7 @@ pub async fn list_scoped_collections(
     let parents_map = state.store.get_parents_many(&page).await?;
     let mut collections = state.store.get_documents(COLLECTIONS_INDEX, &page).await?;
     for doc in collections.iter_mut() {
+        strip_collection_internals(doc);
         if let Some(id) = doc["id"].as_str() {
             let parents = parents_map.get(id).cloned().unwrap_or_default();
             doc["links"] = json!(collection_links(&state, id, &catalog_id, &parents));
@@ -1665,6 +1721,7 @@ pub async fn link_or_create_scoped_collection(
                 .get_document(COLLECTIONS_INDEX, &id)
                 .await?
                 .unwrap();
+            strip_collection_internals(&mut doc);
             let parents = state.store.get_parents(&id).await?;
             doc["links"] = json!(collection_links(&state, &id, &catalog_id, &parents));
             Ok((StatusCode::OK, Json(doc)))
@@ -1694,7 +1751,11 @@ pub async fn link_or_create_scoped_collection(
             }
             if !state
                 .store
-                .create_document(COLLECTIONS_INDEX, &collection.id, &collection)
+                .create_document(
+                    COLLECTIONS_INDEX,
+                    &collection.id,
+                    &stored_collection_doc(&collection),
+                )
                 .await?
             {
                 return Err(ApiError::Conflict(collection.id));
@@ -1718,6 +1779,7 @@ pub async fn get_scoped_collection(
         .await?
     {
         Some(mut doc) => {
+            strip_collection_internals(&mut doc);
             let parents = state.store.get_parents(&collection_id).await?;
             doc["links"] = json!(collection_links(
                 &state,
@@ -1756,14 +1818,18 @@ pub async fn update_scoped_collection(
             .index_document_versioned(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &collection,
+                &stored_collection_doc(&collection),
                 version,
             )
             .await?
     } else {
         state
             .store
-            .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
+            .replace_document(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &stored_collection_doc(&collection),
+            )
             .await?
     };
     if !applied {
@@ -1811,57 +1877,381 @@ pub async fn unlink_scoped_collection(
 
 // --- Global Collections (core STAC routes) ---
 
-/// GET /collections — every collection in the registry (all descendants
-/// of root; orphans are adopted there automatically).
+/// GET /collections — every collection in the registry, with the
+/// collections-search extensions (sortby/fields/q/filter/query/
+/// datetime/bbox) layered on.
 pub async fn list_collections(
-    Query(query): Query<ListQuery>,
+    Query(query): Query<CollectionsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (limit, offset) = list_window(
-        &query,
-        state.default_collection_limit,
-        state.max_collection_limit,
-    )?;
-    let mut ids: Vec<String> = state
-        .store
-        .get_descendant_collections(ROOT_CATALOG_ID)
-        .await?
-        .into_iter()
-        .collect();
-    ids.sort(); // HashSet order is unstable — sort for deterministic pages
-    let matched = ids.len();
-    let page: Vec<String> = ids
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
-    let parents_map = state.store.get_parents_many(&page).await?;
-    let mut collections = state.store.get_documents(COLLECTIONS_INDEX, &page).await?;
-    for doc in collections.iter_mut() {
-        if let Some(id) = doc["id"].as_str() {
-            let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(global_collection_links(&state, id, &parents));
+    collections_page(
+        &state,
+        collections_get_params(query)?,
+        "/collections",
+        false,
+    )
+    .await
+}
+
+/// GET /collections-search — upstream collections-search route;
+/// same parameter surface as the extended GET /collections.
+pub async fn collections_search_get(
+    Query(query): Query<CollectionsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    collections_page(
+        &state,
+        collections_get_params(query)?,
+        "/collections-search",
+        false,
+    )
+    .await
+}
+
+/// POST /collections-search — structured body variant
+/// (`sortby: [{field,direction}]`, `fields: {include,exclude}`).
+pub async fn collections_search_post(
+    State(state): State<Arc<AppState>>,
+    StacJson(body): StacJson<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    collections_page(
+        &state,
+        collections_post_params(body)?,
+        "/collections-search",
+        true,
+    )
+    .await
+}
+
+/// GET-side parameters for /collections and /collections-search.
+#[derive(Deserialize, Default)]
+pub struct CollectionsQuery {
+    pub limit: Option<u64>,
+    pub token: Option<String>,
+    pub sortby: Option<String>,
+    pub fields: Option<String>,
+    pub q: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "filter-lang")]
+    pub filter_lang: Option<String>,
+    pub query: Option<String>,
+    pub datetime: Option<String>,
+    pub bbox: Option<String>,
+}
+
+/// Normalized collections-search params shared by GET and POST.
+#[derive(Default)]
+struct CollectionsSearchParams {
+    limit: Option<u64>,
+    token: Option<String>,
+    /// (field, "asc"|"desc") pairs.
+    sortby: Vec<(String, String)>,
+    /// (include, exclude) field paths.
+    fields: Option<(Vec<String>, Vec<String>)>,
+    q: Vec<String>,
+    filter: Option<stac_api::Filter>,
+    query: Option<serde_json::Map<String, serde_json::Value>>,
+    datetime: Option<String>,
+    /// 2D bbox [minx, miny, maxx, maxy].
+    bbox: Option<[f64; 4]>,
+}
+
+/// `?sortby=+id,-title` -> (field, direction) pairs.
+fn parse_get_sortby(raw: Option<&str>) -> Vec<(String, String)> {
+    raw.into_iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.strip_prefix('-') {
+            Some(f) => (f.to_string(), "desc".to_string()),
+            None => (
+                s.strip_prefix('+').unwrap_or(s).to_string(),
+                "asc".to_string(),
+            ),
+        })
+        .collect()
+}
+
+/// `?fields=a,b,-c` -> (include, exclude).
+fn parse_get_fields(raw: Option<&str>) -> Option<(Vec<String>, Vec<String>)> {
+    let raw = raw?;
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for e in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        if let Some(f) = e.strip_prefix('-') {
+            exclude.push(f.to_string());
+        } else {
+            include.push(e.strip_prefix('+').unwrap_or(e).to_string());
         }
     }
+    Some((include, exclude))
+}
+
+/// 4- or 6-element bbox -> 2D (3D drops the altitude bounds, same as
+/// upstream's bbox_shape extraction).
+fn normalize_bbox(nums: Vec<f64>) -> Result<[f64; 4], ApiError> {
+    match nums.len() {
+        4 => Ok([nums[0], nums[1], nums[2], nums[3]]),
+        6 => Ok([nums[0], nums[1], nums[3], nums[4]]),
+        _ => Err(ApiError::BadRequest(
+            "Invalid parameters provided: bbox".to_string(),
+        )),
+    }
+}
+
+/// `datetime` param -> (start, end) bounds; `..` maps to concrete
+/// sentinels, a single instant is a closed point range (upstream
+/// `apply_collections_datetime_filter_shared`).
+fn datetime_bounds(datetime: &str) -> (String, String) {
+    match datetime.split_once('/') {
+        Some((s, e)) => (
+            if s == ".." {
+                "1800-01-01T00:00:00Z".to_string()
+            } else {
+                s.to_string()
+            },
+            if e == ".." {
+                "2999-12-31T23:59:59Z".to_string()
+            } else {
+                e.to_string()
+            },
+        ),
+        None => (datetime.to_string(), datetime.to_string()),
+    }
+}
+
+fn parse_cql2_filter(raw: &str, lang: Option<&str>) -> Result<stac_api::Filter, ApiError> {
+    if lang == Some("cql2-json") {
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(map)) => Ok(stac_api::Filter::Cql2Json(map)),
+            _ => Err(ApiError::BadRequest(
+                "Invalid filter parameter: expected valid CQL2 JSON.".to_string(),
+            )),
+        }
+    } else {
+        Ok(stac_api::Filter::Cql2Text(raw.to_string()))
+    }
+}
+
+fn parse_query_param(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        _ => Err(ApiError::BadRequest(
+            "Invalid query parameter: expected valid JSON.".to_string(),
+        )),
+    }
+}
+
+fn collections_get_params(q: CollectionsQuery) -> Result<CollectionsSearchParams, ApiError> {
+    let mut p = CollectionsSearchParams {
+        limit: q.limit,
+        token: q.token,
+        sortby: parse_get_sortby(q.sortby.as_deref()),
+        fields: parse_get_fields(q.fields.as_deref()),
+        q: q.q.into_iter().collect(),
+        datetime: q.datetime,
+        ..Default::default()
+    };
+    if let Some(raw) = &q.filter {
+        p.filter = Some(parse_cql2_filter(raw, q.filter_lang.as_deref())?);
+    }
+    if let Some(raw) = &q.query {
+        p.query = Some(parse_query_param(raw)?);
+    }
+    if let Some(raw) = &q.bbox {
+        let nums: Vec<f64> = raw
+            .split(',')
+            .map(|s| s.trim().parse())
+            .collect::<Result<_, _>>()
+            .map_err(|_| ApiError::BadRequest("Invalid parameters provided: bbox".to_string()))?;
+        p.bbox = Some(normalize_bbox(nums)?);
+    }
+    Ok(p)
+}
+
+/// POST /collections-search body -> params. Accepts `filter` as a CQL2
+/// JSON object or a text/json string (`filter_lang` or `filter-lang`),
+/// `query` as an object or JSON string, and `fields`/`sortby` objects.
+fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchParams, ApiError> {
+    let bad = |m: &str| ApiError::BadRequest(format!("Invalid parameters provided: {m}"));
+    let obj = body.as_object();
+    let get = |k: &str| obj.and_then(|o| o.get(k));
+    let mut p = CollectionsSearchParams {
+        limit: get("limit").and_then(|v| v.as_u64()),
+        token: get("token").and_then(|v| v.as_str()).map(str::to_owned),
+        datetime: get("datetime").and_then(|v| v.as_str()).map(str::to_owned),
+        ..Default::default()
+    };
+    if let Some(v) = get("sortby").and_then(|v| v.as_array()) {
+        for s in v {
+            let field = s["field"].as_str().ok_or_else(|| bad("sortby"))?;
+            let dir = s["direction"].as_str().unwrap_or("asc");
+            p.sortby.push((field.to_string(), dir.to_string()));
+        }
+    }
+    if let Some(f) = get("fields").and_then(|v| v.as_object()) {
+        let list = |k: &str| {
+            f.get(k)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        };
+        p.fields = Some((list("include"), list("exclude")));
+    }
+    if let Some(v) = get("q") {
+        p.q = match v {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect(),
+            _ => vec![],
+        };
+    }
+    let lang = get("filter_lang")
+        .or_else(|| get("filter-lang"))
+        .and_then(|v| v.as_str());
+    if let Some(v) = get("filter") {
+        p.filter = Some(match v {
+            serde_json::Value::Object(m) => stac_api::Filter::Cql2Json(m.clone()),
+            serde_json::Value::String(s) => parse_cql2_filter(s, lang)?,
+            _ => return Err(bad("filter")),
+        });
+    }
+    if let Some(v) = get("query") {
+        p.query = Some(match v {
+            serde_json::Value::Object(m) => m.clone(),
+            serde_json::Value::String(s) => parse_query_param(s)?,
+            _ => return Err(bad("query")),
+        });
+    }
+    if let Some(v) = get("bbox") {
+        let nums: Vec<f64> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+            .ok_or_else(|| bad("bbox"))?;
+        p.bbox = Some(normalize_bbox(nums)?);
+    }
+    Ok(p)
+}
+
+/// Shared runner for GET /collections, GET/POST /collections-search.
+/// `post` selects the `next`-link shape (href token vs body token).
+async fn collections_page(
+    state: &AppState,
+    params: CollectionsSearchParams,
+    self_path: &str,
+    post: bool,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = params
+        .limit
+        .unwrap_or(state.default_collection_limit)
+        .min(state.max_collection_limit.unwrap_or(u64::MAX));
+    if limit == 0 {
+        return Err(ApiError::BadRequest("limit must be >= 1".to_string()));
+    }
+    // Collection cursors stay lenient — `?token=!!!!` is a 200 (first
+    // page), matching upstream's arbitrary-cursor contract here.
+    let offset = params
+        .token
+        .as_deref()
+        .map(|t| decode_item_token(t).unwrap_or(0))
+        .unwrap_or(0);
+
+    let mut filters = Vec::new();
+    if !params.q.is_empty() {
+        filters.push(json!({"multi_match": {
+            "query": params.q.join(" "),
+            "fields": ["id", "title^3", "description", "keywords"],
+            "type": "best_fields",
+            "fuzziness": "AUTO"
+        }}));
+    }
+    if let Some(f) = &params.filter {
+        filters.push(
+            crate::store::cql2_clause_with(f, crate::store::COLLECTION_FIELDS)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
+        );
+    }
+    if let Some(q) = &params.query {
+        filters.extend(
+            crate::store::stacql_clauses_with(q, crate::store::COLLECTION_FIELDS)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid query parameter: {e}")))?,
+        );
+    }
+    if let Some(dt) = &params.datetime {
+        let (start, end) = datetime_bounds(dt);
+        filters.push(json!({"bool": {"filter": [
+            {"range": {"extent.temporal.interval": {"lte": end}}},
+            {"range": {"extent.temporal.interval": {"gte": start}}}
+        ]}}));
+    }
+    if let Some(b) = &params.bbox {
+        filters.push(json!({"geo_shape": {"bbox_shape": {
+            "shape": {"type": "envelope", "coordinates": [[b[0], b[3]], [b[2], b[1]]]},
+            "relation": "intersects"
+        }}}));
+    }
+
+    let (mut docs, matched) = state
+        .store
+        .search_collections(filters, params.sortby, limit, offset)
+        .await?;
+    let ids: Vec<String> = docs
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
+        .collect();
+    let parents_map = state.store.get_parents_many(&ids).await?;
+    for doc in docs.iter_mut() {
+        let Some(obj) = doc.as_object_mut() else {
+            continue;
+        };
+        obj.remove("bbox_shape");
+        let id = obj.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+        if let Some(id) = id {
+            let parents = parents_map.get(&id).cloned().unwrap_or_default();
+            obj.insert(
+                "links".to_string(),
+                json!(global_collection_links(state, &id, &parents)),
+            );
+        }
+        if let Some((include, exclude)) = &params.fields {
+            crate::store::filter_fields(obj, include, exclude);
+        }
+    }
+    let returned = docs.len();
     let mut links = json!([
-        { "rel": "self", "href": format!("{}/collections", state.base_url) },
-        { "rel": "root", "href": state.base_url },
-        { "rel": "parent", "href": state.base_url }
+        { "rel": "self", "href": format!("{}{self_path}", state.base_url) },
+        { "rel": "root", "href": state.base_url }
     ]);
-    let returned = collections.len();
-    if let Some(next) = list_next_link(
-        &state,
-        "/collections",
-        limit,
-        offset,
-        returned,
-        matched,
-        None,
-    ) {
+    if offset + (returned as u64) < matched {
+        let next = if post {
+            json!({
+                "rel": "next",
+                "href": format!("{}{self_path}", state.base_url),
+                "method": "POST",
+                "body": {
+                    "limit": limit,
+                    "token": encode_item_token(offset + limit)
+                }
+            })
+        } else {
+            json!({
+                "rel": "next",
+                "href": format!(
+                    "{}{self_path}?limit={}&token={}",
+                    state.base_url,
+                    limit,
+                    encode_item_token(offset + limit)
+                )
+            })
+        };
         links.as_array_mut().unwrap().push(next);
     }
     Ok(Json(json!({
-        "collections": collections,
+        "collections": docs,
         "numberReturned": returned,
         "numberMatched": matched,
         "links": links
@@ -2066,12 +2456,11 @@ async fn items_page(
             .split(',')
             .map(|s| s.parse())
             .collect::<Result<_, _>>()
-            .map_err(|_| {
+            .map_err(|_| ApiError::BadRequest("Invalid parameters provided: bbox".to_string()))?;
+        search.items.bbox =
+            Some(nums.try_into().map_err(|_| {
                 ApiError::BadRequest("Invalid parameters provided: bbox".to_string())
-            })?;
-        search.items.bbox = Some(nums.try_into().map_err(|_| {
-            ApiError::BadRequest("Invalid parameters provided: bbox".to_string())
-        })?);
+            })?);
     }
     if let Some(datetime) = &query.datetime {
         search.items.datetime = Some(datetime.clone());
@@ -2291,7 +2680,11 @@ pub async fn create_root_collection(
     }
     if !state
         .store
-        .create_document(COLLECTIONS_INDEX, &collection.id, &collection)
+        .create_document(
+            COLLECTIONS_INDEX,
+            &collection.id,
+            &stored_collection_doc(&collection),
+        )
         .await?
     {
         return Err(ApiError::Conflict(collection.id));
@@ -2339,14 +2732,18 @@ pub async fn update_root_collection(
             .index_document_versioned(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &collection,
+                &stored_collection_doc(&collection),
                 version,
             )
             .await?
     } else {
         state
             .store
-            .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
+            .replace_document(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &stored_collection_doc(&collection),
+            )
             .await?
     };
     if !applied {
@@ -2548,7 +2945,10 @@ pub async fn update_root_item(
                     .index_document_versioned(ITEMS_INDEX, &key, &item, version)
                     .await?
             } else {
-                state.store.replace_document(ITEMS_INDEX, &key, &item).await?
+                state
+                    .store
+                    .replace_document(ITEMS_INDEX, &key, &item)
+                    .await?
             };
             if !applied {
                 return Err(if headers.contains_key(header::IF_MATCH) {
@@ -2644,8 +3044,7 @@ fn apply_patch(
                     !matches!(
                         op.get("op").and_then(serde_json::Value::as_str),
                         Some("copy" | "move")
-                    )
-                        || seen.insert(op.to_string())
+                    ) || seen.insert(op.to_string())
                 })
                 .cloned()
                 .collect();
@@ -2725,14 +3124,15 @@ pub async fn patch_root_collection(
             .unwrap_or_default(),
         &patch,
     )?;
-    if doc["id"].as_str() != Some(collection_id.as_str())
-        || !is_collection_doc(&doc)
-    {
+    if doc["id"].as_str() != Some(collection_id.as_str()) || !is_collection_doc(&doc) {
         return Err(ApiError::BadRequest(
             "a patch may not change the collection id or type".to_string(),
         ));
     }
     require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    if let Some(obj) = doc.as_object_mut() {
+        collection_search_fields(obj);
+    }
     let applied = if headers.contains_key(header::IF_MATCH) {
         state
             .store
@@ -2809,7 +3209,10 @@ pub async fn patch_root_item(
                     .index_document_versioned(ITEMS_INDEX, &key, &doc, version)
                     .await?
             } else {
-                state.store.replace_document(ITEMS_INDEX, &key, &doc).await?
+                state
+                    .store
+                    .replace_document(ITEMS_INDEX, &key, &doc)
+                    .await?
             };
             if !applied {
                 return Err(if headers.contains_key(header::IF_MATCH) {
@@ -2887,7 +3290,10 @@ pub async fn bulk_create_items(
         let applied = if upsert {
             state.store.put_document(ITEMS_INDEX, &key, &item).await?
         } else {
-            state.store.create_document(ITEMS_INDEX, &key, &item).await?
+            state
+                .store
+                .create_document(ITEMS_INDEX, &key, &item)
+                .await?
         };
         if applied {
             success += 1;

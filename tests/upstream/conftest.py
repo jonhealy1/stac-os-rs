@@ -341,7 +341,31 @@ _INDEX_MAPPINGS = {
         }
     },
     "catalogs": {"properties": {"id": {"type": "keyword"}}},
-    "collections": {"properties": {"id": {"type": "keyword"}}},
+    "collections": {
+        "properties": {
+            "id": {"type": "keyword"},
+            # text+keyword: `q` free text needs analysis; term/sort on
+            # strings needs the keyword sub-field. Mirrors store.rs.
+            "title": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+            },
+            "description": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+            },
+            "keywords": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+            },
+            "extent": {
+                "properties": {
+                    "temporal": {"properties": {"interval": {"type": "date"}}}
+                }
+            },
+            "bbox_shape": {"type": "geo_shape"},
+        }
+    },
     "items": {
         # long->double so differently-typed numeric properties across
         # collections can't lock each other out of the shared index.

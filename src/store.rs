@@ -147,7 +147,21 @@ impl Store {
             ),
             (
                 COLLECTIONS_INDEX,
-                json!({"properties": {"id": {"type": "keyword"}}}),
+                json!({"properties": {
+                    "id": {"type": "keyword"},
+                    // text+keyword: free-text (`q`) needs analysis; term/
+                    // sort on strings needs the keyword sub-field.
+                    "title": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    "description": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    "keywords": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    // collections-search: temporal-extent overlap +
+                    // `bbox_shape` (injected at write time, upstream
+                    // does the same for geo queries on collections).
+                    "extent": {"properties": {"temporal": {"properties": {
+                        "interval": {"type": "date"}
+                    }}}},
+                    "bbox_shape": {"type": "geo_shape"}
+                }}),
             ),
             (
                 ITEMS_INDEX,
@@ -840,6 +854,62 @@ impl Store {
         Ok((items, total))
     }
 
+    /// Collection search (`/collections-search` and the extended
+    /// `/collections`): filters are already-built OpenSearch clauses
+    /// (q/filter/query/datetime/bbox); `sort` is a list of
+    /// `{field: {"order": dir}}` — the `id` asc tiebreak is appended
+    /// here, matching upstream's `format_collection_sort_shared`.
+    /// Returns (docs, total_matched).
+    pub async fn search_collections(
+        &self,
+        filters: Vec<Value>,
+        sort: Vec<(String, String)>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<Value>, u64), opensearch::Error> {
+        let mut sort_json: Vec<Value> = sort
+            .iter()
+            .map(|(field, dir)| {
+                json!({collection_sort_field(field): {
+                    "order": dir,
+                    "missing": "_last",
+                    "unmapped_type": "keyword"
+                }})
+            })
+            .collect();
+        if !sort_json
+            .iter()
+            .any(|s| s.as_object().is_some_and(|o| o.contains_key("id")))
+        {
+            sort_json.push(json!({"id": {"order": "asc"}}));
+        }
+        let index = self.idx(COLLECTIONS_INDEX);
+        let body = json!({
+            "size": limit,
+            "from": offset,
+            "track_total_hits": true,
+            "query": {"bool": {"filter": filters}},
+            "sort": sort_json,
+        });
+        let resp = self
+            .client
+            .search(SearchParts::Index(&[&index]))
+            .body(body)
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let body = resp.json::<Value>().await?;
+        let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let docs = body["hits"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h["_source"].as_object().cloned())
+            .map(Value::Object)
+            .collect();
+        Ok((docs, total))
+    }
+
     // --- node doc helpers ---
 
     async fn get_node(&self, node_id: &str) -> Result<Option<HierarchyNode>, opensearch::Error> {
@@ -1181,6 +1251,58 @@ fn exact_field(field: &str, value: &Value) -> String {
     }
 }
 
+/// Collection docs have no `properties.*` — bare names resolve top-level.
+fn collection_field(field: &str) -> String {
+    field.to_string()
+}
+
+/// Sort field for collections-search: string fields sort on their
+/// `.keyword` sub-field; `id`/`datetime` are the mapped exceptions
+/// (`datetime` sorts on the temporal extent, upstream convention).
+fn collection_sort_field(field: &str) -> String {
+    match field {
+        "id" => "id".to_string(),
+        "datetime" => "extent.temporal.interval".to_string(),
+        f => format!("{f}.keyword"),
+    }
+}
+
+/// Same `.keyword` rule as [`exact_field`], rooted at collection fields:
+/// `id` is a mapped keyword and `extent.*` holds dates/numbers; every
+/// other string field is dynamic `text` + `.keyword`.
+fn collection_exact_field(field: &str, value: &Value) -> String {
+    if value.is_string()
+        && field != "id"
+        && !field.starts_with("extent.")
+        && !field.ends_with(".keyword")
+    {
+        format!("{field}.keyword")
+    } else {
+        field.to_string()
+    }
+}
+
+/// Field-name translation for CQL2/STACQL clauses — item vs collection.
+#[derive(Clone, Copy)]
+pub struct FieldSpec {
+    /// Queryable name -> index field (`platform` -> `properties.platform`
+    /// for items, `platform` -> `platform` for collections).
+    pub map: fn(&str) -> String,
+    /// (index field, value) -> exact-match field (`.keyword` for
+    /// dynamic strings).
+    pub exact: fn(&str, &Value) -> String,
+}
+
+pub const ITEM_FIELDS: FieldSpec = FieldSpec {
+    map: item_field,
+    exact: exact_field,
+};
+
+pub const COLLECTION_FIELDS: FieldSpec = FieldSpec {
+    map: collection_field,
+    exact: collection_exact_field,
+};
+
 /// Page offset — `offset` isn't a modeled `Search` field, it arrives via
 /// `additional_fields` (same trick stac-server's duckdb backend uses).
 /// POST bodies carry it as a number; GET query params arrive as strings.
@@ -1276,35 +1398,42 @@ fn datetime_filter(datetime: &str, use_datetime: bool) -> Value {
 /// `properties.*` (same mapping upstream applies), `eq`/`ne`/`neq`/
 /// `gt`/`gte`/`lt`/`lte`/`in`/`contains` operators supported.
 pub fn stacql_clauses(query: &Map<String, Value>) -> Result<Vec<Value>, String> {
+    stacql_clauses_with(query, ITEM_FIELDS)
+}
+
+pub fn stacql_clauses_with(
+    query: &Map<String, Value>,
+    spec: FieldSpec,
+) -> Result<Vec<Value>, String> {
     let mut clauses = Vec::new();
     for (name, expr) in query {
         let ops = expr
             .as_object()
             .ok_or_else(|| format!("query.{name} must be an object of operators"))?;
-        let field = item_field(name);
+        let field = (spec.map)(name);
         for (op, value) in ops {
-            clauses.push(stacql_clause(&field, op, value)?);
+            clauses.push(stacql_clause(&field, op, value, spec)?);
         }
     }
     Ok(clauses)
 }
 
-fn stacql_clause(field: &str, op: &str, value: &Value) -> Result<Value, String> {
+fn stacql_clause(field: &str, op: &str, value: &Value, spec: FieldSpec) -> Result<Value, String> {
     Ok(match op {
-        "eq" | "contains" => json!({"term": {exact_field(field, value): value}}),
+        "eq" | "contains" => json!({"term": {(spec.exact)(field, value): value}}),
         "ne" | "neq" => {
-            json!({"bool": {"must_not": [{"term": {exact_field(field, value): value}}]}})
+            json!({"bool": {"must_not": [{"term": {(spec.exact)(field, value): value}}]}})
         }
         "gt" | "gte" | "lt" | "lte" => json!({"range": {field: {op: value}}}),
         "in" => match value {
             Value::Array(values) => {
                 let field = values
                     .first()
-                    .map(|v| exact_field(field, v))
+                    .map(|v| (spec.exact)(field, v))
                     .unwrap_or_else(|| field.to_string());
                 json!({"terms": {field: value}})
             }
-            _ => json!({"term": {exact_field(field, value): value}}),
+            _ => json!({"term": {(spec.exact)(field, value): value}}),
         },
         other => return Err(format!("unsupported query operator '{other}'")),
     })
@@ -1315,11 +1444,15 @@ fn stacql_clause(field: &str, op: &str, value: &Value) -> Result<Value, String> 
 /// comparisons (LIKE, BETWEEN, IN) and the basic spatial predicates;
 /// anything else is a 400 via the caller.
 pub fn cql2_clause(filter: &stac_api::Filter) -> Result<Value, String> {
-    let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| e.to_string())?;
-    expr_clause(&expr)
+    cql2_clause_with(filter, ITEM_FIELDS)
 }
 
-fn expr_clause(expr: &cql2::Expr) -> Result<Value, String> {
+pub fn cql2_clause_with(filter: &stac_api::Filter, spec: FieldSpec) -> Result<Value, String> {
+    let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| e.to_string())?;
+    expr_clause(&expr, spec)
+}
+
+fn expr_clause(expr: &cql2::Expr, spec: FieldSpec) -> Result<Value, String> {
     use cql2::Expr;
     match expr {
         Expr::Bool(true) => Ok(json!({"match_all": {}})),
@@ -1328,7 +1461,7 @@ fn expr_clause(expr: &cql2::Expr) -> Result<Value, String> {
             "and" | "or" => {
                 let clauses = args
                     .iter()
-                    .map(|a| expr_clause(a))
+                    .map(|a| expr_clause(a, spec))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(if op == "and" {
                     json!({"bool": {"filter": clauses}})
@@ -1340,12 +1473,12 @@ fn expr_clause(expr: &cql2::Expr) -> Result<Value, String> {
                 let [a] = args.as_slice() else {
                     return Err("'not' expects one operand".into());
                 };
-                Ok(json!({"bool": {"must_not": [expr_clause(a)?]}}))
+                Ok(json!({"bool": {"must_not": [expr_clause(a, spec)?]}}))
             }
-            "=" | "<>" | "<" | "<=" | ">" | ">=" => comparison_clause(op, args),
-            "in" => in_clause(args),
-            "between" => between_clause(args),
-            "like" => like_clause(args),
+            "=" | "<>" | "<" | "<=" | ">" | ">=" => comparison_clause(op, args, spec),
+            "in" => in_clause(args, spec),
+            "between" => between_clause(args, spec),
+            "like" => like_clause(args, spec),
             "isNull" => {
                 let [arg] = args.as_slice() else {
                     return Err("isNull expects a single property".into());
@@ -1353,10 +1486,12 @@ fn expr_clause(expr: &cql2::Expr) -> Result<Value, String> {
                 let Expr::Property { property } = arg.as_ref() else {
                     return Err("isNull expects a property operand".into());
                 };
-                let field = item_field(property);
+                let field = (spec.map)(property);
                 Ok(json!({"bool": {"must_not": [{"exists": {"field": field}}]}}))
             }
-            "s_intersects" | "s_within" | "s_contains" | "s_disjoint" => spatial_clause(op, args),
+            "s_intersects" | "s_within" | "s_contains" | "s_disjoint" => {
+                spatial_clause(op, args, spec)
+            }
             other => Err(format!("unsupported cql2 operator '{other}'")),
         },
         _ => Err("unsupported cql2 expression".into()),
@@ -1373,7 +1508,7 @@ fn two_args<'a>(
     }
 }
 
-fn comparison_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+fn comparison_clause(op: &str, args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
     use cql2::Expr;
     let (a, b) = two_args(op, args)?;
     // The property operand may sit on either side of the literal.
@@ -1389,9 +1524,9 @@ fn comparison_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String
         (">=", true) => "<=",
         (same, _) => same,
     };
-    let field = item_field(property);
+    let field = (spec.map)(property);
     let value = literal_value(lit)?;
-    let exact = exact_field(&field, &value);
+    let exact = (spec.exact)(&field, &value);
     Ok(match op {
         "=" => json!({"term": {exact: value}}),
         "<>" => json!({"bool": {"must_not": [{"term": {exact: value}}]}}),
@@ -1403,24 +1538,24 @@ fn comparison_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String
     })
 }
 
-fn in_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+fn in_clause(args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
     let (a, b) = two_args("in", args)?;
     let (cql2::Expr::Property { property }, cql2::Expr::Array(values)) = (a, b) else {
         return Err("'in' expects a property and an array".into());
     };
-    let field = item_field(property);
+    let field = (spec.map)(property);
     let values = values
         .iter()
         .map(|v| literal_value(v))
         .collect::<Result<Vec<_>, _>>()?;
     let field = values
         .first()
-        .map(|v| exact_field(&field, v))
+        .map(|v| (spec.exact)(&field, v))
         .unwrap_or(field);
     Ok(json!({"terms": {field: values}}))
 }
 
-fn between_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+fn between_clause(args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
     // cql2-json encodes between as (scalar, [lo, hi]); accept the
     // three-operand spelling too.
     let (prop, lo, hi) = match args {
@@ -1434,33 +1569,33 @@ fn between_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
     let cql2::Expr::Property { property } = prop else {
         return Err("'between' expects a property first".into());
     };
-    let field = item_field(property);
+    let field = (spec.map)(property);
     Ok(json!({"range": {field: {
         "gte": literal_value(lo)?,
         "lte": literal_value(hi)?,
     }}}))
 }
 
-fn like_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+fn like_clause(args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
     let (a, b) = two_args("like", args)?;
     let (cql2::Expr::Property { property }, cql2::Expr::Literal(pattern)) = (a, b) else {
         return Err("'like' expects a property and a string pattern".into());
     };
     // LIKE wildcards -> wildcard-query wildcards; dynamic string
     // properties live on the `.keyword` sub-field.
-    let field = exact_field(&item_field(property), &json!(""));
+    let field = (spec.exact)(&(spec.map)(property), &json!(""));
     let pattern = pattern.replace('%', "*").replace('_', "?");
     Ok(json!({"wildcard": {field: {"value": pattern}}}))
 }
 
-fn spatial_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String> {
+fn spatial_clause(op: &str, args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
     let (a, b) = two_args(op, args)?;
     let (property, geom) = match (a, b) {
         (cql2::Expr::Property { property }, g) => (property, g),
         (g, cql2::Expr::Property { property }) => (property, g),
         _ => return Err(format!("'{op}' expects a property operand")),
     };
-    let field = item_field(property);
+    let field = (spec.map)(property);
     let shape = serde_json::to_value(geom).map_err(|e| e.to_string())?;
     let relation = match op {
         "s_intersects" => "intersects",

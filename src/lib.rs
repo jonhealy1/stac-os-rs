@@ -30,6 +30,10 @@ pub fn read_router() -> Router<Arc<AppState>> {
         )
         // --- Core STAC collections routes (global namespace) ---
         .route("/collections", get(list_collections))
+        .route(
+            "/collections-search",
+            get(collections_search_get).post(collections_search_post),
+        )
         .route("/collections/{collection_id}", get(get_collection))
         .route(
             "/collections/{collection_id}/sortables",
