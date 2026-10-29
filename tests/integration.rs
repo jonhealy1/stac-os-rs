@@ -200,16 +200,17 @@ async fn test_scoped_search_intersection() {
     assert_eq!(body["numberMatched"], 1);
     assert_eq!(body["features"][0]["id"], it);
 
-    // Requesting a foreign collection id intersects to empty
-    let (s, body) = call(
+    // Requesting only foreign collection ids is a 403 — upstream
+    // semantics: explicitly-named collections outside the catalog's
+    // scope are rejected, not intersected to empty.
+    let (s, _) = call(
         &app,
         "POST",
         &format!("/catalogs/{cat}/search"),
         Some(json!({"collections": ["not-in-scope"]})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(body["numberReturned"], 0);
+    assert_eq!(s, StatusCode::FORBIDDEN);
 
     // Registry-wide search also finds it (everything is under root).
     // Use an ids filter — the shared dev index outgrows the default page.
@@ -368,7 +369,7 @@ async fn test_search_pagination() {
         async move { call(&app, "POST", &format!("/catalogs/{cat}/search"), Some(body)).await }
     };
 
-    // Page 1: 2 of 3, next link carries offset=2 in its POST body
+    // Page 1: 2 of 3, next link carries an opaque token in its POST body
     let (s, body) = search(json!({"limit": 2})).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["numberMatched"], 3);
@@ -380,7 +381,7 @@ async fn test_search_pagination() {
         .find(|l| l["rel"] == "next")
         .expect("missing next link");
     assert_eq!(next["method"], "POST");
-    assert_eq!(next["body"]["offset"], 2);
+    assert!(next["body"]["token"].is_string());
     assert_eq!(next["body"]["limit"], 2); // original search preserved
 
     // Page 2 via the next link's body: 1 item, prev link back to offset 0
