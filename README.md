@@ -46,7 +46,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/queryables` | OGC Queryables JSON Schema — core fields + properties discovered from the items index mapping (`application/schema+json`) |
 | GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry. Collections-search extensions: `sortby`, `fields`, `q` (free text), `filter` + `filter-lang`, `query`, `datetime`, `bbox` |
-| GET/POST | `/collections-search` | Same parameter surface as extended `/collections`; POST takes `{sortby:[{field,direction}], fields:{include,exclude}, q, filter, query, datetime, bbox, limit, token}` — `next` links carry `body.token` |
+| GET/POST | `/collections-search` | Requires `ENABLE_COLLECTIONS_SEARCH_ROUTE`. Same parameter surface as extended `/collections`; POST takes `{sortby:[{field,direction}], fields:{include,exclude}, q, filter, query, datetime, bbox, limit, token}` — `next` links carry `body.token` |
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
 | GET | `/collections/{collection_id}/queryables` | Per-collection Queryables schema (union — our shared items index can't narrow per collection) |
@@ -162,6 +162,8 @@ All variables are read once at startup — changing them requires a restart.
 |----------|-------------|---------|----------|
 | `ENABLE_TRANSACTIONS_EXTENSIONS` | Mounts all mutating routes — POST/PUT/PATCH/DELETE on collections and items, `bulk_items`, and the `/catalogs` transaction surface. The read surface is always mounted. Set to `true` in `compose.yml`. | `false` | Optional |
 | `CATALOGS_HIDE_ALTERNATE_PARENTS` | Suppresses `related`/`duplicate` links and extra `parent` links for alternate parents in poly-hierarchy — only the contextual `parent` is advertised. Useful for multi-tenant deployments. (Upstream calls this `HIDE_ALTERNATE_PARENTS`.) | `false` | Optional |
+| `ENABLE_COLLECTIONS_SEARCH` | Enables the collection search extensions (`sortby`, `fields`, `q`, `filter`, `query`, `datetime`, `bbox`) on `GET /collections`. `false` = plain `limit`/`token` listing, params ignored. | `true` | Optional |
+| `ENABLE_COLLECTIONS_SEARCH_ROUTE` | Mounts the `GET`/`POST /collections-search` route. Set to `true` in `compose.yml` (upstream default is off). | `false` | Optional |
 
 **Limits & Performance**
 
@@ -185,7 +187,7 @@ All variables are read once at startup — changing them requires a restart.
 |----------|-------------|---------|----------|
 | `USE_DATETIME` | `false` = items carrying `start_datetime`/`end_datetime` are datetime-filtered on the range alone, ignoring `properties.datetime` (matches upstream `USE_DATETIME=false` query semantics). | `true` | Optional |
 
-Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_COLLECTIONS_SEARCH`/`ENABLE_COLLECTIONS_SEARCH_ROUTE`/`ENABLE_CATALOGS_ROUTE` (our extensions are always on), `ENABLE_TOPOLOGY_VALIDATION`, `DATABASE_REFRESH`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
+Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, `DATABASE_REFRESH`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 

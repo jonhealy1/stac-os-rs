@@ -1795,9 +1795,11 @@ mod tests {
         .clone();
         let clauses = stacql_clauses(&q).unwrap();
         assert!(clauses.contains(&json!({"range": {"properties.proj:epsg": {"gt": 1000}}})));
-        assert!(clauses.contains(&json!({"term": {"properties.platform": "landsat"}})));
-        assert!(clauses
-            .contains(&json!({"bool": {"must_not": [{"term": {"properties.mission": "x"}}]}})));
+        // String properties compare on the dynamic `.keyword` sub-field
+        assert!(clauses.contains(&json!({"term": {"properties.platform.keyword": "landsat"}})));
+        assert!(clauses.contains(
+            &json!({"bool": {"must_not": [{"term": {"properties.mission.keyword": "x"}}]}})
+        ));
         // `id` is a top-level item field — not forced under properties.*
         assert!(clauses.contains(&json!({"terms": {"id": ["a", "b"]}})));
     }
@@ -1842,7 +1844,7 @@ mod tests {
         assert_eq!(should[0], json!({"range": {"properties.eo:y": {"gt": 1}}}));
         assert_eq!(
             should[1],
-            json!({"bool": {"must_not": [{"term": {"properties.eo:z": "v"}}]}})
+            json!({"bool": {"must_not": [{"term": {"properties.eo:z.keyword": "v"}}]}})
         );
     }
 

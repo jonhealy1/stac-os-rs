@@ -7,6 +7,7 @@ services:
     environment:
       OPENSEARCH_URL: http://opensearch:9200
       ENABLE_TRANSACTIONS_EXTENSIONS: "true"
+      ENABLE_COLLECTIONS_SEARCH_ROUTE: "true"
     depends_on:
       opensearch:
         condition: service_healthy

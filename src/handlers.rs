@@ -45,6 +45,13 @@ pub struct AppState {
     /// When true, poly-hierarchy alternates (extra `parent` links on
     /// catalogs, `related`/`duplicate` on collections) are suppressed.
     pub hide_alternate_parents: bool,
+    /// `ENABLE_COLLECTIONS_SEARCH` (default true upstream) — when false,
+    /// GET `/collections` ignores the search params (`sortby`, `fields`,
+    /// `q`, `filter`, `query`, `datetime`, `bbox`) and is a plain listing.
+    pub enable_collections_search: bool,
+    /// `ENABLE_COLLECTIONS_SEARCH_ROUTE` (default false upstream) —
+    /// mounts the GET/POST `/collections-search` route.
+    pub enable_collections_search_route: bool,
     /// `STAC_DEFAULT_COLLECTION_LIMIT` — `/collections` page size when
     /// `?limit=` is absent.
     pub default_collection_limit: u64,
@@ -61,6 +68,14 @@ pub struct AppState {
     /// `EXCLUDED_FROM_QUERYABLES` — field prefixes omitted from the
     /// `/queryables` schema.
     pub excluded_queryables: Vec<String>,
+}
+
+impl AppState {
+    /// Either collections-search flag on — gates `bbox_shape` injection
+    /// at write time (upstream does the same check).
+    pub fn collections_search_enabled(&self) -> bool {
+        self.enable_collections_search || self.enable_collections_search_route
+    }
 }
 
 /// Default page size for catalog/collection/children list endpoints.
@@ -491,11 +506,15 @@ fn strip_collection_internals(doc: &mut serde_json::Value) {
     }
 }
 
-/// Collection doc as stored — serialized plus derived search fields.
-fn stored_collection_doc(collection: &Collection) -> serde_json::Value {
+/// Collection doc as stored — serialized plus derived search fields
+/// when collections-search is enabled (upstream skips `bbox_shape`
+/// otherwise).
+fn stored_collection_doc(state: &AppState, collection: &Collection) -> serde_json::Value {
     let mut doc = serde_json::to_value(collection).unwrap_or_default();
-    if let Some(obj) = doc.as_object_mut() {
-        collection_search_fields(obj);
+    if state.collections_search_enabled() {
+        if let Some(obj) = doc.as_object_mut() {
+            collection_search_fields(obj);
+        }
     }
     doc
 }
@@ -1754,7 +1773,7 @@ pub async fn link_or_create_scoped_collection(
                 .create_document(
                     COLLECTIONS_INDEX,
                     &collection.id,
-                    &stored_collection_doc(&collection),
+                    &stored_collection_doc(&state, &collection),
                 )
                 .await?
             {
@@ -1818,7 +1837,7 @@ pub async fn update_scoped_collection(
             .index_document_versioned(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &stored_collection_doc(&collection),
+                &stored_collection_doc(&state, &collection),
                 version,
             )
             .await?
@@ -1828,7 +1847,7 @@ pub async fn update_scoped_collection(
             .replace_document(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &stored_collection_doc(&collection),
+                &stored_collection_doc(&state, &collection),
             )
             .await?
     };
@@ -1877,20 +1896,24 @@ pub async fn unlink_scoped_collection(
 
 // --- Global Collections (core STAC routes) ---
 
-/// GET /collections — every collection in the registry, with the
-/// collections-search extensions (sortby/fields/q/filter/query/
-/// datetime/bbox) layered on.
+/// GET /collections — every collection in the registry. With
+/// `enable_collections_search` off (upstream `ENABLE_COLLECTIONS_SEARCH`,
+/// default on) the search params are ignored: plain `limit`/`token`
+/// listing, mirroring upstream's bare request model.
 pub async fn list_collections(
     Query(query): Query<CollectionsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    collections_page(
-        &state,
-        collections_get_params(query)?,
-        "/collections",
-        false,
-    )
-    .await
+    let params = if state.enable_collections_search {
+        collections_get_params(query)?
+    } else {
+        CollectionsSearchParams {
+            limit: query.limit,
+            token: query.token,
+            ..Default::default()
+        }
+    };
+    collections_page(&state, params, "/collections", false).await
 }
 
 /// GET /collections-search — upstream collections-search route;
@@ -2683,7 +2706,7 @@ pub async fn create_root_collection(
         .create_document(
             COLLECTIONS_INDEX,
             &collection.id,
-            &stored_collection_doc(&collection),
+            &stored_collection_doc(&state, &collection),
         )
         .await?
     {
@@ -2732,7 +2755,7 @@ pub async fn update_root_collection(
             .index_document_versioned(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &stored_collection_doc(&collection),
+                &stored_collection_doc(&state, &collection),
                 version,
             )
             .await?
@@ -2742,7 +2765,7 @@ pub async fn update_root_collection(
             .replace_document(
                 COLLECTIONS_INDEX,
                 &collection_id,
-                &stored_collection_doc(&collection),
+                &stored_collection_doc(&state, &collection),
             )
             .await?
     };
@@ -3130,8 +3153,10 @@ pub async fn patch_root_collection(
         ));
     }
     require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
-    if let Some(obj) = doc.as_object_mut() {
-        collection_search_fields(obj);
+    if state.collections_search_enabled() {
+        if let Some(obj) = doc.as_object_mut() {
+            collection_search_fields(obj);
+        }
     }
     let applied = if headers.contains_key(header::IF_MATCH) {
         state

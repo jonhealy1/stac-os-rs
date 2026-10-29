@@ -30,10 +30,6 @@ pub fn read_router() -> Router<Arc<AppState>> {
         )
         // --- Core STAC collections routes (global namespace) ---
         .route("/collections", get(list_collections))
-        .route(
-            "/collections-search",
-            get(collections_search_get).post(collections_search_post),
-        )
         .route("/collections/{collection_id}", get(get_collection))
         .route(
             "/collections/{collection_id}/sortables",
@@ -151,6 +147,16 @@ pub fn transaction_router() -> Router<Arc<AppState>> {
 /// `state.enable_transactions` is set (ENABLE_TRANSACTIONS_EXTENSIONS).
 pub fn build_app(state: Arc<AppState>) -> Router {
     let mut app = read_router();
+    // Custom collections-search route — opt-in like upstream
+    // (`ENABLE_COLLECTIONS_SEARCH_ROUTE`, default off). The search
+    // params on GET /collections are gated inside list_collections
+    // by `enable_collections_search`.
+    if state.enable_collections_search_route {
+        app = app.route(
+            "/collections-search",
+            get(collections_search_get).post(collections_search_post),
+        );
+    }
     if state.enable_transactions {
         app = app.merge(transaction_router());
     }

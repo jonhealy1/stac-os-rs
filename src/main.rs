@@ -22,6 +22,11 @@ async fn main() {
     };
     let enable_transactions = env_flag("ENABLE_TRANSACTIONS_EXTENSIONS");
     let hide_alternate_parents = env_flag("CATALOGS_HIDE_ALTERNATE_PARENTS");
+    // Upstream defaults: collections-search on, its custom route off.
+    let enable_collections_search = std::env::var("ENABLE_COLLECTIONS_SEARCH")
+        .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+    let enable_collections_search_route = env_flag("ENABLE_COLLECTIONS_SEARCH_ROUTE");
     let env_u64 = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
 
     // `USE_DATETIME` (default true): false = ranged items filter on
@@ -37,6 +42,8 @@ async fn main() {
         links: LinkEngine::new(base_url),
         enable_transactions,
         hide_alternate_parents,
+        enable_collections_search,
+        enable_collections_search_route,
         default_collection_limit: env_u64("STAC_DEFAULT_COLLECTION_LIMIT").unwrap_or(10),
         max_collection_limit: env_u64("STAC_GLOBAL_COLLECTION_MAX_LIMIT"),
         default_item_limit: env_u64("STAC_DEFAULT_ITEM_LIMIT").unwrap_or(10),
