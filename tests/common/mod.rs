@@ -53,6 +53,7 @@ pub async fn test_state_full(
         default_item_limit: 10,
         max_item_limit: None,
         excluded_item_fields: Vec::new(),
+        excluded_queryables: Vec::new(),
     }))
 }
 
@@ -175,7 +176,11 @@ pub async fn ctx(state: &AppState) -> Ctx {
         .unwrap();
     state
         .store
-        .index_document(ITEMS_INDEX, &item_id, item(&item_id, &collection_id))
+        .index_document(
+            ITEMS_INDEX,
+            &format!("{item_id}|{collection_id}"),
+            item(&item_id, &collection_id),
+        )
         .await
         .unwrap();
     Ctx {

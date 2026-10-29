@@ -22,6 +22,7 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/conformance", get(conformance))
         .route("/api", get(api))
         .route("/sortables", get(sortables))
+        .route("/queryables", get(get_queryables))
         // --- Core STAC item search (registry-wide; same as /catalogs/search) ---
         .route(
             "/search",
@@ -33,6 +34,10 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route(
             "/collections/{collection_id}/sortables",
             get(collection_sortables),
+        )
+        .route(
+            "/collections/{collection_id}/queryables",
+            get(get_collection_queryables),
         )
         .route(
             "/collections/{collection_id}/items",

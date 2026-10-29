@@ -50,6 +50,15 @@ async fn main() {
                     .collect()
             })
             .unwrap_or_default(),
+        excluded_queryables: std::env::var("EXCLUDED_FROM_QUERYABLES")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
     let app = build_app(state);
 

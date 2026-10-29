@@ -1099,6 +1099,53 @@
           }
         }
       }
+    },
+    "/queryables": {
+      "get": {
+        "summary": "Global queryables (JSON Schema)",
+        "responses": {
+          "200": {
+            "description": "JSON Schema of queryable properties",
+            "content": {
+              "application/schema+json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/collections/{collectionId}/queryables": {
+      "get": {
+        "summary": "Collection queryables (JSON Schema)",
+        "parameters": [
+          {
+            "name": "collectionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON Schema of queryable properties",
+            "content": {
+              "application/schema+json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Collection not found"
+          }
+        }
+      }
     }
   },
   "components": {

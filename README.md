@@ -42,10 +42,12 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
+| GET | `/queryables` | OGC Queryables JSON Schema — core fields + properties discovered from the items index mapping (`application/schema+json`) |
 | GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry |
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
+| GET | `/collections/{collection_id}/queryables` | Per-collection Queryables schema (union — our shared items index can't narrow per collection) |
 | GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
 | GET | `/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 
@@ -112,7 +114,6 @@ Status codes: `201` create (Mode A), `200` link (Mode B `{"id": ...}`) / update,
 
 | Method | Path | Status |
 |---|---|---|
-| GET | `/collections/{id}/queryables` | 404 |
 | POST | `/catalogs/{id}/bulk` | 404 — bulk transactions extension |
 
 ## Getting Started (coming from Python?)
@@ -210,7 +211,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 - Offset pagination exists: `{"offset": n}` in the POST body or `?offset=` on GET + `next`/`prev` links (`method: POST`, `body`) in search responses; items listings use `?limit=&token=` with `method: GET` `next` links. All paged responses include `numberMatched`/`numberReturned`. Deep paging (>10k) needs `search_after`/cursor — not implemented
 
 **Core STAC routes**
-- `GET /queryables` endpoints (root + per-collection) — not implemented
+- `GET /queryables` (root + per-collection) serve the union of mapped item properties — per-collection narrowing would need per-collection indices or an aggregation pass
 - `service-doc` (human-readable API docs page) — OpenAPI JSON exists at `/api`; no HTML variant
 - `src/openapi.json` is hand-maintained and drifts as features land — generate it from the route types instead (`utoipa` or `aide`)
 

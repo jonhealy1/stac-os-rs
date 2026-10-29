@@ -58,6 +58,9 @@ pub struct AppState {
     /// `EXCLUDED_FROM_ITEMS` — field paths stripped from every item
     /// response (e.g. `private_data,properties.private_data`).
     pub excluded_item_fields: Vec<String>,
+    /// `EXCLUDED_FROM_QUERYABLES` — field prefixes omitted from the
+    /// `/queryables` schema.
+    pub excluded_queryables: Vec<String>,
 }
 
 /// Default page size for catalog/collection/children list endpoints.
@@ -391,6 +394,13 @@ fn global_collection_links(state: &AppState, collection_id: &str, parents: &[Str
 }
 
 /// Serialize a collection with global (canonical) links.
+/// A document in the collections index counts as a collection only when
+/// `type == "Collection"` — upstream's shared index stores catalogs there
+/// too, so wrong-type docs read as missing on the collections surface.
+fn is_collection_doc(doc: &serde_json::Value) -> bool {
+    doc["type"].as_str() == Some("Collection")
+}
+
 async fn global_collection_doc(
     state: &AppState,
     collection_id: &str,
@@ -399,6 +409,7 @@ async fn global_collection_doc(
         .store
         .get_document(COLLECTIONS_INDEX, collection_id)
         .await?
+        .filter(is_collection_doc)
         .ok_or_else(|| ApiError::NotFound(collection_id.to_string()))?;
     let parents = state.store.get_parents(collection_id).await?;
     doc["links"] = json!(global_collection_links(state, collection_id, &parents));
@@ -416,6 +427,13 @@ async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::
 
 /// Serialize an item with canonical links injected — write responses
 /// mirror what a subsequent GET would return.
+/// Physical OpenSearch `_id` for an item document. Items are namespaced
+/// per collection — `"{item_id}|{collection_id}"` (upstream `mk_item_id`)
+/// — so the same item id may exist in different collections.
+fn item_key(item_id: &str, collection_id: &str) -> String {
+    format!("{item_id}|{collection_id}")
+}
+
 fn item_doc(state: &AppState, item: &Item, scoped_catalog_id: Option<&str>) -> serde_json::Value {
     let mut doc = serde_json::to_value(item).unwrap_or_default();
     if let Some(col) = item.collection.as_deref() {
@@ -461,6 +479,7 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.0.0-rc.2/item-search#filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/features-filter",
+        "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/queryables",
         "http://www.opengis.net/spec/cql2/1.0/conf/cql2-json",
         "http://www.opengis.net/spec/cql2/1.0/conf/cql2-text",
         "http://www.opengis.net/spec/cql2/1.0/conf/basic-cql2",
@@ -483,6 +502,105 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
 /// GET /conformance — OGC API conformance classes for the whole service.
 pub async fn conformance(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(json!({ "conformsTo": conformance_classes(&state) }))
+}
+
+/// Core queryables present on every item (upstream DEFAULT_QUERYABLES —
+/// `$ref`s into the STAC item-spec schema).
+fn default_queryables() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("id", json!({"description": "ID", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json#/definitions/core/allOf/2/properties/id"})),
+        ("collection", json!({"description": "Collection", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json#/definitions/core/allOf/2/then/properties/collection"})),
+        ("geometry", json!({"description": "Geometry", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json#/definitions/core/allOf/1/oneOf/0/properties/geometry"})),
+        ("datetime", json!({"description": "Acquisition Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/datetime"})),
+        ("created", json!({"description": "Creation Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/created"})),
+        ("updated", json!({"description": "Update Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/updated"})),
+        ("title", json!({"type": "string", "description": "Item title"})),
+        ("description", json!({"type": "string", "description": "Item description"})),
+        ("keywords", json!({"type": "array", "items": {"type": "string"}, "description": "Item keywords"})),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect::<serde_json::Map<String, serde_json::Value>>())
+}
+
+/// JSON Schema document served by the queryables endpoints.
+fn queryables_schema(
+    state: &AppState,
+    id: String,
+    title: &str,
+    dynamic: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut properties = default_queryables();
+    // Discovered mapping fields fill in around the core set; core $refs win.
+    for (name, schema) in dynamic {
+        properties.entry(name).or_insert(schema);
+    }
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": format!("{}{}", state.base_url, id),
+        "type": "object",
+        "title": title,
+        "description": "Queryable names for the stac-os-rs Item Search filter.",
+        "properties": properties,
+    })
+}
+
+fn json_schema(body: serde_json::Value) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/schema+json")],
+        Json(body),
+    )
+}
+
+/// GET /queryables — union of queryables across all items.
+pub async fn get_queryables(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mapping = state.store.get_index_mapping(ITEMS_INDEX).await?;
+    let index_mapping = mapping
+        .as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|v| v.get("mappings"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let dynamic = crate::store::queryable_properties(&index_mapping, &state.excluded_queryables);
+    Ok(json_schema(queryables_schema(
+        &state,
+        "/queryables".to_string(),
+        "Queryables for stac-os-rs",
+        dynamic,
+    )))
+}
+
+/// GET /collections/{collection_id}/queryables — same union scoped to a
+/// collection (our shared items index means the advertised set is global;
+/// upstream per-collection indices would narrow it).
+pub async fn get_collection_queryables(
+    Path(collection_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    if state
+        .store
+        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(collection_id));
+    }
+    let mapping = state.store.get_index_mapping(ITEMS_INDEX).await?;
+    let index_mapping = mapping
+        .as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|v| v.get("mappings"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let dynamic = crate::store::queryable_properties(&index_mapping, &state.excluded_queryables);
+    Ok(json_schema(queryables_schema(
+        &state,
+        format!("/collections/{collection_id}/queryables"),
+        "Queryables for stac-os-rs",
+        dynamic,
+    )))
 }
 
 /// GET /api — OpenAPI service description (hand-maintained).
@@ -508,6 +626,7 @@ pub async fn root_landing_page(
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
+        { "rel": "http://www.opengis.net/def/rel/ogc/1.0/queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" },
         { "rel": "catalogs", "type": "application/json", "href": format!("{base}/catalogs"), "title": "Multi-Tenant Catalogs Registry" }
     ]);
     // Browseable: a child link per root-level node (collections resolve
@@ -1511,7 +1630,11 @@ pub async fn get_collection_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(mut doc) if doc["collection"] == collection_id => {
             doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
             if let Some(obj) = doc.as_object_mut() {
@@ -1690,7 +1813,11 @@ pub async fn get_scoped_item(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(mut doc) if doc["collection"] == collection_id => {
             doc["links"] = json!(item_links(
                 &state,
@@ -1717,7 +1844,7 @@ pub async fn create_scoped_item(
     // Atomic create — 409 on repost, no get-then-write race
     if !state
         .store
-        .create_document(ITEMS_INDEX, &item.id, &item)
+        .create_document(ITEMS_INDEX, &item_key(&item.id, &collection_id), &item)
         .await?
     {
         return Err(ApiError::Conflict(item.id));
@@ -1737,7 +1864,7 @@ pub async fn update_scoped_item(
     validate_item_collection(&mut item, &collection_id)?;
     if !state
         .store
-        .put_document(ITEMS_INDEX, &item_id, &item)
+        .put_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
         .await?
     {
         return Err(ApiError::WriteConflict(item_id));
@@ -1750,9 +1877,16 @@ pub async fn delete_scoped_item(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(doc) if doc["collection"] == collection_id => {
-            state.store.delete_document(ITEMS_INDEX, &item_id).await?;
+            state
+                .store
+                .delete_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+                .await?;
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(ApiError::NotFound(item_id)),
@@ -1819,6 +1953,7 @@ pub async fn update_root_collection(
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
         .await?
+        .filter(is_collection_doc)
         .is_none()
     {
         return Err(ApiError::NotFound(collection_id));
@@ -1844,6 +1979,7 @@ pub async fn delete_root_collection(
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
         .await?
+        .filter(is_collection_doc)
         .is_none()
     {
         return Err(ApiError::NotFound(collection_id));
@@ -1864,8 +2000,8 @@ pub async fn delete_root_collection(
 pub async fn create_root_item(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    StacJson(mut item): StacJson<Item>,
-) -> Result<impl IntoResponse, ApiError> {
+    StacJson(body): StacJson<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
     if state
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
@@ -1874,10 +2010,17 @@ pub async fn create_root_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
+    if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
+        return create_root_items_batch(&state, &collection_id, &body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    let mut item: Item = serde_json::from_value(body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id)?;
     if state
         .store
-        .get_document(ITEMS_INDEX, &item.id)
+        .get_document(ITEMS_INDEX, &item_key(&item.id, &collection_id))
         .await?
         .is_some()
     {
@@ -1885,12 +2028,64 @@ pub async fn create_root_item(
     }
     if !state
         .store
-        .create_document(ITEMS_INDEX, &item.id, &item)
+        .create_document(ITEMS_INDEX, &item_key(&item.id, &collection_id), &item)
         .await?
     {
         return Err(ApiError::Conflict(item.id));
     }
-    Ok((StatusCode::CREATED, geo_json(item_doc(&state, &item, None))))
+    Ok((StatusCode::CREATED, geo_json(item_doc(&state, &item, None))).into_response())
+}
+
+/// FeatureCollection batch POST — all-or-nothing. Every feature's
+/// collection identity is preflighted (URI-populated when absent) and any
+/// mismatch or existing-id conflict rejects the whole batch before a
+/// single write. In-batch duplicate ids collapse to one write (last wins).
+async fn create_root_items_batch(
+    state: &AppState,
+    collection_id: &str,
+    body: &serde_json::Value,
+) -> Result<(StatusCode, impl IntoResponse), ApiError> {
+    let features = body
+        .get("features")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ApiError::BadRequest("FeatureCollection missing features".into()))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, Item> = std::collections::HashMap::new();
+    for f in features {
+        let mut item: Item = serde_json::from_value(f.clone())
+            .map_err(|e| ApiError::BadRequest(format!("invalid feature: {e}")))?;
+        validate_item_collection(&mut item, collection_id)?;
+        if !by_id.contains_key(&item.id) {
+            order.push(item.id.clone());
+        }
+        by_id.insert(item.id.clone(), item);
+    }
+    for id in &order {
+        if state
+            .store
+            .get_document(ITEMS_INDEX, &item_key(id, collection_id))
+            .await?
+            .is_some()
+        {
+            return Err(ApiError::Conflict(id.clone()));
+        }
+    }
+    let mut docs = Vec::with_capacity(order.len());
+    for id in &order {
+        let item = &by_id[id];
+        if !state
+            .store
+            .create_document(ITEMS_INDEX, &item_key(id, collection_id), item)
+            .await?
+        {
+            return Err(ApiError::Conflict(id.clone()));
+        }
+        docs.push(item_doc(state, item, None));
+    }
+    Ok((
+        StatusCode::CREATED,
+        geo_json(serde_json::json!({"type": "FeatureCollection", "features": docs})),
+    ))
 }
 
 /// PUT /collections/{id}/items/{item_id} — update an item.
@@ -1913,12 +2108,16 @@ pub async fn update_root_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(doc) if doc["collection"] == collection_id => {
             validate_item_collection(&mut item, &collection_id)?;
             if !state
                 .store
-                .replace_document(ITEMS_INDEX, &item_id, &item)
+                .replace_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
                 .await?
             {
                 return Err(ApiError::WriteConflict(item_id));
@@ -1942,9 +2141,16 @@ pub async fn delete_root_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(doc) if doc["collection"] == collection_id => {
-            state.store.delete_document(ITEMS_INDEX, &item_id).await?;
+            state
+                .store
+                .delete_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+                .await?;
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(ApiError::NotFound(item_id)),
@@ -1968,8 +2174,25 @@ fn apply_patch(
         .to_ascii_lowercase();
     match patch {
         serde_json::Value::Array(ops) if content_type == "application/json-patch+json" => {
+            // Upstream patch semantics: a `copy`/`move` op that exactly
+            // duplicates an earlier op in the same document is skipped,
+            // so repeated copy chains read the already-patched scratch
+            // value. Write ops (add/replace/remove/test) always run —
+            // repeated `add` is how upstream's "reset" idiom works.
+            let mut seen = std::collections::HashSet::new();
+            let ops: Vec<serde_json::Value> = ops
+                .iter()
+                .filter(|op| {
+                    !matches!(
+                        op.get("op").and_then(serde_json::Value::as_str),
+                        Some("copy" | "move")
+                    )
+                        || seen.insert(op.to_string())
+                })
+                .cloned()
+                .collect();
             let ops: Vec<json_patch::PatchOperation> =
-                serde_json::from_value(serde_json::Value::Array(ops.clone()))
+                serde_json::from_value(serde_json::Value::Array(ops))
                     .map_err(|e| ApiError::BadRequest(format!("invalid JSON-Patch: {e}")))?;
             json_patch::patch(doc, &ops)
                 .map_err(|e| ApiError::BadRequest(format!("JSON-Patch failed: {e}")))
@@ -2005,6 +2228,19 @@ fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
                 }
             }
         }
+        // Target member absent or scalar: materialize an object and merge,
+        // so null members in the patch are dropped, not stored verbatim.
+        (target, serde_json::Value::Object(patch)) => {
+            let mut merged = serde_json::Map::new();
+            for (key, value) in patch {
+                if !value.is_null() {
+                    let mut slot = serde_json::Value::Null;
+                    merge_patch(&mut slot, value);
+                    merged.insert(key.clone(), slot);
+                }
+            }
+            *target = serde_json::Value::Object(merged);
+        }
         (target, patch) => *target = patch.clone(),
     }
 }
@@ -2021,6 +2257,7 @@ pub async fn patch_root_collection(
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
         .await?
+        .filter(is_collection_doc)
         .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
     apply_patch(
         &mut doc,
@@ -2030,9 +2267,11 @@ pub async fn patch_root_collection(
             .unwrap_or_default(),
         &patch,
     )?;
-    if doc["id"].as_str() != Some(collection_id.as_str()) {
+    if doc["id"].as_str() != Some(collection_id.as_str())
+        || !is_collection_doc(&doc)
+    {
         return Err(ApiError::BadRequest(
-            "a patch may not change the collection id".to_string(),
+            "a patch may not change the collection id or type".to_string(),
         ));
     }
     if !state
@@ -2062,7 +2301,11 @@ pub async fn patch_root_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    match state.store.get_document(ITEMS_INDEX, &item_id).await? {
+    match state
+        .store
+        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .await?
+    {
         Some(mut doc) if doc["collection"] == collection_id => {
             apply_patch(
                 &mut doc,
@@ -2081,7 +2324,7 @@ pub async fn patch_root_item(
             }
             if !state
                 .store
-                .replace_document(ITEMS_INDEX, &item_id, &doc)
+                .replace_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &doc)
                 .await?
             {
                 return Err(ApiError::WriteConflict(item_id));

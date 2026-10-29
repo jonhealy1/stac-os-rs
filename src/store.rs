@@ -4,7 +4,10 @@ use opensearch::{
         transport::{SingleNodeConnectionPool, TransportBuilder},
         StatusCode, Url,
     },
-    indices::{IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts, IndicesPutMappingParts},
+    indices::{
+        IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts, IndicesGetMappingParts,
+        IndicesPutMappingParts,
+    },
     CreateParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts, MgetParts, OpenSearch,
     SearchParts,
 };
@@ -222,6 +225,20 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Raw `GET /{index}/_mapping` for a logical index — used by the
+    /// `/queryables` endpoints to discover dynamic item properties.
+    pub async fn get_index_mapping(&self, logical: &str) -> Result<Value, opensearch::Error> {
+        let index = self.idx(logical);
+        self.client
+            .indices()
+            .get_mapping(IndicesGetMappingParts::Index(&[&index]))
+            .send()
+            .await?
+            .error_for_status_code()?
+            .json()
+            .await
     }
 
     // --- Hierarchy DAG ---
@@ -1034,6 +1051,71 @@ fn recursive_exclude(source: &mut serde_json::Map<String, Value>, parts: &[&str]
 /// through, as does any dotted path (`properties.x`, `assets.x`);
 /// anything else is a `properties.*` member (bare `datetime` included).
 /// Shared by `sortby`, `query`, and `filter` field resolution.
+/// JSON Schema `properties` for `/queryables`, discovered from an index
+/// mapping. Walks `properties` recursively — leaf fields become dotted
+/// `a.b.c` names with `properties.`/`assets.` prefixes stripped
+/// (upstream sfeos semantics). An `excluded` entry drops a subtree and
+/// matches with or without the `properties.` prefix.
+pub fn queryable_properties(mapping: &Value, excluded: &[String]) -> Map<String, Value> {
+    let excluded: Vec<String> = excluded
+        .iter()
+        .flat_map(|e| {
+            let e = e.trim();
+            if e.is_empty() {
+                Vec::new()
+            } else if let Some(bare) = e.strip_prefix("properties.") {
+                vec![e.to_string(), bare.to_string()]
+            } else {
+                vec![e.to_string(), format!("properties.{e}")]
+            }
+        })
+        .collect();
+    let is_excluded = |fqn: &str| {
+        excluded
+            .iter()
+            .any(|p| fqn == p || fqn.starts_with(&format!("{p}.")))
+    };
+
+    let mut props = Map::new();
+    let mut stack: Vec<(String, &Value)> = mapping
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v)).collect())
+        .unwrap_or_default();
+    while let Some((fqn, def)) = stack.pop() {
+        let enabled = def.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        if !enabled || is_excluded(&fqn) {
+            continue;
+        }
+        if let Some(nested) = def.get("properties").and_then(Value::as_object) {
+            stack.extend(nested.iter().map(|(k, v)| (format!("{fqn}.{k}"), v)));
+        }
+        if def.get("type").and_then(Value::as_str).is_none() {
+            continue;
+        }
+        let name = fqn
+            .strip_prefix("properties.")
+            .or_else(|| fqn.strip_prefix("assets."))
+            .unwrap_or(&fqn);
+        props
+            .entry(name.to_string())
+            .or_insert_with(|| os_type_schema(def["type"].as_str().unwrap_or_default()));
+    }
+    props
+}
+
+/// OpenSearch field type -> JSON Schema fragment for a queryable.
+fn os_type_schema(ty: &str) -> Value {
+    match ty {
+        "keyword" | "text" | "wildcard" | "ip" | "version" => json!({"type": "string"}),
+        "date" | "date_nanos" => json!({"type": "string", "format": "date-time"}),
+        "long" | "integer" | "short" | "byte" | "unsigned_long" => json!({"type": "integer"}),
+        "double" | "float" | "half_float" | "scaled_float" => json!({"type": "number"}),
+        "boolean" => json!({"type": "boolean"}),
+        _ => json!({}),
+    }
+}
+
 fn item_field(field: &str) -> String {
     match field {
         "id" | "collection" | "bbox" | "geometry" | "type" => field.to_string(),
@@ -1678,5 +1760,63 @@ mod tests {
             ranged[0]["range"]["properties.end_datetime"],
             json!({"gte": "2023-06-01"})
         );
+    }
+
+    #[test]
+    fn test_queryable_properties_types_and_prefixes() {
+        let mapping = json!({"properties": {
+            "id": {"type": "keyword"},
+            "properties": {"properties": {
+                "datetime": {"type": "date"},
+                "eo:cloud_cover": {"type": "double"},
+                "eo:bands": {"type": "object", "properties": {
+                    "center_wavelength": {"type": "float"},
+                    "full": {"type": "boolean"}
+                }},
+                "private_data": {"type": "keyword"}
+            }},
+            "assets": {"properties": {
+                "thumbnail": {"type": "object", "properties": {
+                    "href": {"type": "keyword"}
+                }}
+            }}
+        }});
+        let props = queryable_properties(&mapping, &[]);
+        assert_eq!(props["id"], json!({"type": "string"}));
+        assert_eq!(
+            props["datetime"],
+            json!({"type": "string", "format": "date-time"})
+        );
+        assert_eq!(props["eo:cloud_cover"], json!({"type": "number"}));
+        assert_eq!(
+            props["eo:bands.center_wavelength"],
+            json!({"type": "number"})
+        );
+        assert_eq!(props["eo:bands.full"], json!({"type": "boolean"}));
+        assert_eq!(props["thumbnail.href"], json!({"type": "string"}));
+        assert!(props.contains_key("private_data"));
+    }
+
+    #[test]
+    fn test_queryable_properties_exclusions() {
+        let mapping = json!({"properties": {
+            "properties": {"properties": {
+                "private_data": {"type": "keyword"},
+                "private": {"type": "object", "properties": {
+                    "nested": {"type": "keyword"}
+                }},
+                "eo:cloud_cover": {"type": "double"}
+            }}
+        }});
+        // exclusion applies with or without the properties. prefix and
+        // drops whole subtrees
+        let props = queryable_properties(
+            &mapping,
+            &["private_data".into(), "properties.private".into()],
+        );
+        assert!(!props.contains_key("private_data"));
+        assert!(!props.contains_key("private"));
+        assert!(!props.contains_key("private.nested"));
+        assert!(props.contains_key("eo:cloud_cover"));
     }
 }
