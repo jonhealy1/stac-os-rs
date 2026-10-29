@@ -758,6 +758,24 @@ def stac_validator_off(monkeypatch):
     monkeypatch.setenv("ENABLE_STAC_VALIDATOR", "false")
 
 
+@pytest_asyncio.fixture()
+async def datetime_nanos_off(txn_client):
+    """Upstream remaps item datetimes to `date` (USE_DATETIME_NANOS=false)
+    for a test; our items index is always millisecond `date`, so a plain
+    reset is the equivalent setup."""
+    await delete_collections_and_items(txn_client)
+    yield
+
+
+async def use_datetime_nanos(value: bool) -> None:
+    """In-process helper — rewrites upstream's index template for
+    USE_DATETIME_NANOS. No external equivalent; callers skip."""
+    pytest.skip(
+        "USE_DATETIME_NANOS rewrites upstream's index template in-process; "
+        "our datetime fields are always mapped `date`"
+    )
+
+
 def get_flattened_routes(router_obj, prefix=""):
     """Flatten routes from a router-like object (kept verbatim from upstream)."""
     api_routes = set()
@@ -865,6 +883,13 @@ _IN_PROCESS_TESTS = {
         "monkeypatches the in-process cql2_text_to_json — an external "
         "API never calls it"
     ),
+    "test_datetime_aggregations_cover_all_dates": (
+        "the aggregation extension (`/aggregate`) is not implemented"
+    ),
+    "test_sort_spans_date_and_date_nanos_indexes": (
+        "rewrites upstream's index template mid-test via in-process "
+        "use_datetime_nanos + USE_DATETIME_NANOS env — no HTTP equivalent"
+    ),
 }
 
 
@@ -915,6 +940,13 @@ def pytest_collection_modifyitems(items):
                 pytest.mark.skip(
                     reason="ENABLE_REDIS_QUEUE=true — Redis queueing is out "
                     "of scope; env-only mutation can't affect external API"
+                )
+            )
+        elif params.get("use_datetime") == "false":
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="fixture mutates USE_DATETIME=false in-process; "
+                    "external API reads config at startup"
                 )
             )
         elif params.get("field") in ("start_datetime", "end_datetime"):

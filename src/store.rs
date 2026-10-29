@@ -820,7 +820,17 @@ impl Store {
                 }})
             })
             .collect();
-        if !sort.is_empty() {
+        if sort.is_empty() {
+            // No sortby — upstream's DEFAULT_SORT (mappings.py) is an
+            // index-level segment sort, which orders docs missing the
+            // field last. `_last` replicates that at query time.
+            sort = vec![
+                json!({"properties.datetime": {"order": "desc", "missing": "_last"}}),
+                json!({"properties.start_datetime": {"order": "desc", "missing": "_last"}}),
+                json!({"id": {"order": "desc"}}),
+                json!({"collection": {"order": "desc"}}),
+            ];
+        } else {
             sort.push(json!({"_id": {"order": "asc"}}));
         }
 

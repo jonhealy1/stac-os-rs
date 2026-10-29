@@ -1168,6 +1168,7 @@ async fn run_scoped_search(
     state: &AppState,
     scope_id: &str,
     mut search: Search,
+    req: Option<(axum::http::Uri, bool)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let empty = || {
         let mut c =
@@ -1366,33 +1367,71 @@ async fn run_scoped_search(
     collection.number_returned = Some(returned);
     collection.links.push(link_json(format!("{base}/"), "root"));
 
-    // 4. Offset pagination links (STAC pagination: method+body on the link).
+    // 4. Pagination links — upstream PagingLinks: GET merges the request
+    // URL with a `token` query param (`method: GET`); POST carries the
+    // search body + `token` (`method: POST`). Self = the request URL.
     let limit = search
         .items
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .min(MAX_SEARCH_LIMIT);
     let offset = search_offset(&search);
-    let href = if scope_id == ROOT_CATALOG_ID {
-        format!("{}/catalogs/search", state.base_url)
-    } else {
-        format!("{}/catalogs/{scope_id}/search", state.base_url)
+    let get_uri = req.as_ref().filter(|(_, is_get)| *is_get).map(|(u, _)| u);
+    let base = &state.base_url;
+    let self_href = match &req {
+        Some((u, _)) => format!("{base}{u}"),
+        None => {
+            if scope_id == ROOT_CATALOG_ID {
+                format!("{base}/catalogs/search")
+            } else {
+                format!("{base}/catalogs/{scope_id}/search")
+            }
+        }
     };
-    collection.links.push(link_json(href.clone(), "self"));
+    let post_href = match &req {
+        Some((u, _)) => format!("{base}{}", u.path()),
+        None => self_href.clone(),
+    };
+    collection.links.push(link_json(self_href, "self"));
     if offset + returned < matched {
-        collection
-            .links
-            .push(page_link("next", &href, &search, offset + limit));
+        collection.links.push(match get_uri {
+            Some(u) => page_link_get("next", base, u, offset + limit),
+            None => page_link("next", &post_href, &search, offset + limit),
+        });
     }
     if offset > 0 {
-        collection.links.push(page_link(
-            "prev",
-            &href,
-            &search,
-            offset.saturating_sub(limit),
-        ));
+        collection.links.push(match get_uri {
+            Some(u) => page_link_get("prev", base, u, offset.saturating_sub(limit)),
+            None => page_link("prev", &post_href, &search, offset.saturating_sub(limit)),
+        });
     }
     Ok(geo_json(collection))
+}
+
+/// GET-side pagination link: rel + href (request URL with `token`
+/// merged in) + `method: GET` — upstream `PagingLinks.link_next`.
+fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, offset: u64) -> Link {
+    let pq = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let (path, query) = pq.split_once('?').unwrap_or((pq, ""));
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("token="))
+        .collect();
+    let mut merged = path.to_string();
+    merged.push('?');
+    if !kept.is_empty() {
+        merged.push_str(&kept.join("&"));
+        merged.push('&');
+    }
+    merged.push_str("token=");
+    merged.push_str(&encode_item_token(offset));
+    let mut link = Link::new(format!("{base}{merged}"), rel);
+    link.method = Some("GET".to_string());
+    link.r#type = Some("application/json".to_string());
+    link
 }
 
 /// A STAC pagination link: rel + href + `method: POST` + the original
@@ -1528,41 +1567,45 @@ impl<'de> serde::Deserialize<'de> for SearchBody {
 pub async fn scoped_search_post(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
     Query(params): Query<HashMap<String, String>>,
     StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut search = search.0;
     apply_query_token(&mut search, params.get("token"));
-    run_scoped_search(&state, &catalog_id, search).await
+    run_scoped_search(&state, &catalog_id, search, Some((uri, false))).await
 }
 
 pub async fn scoped_search_get(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
     Query(params): Query<GetSearch>,
 ) -> Result<impl IntoResponse, ApiError> {
     let search = get_to_search(params)?;
-    run_scoped_search(&state, &catalog_id, search).await
+    run_scoped_search(&state, &catalog_id, search, Some((uri, true))).await
 }
 
 /// Search across the whole catalogs registry — equivalent to scoping to
 /// `root`, since every orphan is adopted there.
 pub async fn catalogs_search_post(
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
     Query(params): Query<HashMap<String, String>>,
     StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut search = search.0;
     apply_query_token(&mut search, params.get("token"));
-    run_scoped_search(&state, ROOT_CATALOG_ID, search).await
+    run_scoped_search(&state, ROOT_CATALOG_ID, search, Some((uri, false))).await
 }
 
 pub async fn catalogs_search_get(
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
     Query(params): Query<GetSearch>,
 ) -> Result<impl IntoResponse, ApiError> {
     let search = get_to_search(params)?;
-    run_scoped_search(&state, ROOT_CATALOG_ID, search).await
+    run_scoped_search(&state, ROOT_CATALOG_ID, search, Some((uri, true))).await
 }
 
 // --- Transaction Handlers ---
