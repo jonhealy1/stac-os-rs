@@ -102,6 +102,10 @@ pub fn transaction_router() -> Router<Arc<AppState>> {
         )
         .route("/collections/{collection_id}/items", post(create_root_item))
         .route(
+            "/collections/{collection_id}/bulk_items",
+            post(bulk_create_items),
+        )
+        .route(
             "/collections/{collection_id}/items/{item_id}",
             put(update_root_item)
                 .delete(delete_root_item)
@@ -147,4 +151,37 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         app = app.merge(transaction_router());
     }
     app.with_state(state)
+        // Compression first so it runs innermost on the way out; the
+        // etag layer is outermost and sees the final Content-Encoding.
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(axum::middleware::from_fn(etag_content_coding))
+}
+
+/// Response-side ETag finishing: when the body is content-encoded
+/// (gzip/br), append `-<coding>` inside the ETag quotes — a tag shared
+/// by differently-encoded bodies would be weak (RFC 9110 §8.8.1).
+async fn etag_content_coding(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let coding = resp
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !coding.is_empty() && coding != "identity" {
+        if let Some(value) = resp.headers().get(axum::http::header::ETAG) {
+            if let Ok(tag) = value.to_str() {
+                if let Some(inner) = tag.strip_suffix('"') {
+                    let tagged = format!("{inner}-{coding}\"");
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&tagged) {
+                        resp.headers_mut().insert(axum::http::header::ETAG, v);
+                    }
+                }
+            }
+        }
+    }
+    resp
 }

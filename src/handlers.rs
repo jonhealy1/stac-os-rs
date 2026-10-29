@@ -87,6 +87,16 @@ pub struct ListQuery {
     pub sortby: Option<String>,
     /// Fields extension (features binding): `?fields=+include,-exclude`.
     pub fields: Option<String>,
+    // Items-listing filters — consumed by `items_page` only; silently
+    // ignored on catalog/collection listings. `intersects` is
+    // deliberately absent (unaccepted on the items binding).
+    pub ids: Option<String>,
+    pub query: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "filter-lang")]
+    pub filter_lang: Option<String>,
+    pub bbox: Option<String>,
+    pub datetime: Option<String>,
 }
 
 /// Resolve `?limit=&token=` into `(limit, offset)` — absent limit falls
@@ -432,6 +442,73 @@ async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::
 /// — so the same item id may exist in different collections.
 fn item_key(item_id: &str, collection_id: &str) -> String {
     format!("{item_id}|{collection_id}")
+}
+
+/// Strong ETag for a stored document version:
+/// `"<primary_term>-<seq_no>-<indexhash>"`. When the response body is
+/// compressed the response layer appends `-<coding>` inside the quotes;
+/// `If-Match` comparison normalizes that suffix away (a tag shared by
+/// gzip and plain bodies would be weak, RFC 9110 §8.8.1).
+fn etag_of(state: &AppState, index: &str, v: &crate::store::DocVersion) -> String {
+    format!(
+        "\"{}-{}-{}\"",
+        v.primary_term,
+        v.seq_no,
+        state.store.index_hash(index)
+    )
+}
+
+/// The version portion of an ETag — drop a trailing `-<coding>` suffix.
+fn etag_version_part(tag: &str) -> &str {
+    let mut dashes = tag.match_indices('-');
+    let _ = dashes.next();
+    let _ = dashes.next();
+    match dashes.next() {
+        Some((i, _)) => &tag[..i],
+        None => tag,
+    }
+}
+
+/// RFC 9110 §13.1.1 strong comparison for `If-Match`: `*` or any list
+/// element that is a well-formed strong tag equal to the current version
+/// (coding suffix normalized). Weak (`W/"…"`) and malformed elements
+/// never match; whitespace around elements is space/tab only.
+fn if_match_holds(header_value: &str, current_etag: &str) -> bool {
+    let current = current_etag.trim_matches('"');
+    header_value.split(',').any(|raw| {
+        let tag = raw.trim_matches(|c| c == ' ' || c == '\t');
+        if tag == "*" {
+            return true;
+        }
+        let Some(inner) = tag.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+            return false;
+        };
+        etag_version_part(inner) == current
+    })
+}
+
+/// 412 unless `If-Match` is absent or holds against `current_etag`.
+fn require_if_match(headers: &axum::http::HeaderMap, current_etag: &str) -> Result<(), ApiError> {
+    match headers.get(header::IF_MATCH) {
+        Some(v) if !if_match_holds(v.to_str().unwrap_or_default(), current_etag) => {
+            Err(ApiError::PreconditionFailed)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Attach `etag` to a status+body response.
+fn etag_response(status: StatusCode, etag: &str, body: impl IntoResponse) -> impl IntoResponse {
+    (
+        status,
+        [(
+            header::ETAG,
+            axum::http::HeaderValue::from_str(etag).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static("\"invalid\"")
+            }),
+        )],
+        body,
+    )
 }
 
 fn item_doc(state: &AppState, item: &Item, scoped_catalog_id: Option<&str>) -> serde_json::Value {
@@ -816,8 +893,7 @@ pub async fn get_catalog_children(
         &ListQuery {
             limit: query.limit,
             token: query.token.clone(),
-            sortby: None,
-            fields: None,
+            ..Default::default()
         },
         DEFAULT_LIST_LIMIT,
         None,
@@ -1012,13 +1088,123 @@ pub async fn catalog_conformance(
 
 // --- Scoped Item Search ---
 
-/// Shared scoped-search pipeline: intersect the request's collections with
-/// the scope's descendants, then run the OpenSearch query.
+/// Shared scoped-search pipeline, in upstream order: pagination token →
+/// catalog-scope 403 → extension-param parsing → spec validation → query.
 async fn run_scoped_search(
     state: &AppState,
     scope_id: &str,
     mut search: Search,
 ) -> Result<impl IntoResponse, ApiError> {
+    let empty = || {
+        let mut c =
+            ItemCollection::new(Vec::new()).map_err(|e| ApiError::Internal(e.to_string()))?;
+        c.number_matched = Some(0);
+        c.number_returned = Some(0);
+        Ok::<_, ApiError>(c)
+    };
+
+    // Pagination token → numeric offset (rejected before any lookup).
+    if let Some(t) = search.items.additional_fields.get("token").cloned() {
+        if !t.is_null() {
+            let offset = match &t {
+                serde_json::Value::String(s) => decode_item_token(s)?,
+                serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+                    ApiError::BadRequest("Invalid pagination token.".to_string())
+                })?,
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "Invalid pagination token.".to_string(),
+                    ))
+                }
+            };
+            search
+                .items
+                .additional_fields
+                .insert("offset".to_string(), json!(offset));
+        }
+        search.items.additional_fields.shift_remove("token");
+    }
+
+    // Scope: intersect requested collections with the catalog's
+    // descendants. A request naming only out-of-scope collections is a
+    // 403 (upstream semantics); parsing happens after this check.
+    let allowed_collections = state.store.get_descendant_collections(scope_id).await?;
+    if !search.collections.is_empty() {
+        search
+            .collections
+            .retain(|c| allowed_collections.contains(c));
+        if search.collections.is_empty() {
+            if scope_id != ROOT_CATALOG_ID {
+                return Err(ApiError::Forbidden(
+                    "Requested collections are outside the scope of this catalog.".to_string(),
+                ));
+            }
+            return Ok(geo_json(empty()?));
+        }
+    } else {
+        search.collections = allowed_collections.iter().cloned().collect();
+    }
+
+    // Deferred GET params the crate can't model — parsed now, in
+    // upstream order (query → intersects → filter-lang).
+    if let Some(raw) = search
+        .items
+        .additional_fields
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Object(map)) => search.items.query = Some(map),
+            Ok(_) => {
+                return Err(ApiError::BadRequest(
+                    "Invalid parameters provided: query must be a JSON object".to_string(),
+                ))
+            }
+            Err(_) => {
+                return Err(ApiError::BadRequest(
+                    "Invalid query parameter: expected valid JSON.".to_string(),
+                ))
+            }
+        }
+        search.items.additional_fields.shift_remove("query");
+    }
+    if let Some(raw) = search
+        .items
+        .additional_fields
+        .shift_remove("__intersects")
+        .and_then(|v| v.as_str().map(str::to_owned))
+    {
+        search.intersects = serde_json::from_str(&raw).map_err(|_| {
+            ApiError::BadRequest("Invalid intersects parameter: expected valid JSON.".to_string())
+        })?;
+    }
+    if let Some(filter) = &mut search.items.filter {
+        if let stac_api::Filter::Cql2Text(raw) = filter {
+            if search
+                .items
+                .additional_fields
+                .get("__filter_lang")
+                .and_then(|v| v.as_str())
+                == Some("cql2-json")
+            {
+                let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+                    ApiError::BadRequest(
+                        "Invalid filter parameter: expected valid CQL2 JSON.".to_string(),
+                    )
+                })?;
+                let map = parsed.as_object().cloned().ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "Invalid filter parameter: expected a CQL2 expression with an operator."
+                            .to_string(),
+                    )
+                })?;
+                *filter = stac_api::Filter::Cql2Json(map);
+            }
+        }
+    }
+    search.items.additional_fields.shift_remove("__filter_lang");
+
     // Antimeridian: a bbox with west > east means "crosses the dateline"
     // per spec, but the stac crate's `Bbox::is_valid` rejects it. Rewrite
     // crossing bboxes as a two-piece `intersects` MultiPolygon split at
@@ -1050,34 +1236,13 @@ async fn run_scoped_search(
     // are rejected by the crate).
     search = search
         .valid()
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| ApiError::BadRequest(format!("Invalid parameters provided: {e}")))?;
 
-    let empty = || {
-        let mut c =
-            ItemCollection::new(Vec::new()).map_err(|e| ApiError::Internal(e.to_string()))?;
-        c.number_matched = Some(0);
-        c.number_returned = Some(0);
-        Ok::<_, ApiError>(c)
-    };
-
-    // 1. Resolve all descendant collection IDs in the scope's DAG
-    let allowed_collections = state.store.get_descendant_collections(scope_id).await?;
-    if allowed_collections.is_empty() {
-        return Ok(geo_json(empty()?));
-    }
-
-    // 2. Security & Intersection: Enforce scope boundaries on search payload
+    // A scope with no collections (or a root request filtered to
+    // nothing) short-circuits — after parsing, so malformed extension
+    // params still surface their 400 (#935 semantics).
     if search.collections.is_empty() {
-        // No filter provided — restrict to all descendants of this scope
-        search.collections = allowed_collections.into_iter().collect();
-    } else {
-        // Intersect requested collections with allowed descendants
-        search
-            .collections
-            .retain(|c| allowed_collections.contains(c));
-        if search.collections.is_empty() {
-            return Ok(geo_json(empty()?));
-        }
+        return Ok(geo_json(empty()?));
     }
 
     // 3. Query OpenSearch — collections scope + bbox/datetime/intersects/ids
@@ -1085,10 +1250,16 @@ async fn run_scoped_search(
     // to extra filter clauses (malformed expressions are a 400).
     let mut extra_filters = Vec::new();
     if let Some(query) = &search.items.query {
-        extra_filters.extend(crate::store::stacql_clauses(query).map_err(ApiError::BadRequest)?);
+        extra_filters.extend(
+            crate::store::stacql_clauses(query)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid query parameter: {e}")))?,
+        );
     }
     if let Some(filter) = &search.items.filter {
-        extra_filters.push(crate::store::cql2_clause(filter).map_err(ApiError::BadRequest)?);
+        extra_filters.push(
+            crate::store::cql2_clause(filter)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
+        );
     }
     let (mut items, matched) = state
         .store
@@ -1151,15 +1322,109 @@ async fn run_scoped_search(
 }
 
 /// A STAC pagination link: rel + href + `method: POST` + the original
-/// search body with an updated `offset`.
+/// search body with an opaque `token` for the next page.
 fn page_link(rel: &str, href: &str, search: &Search, offset: u64) -> Link {
     let mut body = serde_json::to_value(search).unwrap_or_default();
-    body["offset"] = json!(offset);
+    body["token"] = json!(encode_item_token(offset));
     let mut link = Link::new(href, rel);
     link.method = Some("POST".to_string());
     link.r#type = Some("application/geo+json".to_string());
     link.body = body.as_object().cloned();
     link
+}
+
+/// Opaque pagination token: url-safe base64 of a JSON `[offset]` —
+/// upstream tokens are a base64'd JSON list too, so clients can't tell
+/// the difference.
+fn encode_item_token(offset: u64) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    URL_SAFE_NO_PAD.encode(format!("[{offset}]"))
+}
+
+fn decode_item_token(token: &str) -> Result<u64, ApiError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let invalid = || ApiError::BadRequest("Invalid pagination token.".to_string());
+    if token.is_empty() {
+        return Err(invalid());
+    }
+    if let Ok(raw) = URL_SAFE_NO_PAD.decode(token) {
+        return match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Array(parts)) => {
+                parts.first().and_then(|v| v.as_u64()).ok_or_else(invalid)
+            }
+            _ => Err(invalid()),
+        };
+    }
+    // Numeric fallback — older `next` links carried the raw offset.
+    token.parse::<u64>().map_err(|_| invalid())
+}
+
+/// POST /search honors a `?token=` query parameter only when the body
+/// has none (`null` counts as absent).
+fn apply_query_token(search: &mut Search, query_token: Option<&String>) {
+    let body_token = search.items.additional_fields.get("token");
+    if (body_token.is_none() || body_token == Some(&serde_json::Value::Null))
+        && query_token.is_some()
+    {
+        search
+            .items
+            .additional_fields
+            .insert("token".to_string(), json!(query_token));
+    }
+}
+
+/// Decode `+`/`%XX` — upstream decodes `intersects` twice (clients
+/// double-encode), so the once-decoded query value gets a second pass.
+fn percent_decode_plus(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `GetSearch` -> `Search`, preserving the pieces the crate drops:
+/// `intersects` gets a second percent-decode and `filter-lang` is
+/// stashed — both are parsed inside `run_scoped_search` so the
+/// catalog-scope check precedes parsing errors (upstream order).
+fn get_to_search(mut params: GetSearch) -> Result<Search, ApiError> {
+    let intersects_raw = params.intersects.take();
+    let filter_lang = params.items.filter_lang.take();
+    let mut search = Search::try_from(params)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid parameters provided: {e}")))?;
+    if let Some(raw) = intersects_raw {
+        search
+            .items
+            .additional_fields
+            .insert("__intersects".to_string(), json!(percent_decode_plus(&raw)));
+    }
+    if let Some(lang) = filter_lang {
+        search
+            .items
+            .additional_fields
+            .insert("__filter_lang".to_string(), json!(lang));
+    }
+    Ok(search)
 }
 
 /// POST /search body. The stac-api crate's `Fields` requires both `include`
@@ -1189,9 +1454,12 @@ impl<'de> serde::Deserialize<'de> for SearchBody {
 pub async fn scoped_search_post(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
     StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    run_scoped_search(&state, &catalog_id, search.0).await
+    let mut search = search.0;
+    apply_query_token(&mut search, params.get("token"));
+    run_scoped_search(&state, &catalog_id, search).await
 }
 
 pub async fn scoped_search_get(
@@ -1199,7 +1467,7 @@ pub async fn scoped_search_get(
     State(state): State<Arc<AppState>>,
     Query(params): Query<GetSearch>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let search = Search::try_from(params).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let search = get_to_search(params)?;
     run_scoped_search(&state, &catalog_id, search).await
 }
 
@@ -1207,16 +1475,19 @@ pub async fn scoped_search_get(
 /// `root`, since every orphan is adopted there.
 pub async fn catalogs_search_post(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
     StacJson(search): StacJson<SearchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    run_scoped_search(&state, ROOT_CATALOG_ID, search.0).await
+    let mut search = search.0;
+    apply_query_token(&mut search, params.get("token"));
+    run_scoped_search(&state, ROOT_CATALOG_ID, search).await
 }
 
 pub async fn catalogs_search_get(
     State(state): State<Arc<AppState>>,
     Query(params): Query<GetSearch>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let search = Search::try_from(params).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let search = get_to_search(params)?;
     run_scoped_search(&state, ROOT_CATALOG_ID, search).await
 }
 
@@ -1463,6 +1734,7 @@ pub async fn get_scoped_collection(
 pub async fn update_scoped_collection(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     StacJson(collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
@@ -1472,15 +1744,44 @@ pub async fn update_scoped_collection(
             collection.id
         )));
     }
-    if !state
+    let (_, version) = state
         .store
-        .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
-    {
-        return Err(ApiError::WriteConflict(collection_id));
+        .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
+    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    let applied = if headers.contains_key(header::IF_MATCH) {
+        state
+            .store
+            .index_document_versioned(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &collection,
+                version,
+            )
+            .await?
+    } else {
+        state
+            .store
+            .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
+            .await?
+    };
+    if !applied {
+        return Err(if headers.contains_key(header::IF_MATCH) {
+            ApiError::PreconditionFailed
+        } else {
+            ApiError::WriteConflict(collection_id)
+        });
     }
-    Ok(Json(
-        collection_doc(&state, &collection, &catalog_id).await?,
+    let (_, version) = state
+        .store
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("collection vanished after write".into()))?;
+    Ok(etag_response(
+        StatusCode::OK,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+        Json(collection_doc(&state, &collection, &catalog_id).await?),
     ))
 }
 
@@ -1572,7 +1873,19 @@ pub async fn get_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(global_collection_doc(&state, &collection_id).await?))
+    let Some((_, version)) = state
+        .store
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .filter(|t| is_collection_doc(&t.0))
+    else {
+        return Err(ApiError::NotFound(collection_id));
+    };
+    Ok(etag_response(
+        StatusCode::OK,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+        Json(global_collection_doc(&state, &collection_id).await?),
+    ))
 }
 
 /// GET /collections/{id}/items — global item listing for a collection.
@@ -1590,13 +1903,8 @@ pub async fn list_collection_items(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    let mut collection =
+    let (mut collection, offset) =
         items_page(&state, std::slice::from_ref(&collection_id), &query, None).await?;
-    let offset = query
-        .token
-        .as_deref()
-        .and_then(|t| t.parse::<u64>().ok())
-        .unwrap_or(0);
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!("{}/collections/{collection_id}/items", state.base_url),
@@ -1632,15 +1940,19 @@ pub async fn get_collection_item(
     }
     match state
         .store
-        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
         .await?
     {
-        Some(mut doc) if doc["collection"] == collection_id => {
+        Some((mut doc, version)) if doc["collection"] == collection_id => {
             doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
             if let Some(obj) = doc.as_object_mut() {
                 strip_excluded_item_fields(&state, obj);
             }
-            Ok(geo_json(doc))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, ITEMS_INDEX, &version),
+                geo_json(doc),
+            ))
         }
         _ => Err(ApiError::NotFound(item_id)),
     }
@@ -1676,9 +1988,9 @@ pub async fn disband_catalog(
 /// Enforce that the item's declared `collection` matches the path.
 fn validate_item_collection(item: &mut Item, collection_id: &str) -> Result<(), ApiError> {
     match &item.collection {
-        Some(c) if c != collection_id => Err(ApiError::BadRequest(format!(
-            "item collection '{c}' does not match path collection '{collection_id}'"
-        ))),
+        Some(c) if c != collection_id => Err(ApiError::BadRequest(
+            "Collection ID from path does not match Collection ID from request body".to_string(),
+        )),
         Some(_) => Ok(()),
         None => {
             item.collection = Some(collection_id.to_string());
@@ -1693,18 +2005,13 @@ pub async fn list_scoped_items(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    let mut collection = items_page(
+    let (mut collection, offset) = items_page(
         &state,
         std::slice::from_ref(&collection_id),
         &query,
         Some(&catalog_id),
     )
     .await?;
-    let offset = query
-        .token
-        .as_deref()
-        .and_then(|t| t.parse::<u64>().ok())
-        .unwrap_or(0);
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!(
@@ -1728,21 +2035,47 @@ pub async fn list_scoped_items(
     Ok(geo_json(collection))
 }
 
-/// Shared items-listing pipeline: `?limit=&token=` -> paginated search.
+/// Shared items-listing pipeline: `?limit=&token=` + the features-binding
+/// filters (`ids`/`query`/`filter`/`bbox`/`datetime`) -> paginated search.
 /// `scoped_catalog_id` selects scoped vs canonical item link paths.
+/// Returns the collection and the page offset (for the `next` link).
 async fn items_page(
     state: &AppState,
     collections: &[String],
     query: &ListQuery,
     scoped_catalog_id: Option<&str>,
-) -> Result<ItemCollection, ApiError> {
-    let (limit, offset) = list_window(query, state.default_item_limit, state.max_item_limit)?;
+) -> Result<(ItemCollection, u64), ApiError> {
+    let (limit, _) = list_window(query, state.default_item_limit, state.max_item_limit)?;
+    let offset = query
+        .token
+        .as_deref()
+        .map(decode_item_token)
+        .transpose()?
+        .unwrap_or(0);
     let mut search = Search::default();
     search.items.limit = Some(limit);
     search
         .items
         .additional_fields
         .insert("offset".to_string(), json!(offset));
+    if let Some(ids) = &query.ids {
+        search.ids = ids.split(',').map(|s| s.to_string()).collect();
+    }
+    if let Some(bbox) = &query.bbox {
+        let nums: Vec<f64> = bbox
+            .split(',')
+            .map(|s| s.parse())
+            .collect::<Result<_, _>>()
+            .map_err(|_| {
+                ApiError::BadRequest("Invalid parameters provided: bbox".to_string())
+            })?;
+        search.items.bbox = Some(nums.try_into().map_err(|_| {
+            ApiError::BadRequest("Invalid parameters provided: bbox".to_string())
+        })?);
+    }
+    if let Some(datetime) = &query.datetime {
+        search.items.datetime = Some(datetime.clone());
+    }
     if let Some(sortby) = &query.sortby {
         search.items.sortby = sortby
             .split(',')
@@ -1752,9 +2085,41 @@ async fn items_page(
     if let Some(fields) = &query.fields {
         search.items.fields = Some(fields.parse().expect("infallible"));
     }
+    let mut extra_filters = Vec::new();
+    if let Some(raw) = &query.query {
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(map)) => extra_filters.extend(
+                crate::store::stacql_clauses(&map)
+                    .map_err(|e| ApiError::BadRequest(format!("Invalid query parameter: {e}")))?,
+            ),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "Invalid query parameter: expected valid JSON.".to_string(),
+                ))
+            }
+        }
+    }
+    if let Some(expr) = &query.filter {
+        let filter = if query.filter_lang.as_deref() == Some("cql2-json") {
+            match serde_json::from_str::<serde_json::Value>(expr) {
+                Ok(serde_json::Value::Object(map)) => stac_api::Filter::Cql2Json(map),
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "Invalid filter parameter: expected valid CQL2 JSON.".to_string(),
+                    ))
+                }
+            }
+        } else {
+            stac_api::Filter::Cql2Text(expr.clone())
+        };
+        extra_filters.push(
+            crate::store::cql2_clause(&filter)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
+        );
+    }
     let (mut items, matched) = state
         .store
-        .search_items(collections, &search, Vec::new())
+        .search_items(collections, &search, extra_filters)
         .await?;
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
@@ -1779,7 +2144,7 @@ async fn items_page(
         ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
     collection.number_matched = Some(matched);
     collection.number_returned = Some(returned);
-    Ok(collection)
+    Ok((collection, offset))
 }
 
 /// `next` link for a paged items listing (GET href with limit+token).
@@ -1800,7 +2165,7 @@ fn items_next_link(
             "{}{path}?limit={}&token={}",
             state.base_url,
             limit,
-            offset + limit
+            encode_item_token(offset + limit)
         ),
         "next",
     );
@@ -1931,8 +2296,14 @@ pub async fn create_root_collection(
     {
         return Err(ApiError::Conflict(collection.id));
     }
-    Ok((
+    let (_, version) = state
+        .store
+        .get_document_versioned(COLLECTIONS_INDEX, &collection.id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("collection vanished after create".into()))?;
+    Ok(etag_response(
         StatusCode::CREATED,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
         Json(global_collection_doc(&state, &collection.id).await?),
     ))
 }
@@ -1941,6 +2312,7 @@ pub async fn create_root_collection(
 pub async fn update_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     StacJson(mut collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     if collection.id != collection_id {
@@ -1949,24 +2321,51 @@ pub async fn update_root_collection(
             collection.id
         )));
     }
-    if state
+    let Some((_, version)) = state
         .store
-        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
-        .filter(is_collection_doc)
-        .is_none()
-    {
+        .filter(|t| is_collection_doc(&t.0))
+    else {
         return Err(ApiError::NotFound(collection_id));
-    }
+    };
+    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
     collection.links.clear();
-    if !state
-        .store
-        .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
-        .await?
-    {
-        return Err(ApiError::WriteConflict(collection_id));
+    // With If-Match the write is conditioned on the version that
+    // satisfied the check — check and write are one atomic step.
+    let applied = if headers.contains_key(header::IF_MATCH) {
+        state
+            .store
+            .index_document_versioned(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &collection,
+                version,
+            )
+            .await?
+    } else {
+        state
+            .store
+            .replace_document(COLLECTIONS_INDEX, &collection_id, &collection)
+            .await?
+    };
+    if !applied {
+        return Err(if headers.contains_key(header::IF_MATCH) {
+            ApiError::PreconditionFailed
+        } else {
+            ApiError::WriteConflict(collection_id)
+        });
     }
-    Ok(Json(global_collection_doc(&state, &collection.id).await?))
+    let (_, version) = state
+        .store
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("collection vanished after write".into()))?;
+    Ok(etag_response(
+        StatusCode::OK,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+        Json(global_collection_doc(&state, &collection.id).await?),
+    ))
 }
 
 /// DELETE /collections/{id} — removes the collection, its DAG node, and
@@ -1974,25 +2373,40 @@ pub async fn update_root_collection(
 pub async fn delete_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    if state
+    let Some((_, version)) = state
         .store
-        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
-        .filter(is_collection_doc)
-        .is_none()
-    {
+        .filter(|t| is_collection_doc(&t.0))
+    else {
         return Err(ApiError::NotFound(collection_id));
-    }
+    };
+    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
     state
         .store
         .delete_items_by_collection(&collection_id)
         .await?;
     state.store.remove_node(&collection_id).await?;
-    state
-        .store
-        .delete_document(COLLECTIONS_INDEX, &collection_id)
-        .await?;
+    let deleted = if headers.contains_key(header::IF_MATCH) {
+        state
+            .store
+            .delete_document_versioned(COLLECTIONS_INDEX, &collection_id, version)
+            .await?
+    } else {
+        state
+            .store
+            .delete_document(COLLECTIONS_INDEX, &collection_id)
+            .await?
+    };
+    if !deleted {
+        return Err(if headers.contains_key(header::IF_MATCH) {
+            ApiError::PreconditionFailed
+        } else {
+            ApiError::NotFound(collection_id)
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2033,7 +2447,17 @@ pub async fn create_root_item(
     {
         return Err(ApiError::Conflict(item.id));
     }
-    Ok((StatusCode::CREATED, geo_json(item_doc(&state, &item, None))).into_response())
+    let (_, version) = state
+        .store
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item.id, &collection_id))
+        .await?
+        .ok_or_else(|| ApiError::Internal("item vanished after create".into()))?;
+    Ok(etag_response(
+        StatusCode::CREATED,
+        &etag_of(&state, ITEMS_INDEX, &version),
+        geo_json(item_doc(&state, &item, None)),
+    )
+    .into_response())
 }
 
 /// FeatureCollection batch POST — all-or-nothing. Every feature's
@@ -2092,6 +2516,7 @@ async fn create_root_items_batch(
 pub async fn update_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     if item.id != item_id {
@@ -2110,19 +2535,38 @@ pub async fn update_root_item(
     }
     match state
         .store
-        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
         .await?
     {
-        Some(doc) if doc["collection"] == collection_id => {
+        Some((doc, version)) if doc["collection"] == collection_id => {
             validate_item_collection(&mut item, &collection_id)?;
-            if !state
-                .store
-                .replace_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
-                .await?
-            {
-                return Err(ApiError::WriteConflict(item_id));
+            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            let key = item_key(&item_id, &collection_id);
+            let applied = if headers.contains_key(header::IF_MATCH) {
+                state
+                    .store
+                    .index_document_versioned(ITEMS_INDEX, &key, &item, version)
+                    .await?
+            } else {
+                state.store.replace_document(ITEMS_INDEX, &key, &item).await?
+            };
+            if !applied {
+                return Err(if headers.contains_key(header::IF_MATCH) {
+                    ApiError::PreconditionFailed
+                } else {
+                    ApiError::WriteConflict(item_id)
+                });
             }
-            Ok(geo_json(item_doc(&state, &item, None)))
+            let (_, version) = state
+                .store
+                .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+                .await?
+                .ok_or_else(|| ApiError::Internal("item vanished after write".into()))?;
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, ITEMS_INDEX, &version),
+                geo_json(item_doc(&state, &item, None)),
+            ))
         }
         _ => Err(ApiError::NotFound(item_id)),
     }
@@ -2132,6 +2576,7 @@ pub async fn update_root_item(
 pub async fn delete_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     if state
         .store
@@ -2143,14 +2588,27 @@ pub async fn delete_root_item(
     }
     match state
         .store
-        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
         .await?
     {
-        Some(doc) if doc["collection"] == collection_id => {
-            state
-                .store
-                .delete_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
-                .await?;
+        Some((doc, version)) if doc["collection"] == collection_id => {
+            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            let key = item_key(&item_id, &collection_id);
+            let deleted = if headers.contains_key(header::IF_MATCH) {
+                state
+                    .store
+                    .delete_document_versioned(ITEMS_INDEX, &key, version)
+                    .await?
+            } else {
+                state.store.delete_document(ITEMS_INDEX, &key).await?
+            };
+            if !deleted {
+                return Err(if headers.contains_key(header::IF_MATCH) {
+                    ApiError::PreconditionFailed
+                } else {
+                    ApiError::NotFound(item_id)
+                });
+            }
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(ApiError::NotFound(item_id)),
@@ -2253,11 +2711,11 @@ pub async fn patch_root_collection(
     headers: axum::http::HeaderMap,
     StacJson(patch): StacJson<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut doc = state
+    let (mut doc, version) = state
         .store
-        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
-        .filter(is_collection_doc)
+        .filter(|t| is_collection_doc(&t.0))
         .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
     apply_patch(
         &mut doc,
@@ -2274,14 +2732,35 @@ pub async fn patch_root_collection(
             "a patch may not change the collection id or type".to_string(),
         ));
     }
-    if !state
-        .store
-        .replace_document(COLLECTIONS_INDEX, &collection_id, &doc)
-        .await?
-    {
-        return Err(ApiError::WriteConflict(collection_id));
+    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    let applied = if headers.contains_key(header::IF_MATCH) {
+        state
+            .store
+            .index_document_versioned(COLLECTIONS_INDEX, &collection_id, &doc, version)
+            .await?
+    } else {
+        state
+            .store
+            .replace_document(COLLECTIONS_INDEX, &collection_id, &doc)
+            .await?
+    };
+    if !applied {
+        return Err(if headers.contains_key(header::IF_MATCH) {
+            ApiError::PreconditionFailed
+        } else {
+            ApiError::WriteConflict(collection_id)
+        });
     }
-    Ok(Json(global_collection_doc(&state, &collection_id).await?))
+    let (_, version) = state
+        .store
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("collection vanished after write".into()))?;
+    Ok(etag_response(
+        StatusCode::OK,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+        Json(global_collection_doc(&state, &collection_id).await?),
+    ))
 }
 
 /// PATCH /collections/{id}/items/{item_id} — JSON Merge Patch or
@@ -2303,10 +2782,10 @@ pub async fn patch_root_item(
     }
     match state
         .store
-        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
         .await?
     {
-        Some(mut doc) if doc["collection"] == collection_id => {
+        Some((mut doc, version)) if doc["collection"] == collection_id => {
             apply_patch(
                 &mut doc,
                 headers
@@ -2322,26 +2801,118 @@ pub async fn patch_root_item(
                     "a patch may not change the item id or collection".to_string(),
                 ));
             }
-            if !state
-                .store
-                .replace_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &doc)
-                .await?
-            {
-                return Err(ApiError::WriteConflict(item_id));
+            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            let key = item_key(&item_id, &collection_id);
+            let applied = if headers.contains_key(header::IF_MATCH) {
+                state
+                    .store
+                    .index_document_versioned(ITEMS_INDEX, &key, &doc, version)
+                    .await?
+            } else {
+                state.store.replace_document(ITEMS_INDEX, &key, &doc).await?
+            };
+            if !applied {
+                return Err(if headers.contains_key(header::IF_MATCH) {
+                    ApiError::PreconditionFailed
+                } else {
+                    ApiError::WriteConflict(item_id)
+                });
             }
             doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
-            Ok(geo_json(doc))
+            let (_, version) = state
+                .store
+                .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+                .await?
+                .ok_or_else(|| ApiError::Internal("item vanished after write".into()))?;
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, ITEMS_INDEX, &version),
+                geo_json(doc),
+            ))
         }
         _ => Err(ApiError::NotFound(item_id)),
     }
+}
+
+/// POST /collections/{id}/bulk_items — bulk transactions extension:
+/// `{"items": {"id": {item}}, "method": "insert"|"upsert"}` →
+/// `{received, success, skipped, errors[]}`. Per-item processing:
+/// collection populated from the path when absent, per-item error on
+/// mismatch/malformed/conflict — never all-or-nothing.
+pub async fn bulk_create_items(
+    Path(collection_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    StacJson(body): StacJson<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    if state
+        .store
+        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .await?
+        .filter(is_collection_doc)
+        .is_none()
+    {
+        return Err(ApiError::NotFound(collection_id));
+    }
+    let upsert = body.get("method").and_then(serde_json::Value::as_str) == Some("upsert");
+    let items = body
+        .get("items")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("body missing 'items' object".into()))?;
+    let received = items.len();
+    let (mut success, mut skipped) = (0usize, 0usize);
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (id, raw) in items {
+        if !seen.insert(id.clone()) {
+            skipped += 1;
+            continue;
+        }
+        let mut item: Item = match serde_json::from_value(raw) {
+            Ok(i) => i,
+            Err(e) => {
+                errors.push(json!({"id": id, "msg": format!("invalid item: {e}")}));
+                continue;
+            }
+        };
+        if let Err(e) = validate_item_collection(&mut item, &collection_id) {
+            let msg = match e {
+                ApiError::BadRequest(m) => m,
+                _ => "invalid collection identity".to_string(),
+            };
+            errors.push(json!({"id": id, "msg": msg}));
+            continue;
+        }
+        let key = item_key(&item.id, &collection_id);
+        let applied = if upsert {
+            state.store.put_document(ITEMS_INDEX, &key, &item).await?
+        } else {
+            state.store.create_document(ITEMS_INDEX, &key, &item).await?
+        };
+        if applied {
+            success += 1;
+        } else {
+            errors.push(json!({"id": id, "msg": "item already exists or write conflict"}));
+        }
+    }
+    Ok(Json(json!({
+        "received": received,
+        "success": success,
+        "skipped": skipped,
+        "errors": errors,
+    })))
 }
 
 // --- Error Handling ---
 
 pub enum ApiError {
     BadRequest(String),
+    /// Requested resources sit outside the scoped catalog (403).
+    Forbidden(String),
     NotFound(String),
     Conflict(String),
+    /// `If-Match` precondition failed.
+    PreconditionFailed,
     /// Optimistic-concurrency retries exhausted — retry the request.
     WriteConflict(String),
     Internal(String),
@@ -2357,10 +2928,15 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::NotFound(id) => (StatusCode::NOT_FOUND, format!("Resource '{id}' not found")),
             ApiError::Conflict(id) => (
                 StatusCode::CONFLICT,
                 format!("Resource '{id}' already exists"),
+            ),
+            ApiError::PreconditionFailed => (
+                StatusCode::PRECONDITION_FAILED,
+                "If-Match precondition failed".to_string(),
             ),
             ApiError::WriteConflict(id) => (
                 StatusCode::CONFLICT,
@@ -2368,10 +2944,6 @@ impl IntoResponse for ApiError {
             ),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
-        (
-            status,
-            Json(json!({ "code": status.as_u16(), "description": msg })),
-        )
-            .into_response()
+        (status, Json(json!({ "detail": msg }))).into_response()
     }
 }

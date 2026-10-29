@@ -779,6 +779,8 @@ def get_flattened_routes(router_obj, prefix=""):
 _ENV_MUTATION_TESTS = {
     "test_global_collection_max_limit_set": "STAC_GLOBAL_COLLECTION_MAX_LIMIT",
     "test_default_collection_limit": "STAC_DEFAULT_COLLECTION_LIMIT",
+    "test_global_item_max_limit_set": "STAC_GLOBAL_ITEM_MAX_LIMIT",
+    "test_default_item_limit_without_limit_parameter_set": "STAC_DEFAULT_ITEM_LIMIT",
     "test_use_datetime_false": "USE_DATETIME",
     "test_hide_private_data_from_item": "EXCLUDED_FROM_ITEMS",
 }
@@ -805,11 +807,39 @@ _IN_PROCESS_TESTS = {
         "upstream finds the write target via (refresh-dependent) search; "
         "ours uses a realtime GET — divergent lookup semantics by design"
     ),
+    "test_a_collection_write_after_an_alias_move_returns_412": (
+        "monkeypatches upstream's index_behind_alias in-process — "
+        "index-layout internals with no HTTP equivalent"
+    ),
+    "test_conditional_put_writes_to_the_index_that_holds_the_item": (
+        "monkeypatches the inserter's get_target_index — per-collection "
+        "index internals, not HTTP-observable"
+    ),
+    "test_a_patch_whose_item_was_recreated_elsewhere_returns_412": (
+        "recreates the collection via monkeypatched client methods — "
+        "the hook never fires against an external API"
+    ),
+    "test_a_write_between_check_and_write_returns_412": (
+        "races a write via monkeypatched client methods — the hook "
+        "never fires against an external API"
+    ),
+    "test_require_if_match_returns_428_without_it": (
+        "REQUIRE_IF_MATCH is env-only/inert externally (in-process "
+        "config flag)"
+    ),
+    "test_require_if_match_refuses_bulk_upsert": (
+        "REQUIRE_IF_MATCH is env-only/inert externally (in-process "
+        "config flag)"
+    ),
     "test_hidden_put_queue_ack_preserves_storage_until_worker": (
         "requires a live Redis queue (out of scope)"
     ),
     "test_write_datetime_immutability_before_queue": (
         "requires a live Redis queue (out of scope)"
+    ),
+    "test_generated_json_failure_propagates": (
+        "monkeypatches the in-process cql2_text_to_json — an external "
+        "API never calls it"
     ),
 }
 
@@ -844,6 +874,16 @@ def pytest_collection_modifyitems(items):
                 pytest.mark.skip(
                     reason="ENABLE_STAC_VALIDATOR=true is env-only/inert "
                     "against an external API process"
+                )
+            )
+        elif params.get("if_match", "").startswith(" ") or params.get(
+            "if_match", ""
+        ).endswith(" "):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="leading/trailing-whitespace header value is "
+                    "rejected by the HTTP client transport (h11) before "
+                    "it can be sent"
                 )
             )
         elif params.get("queue") == "true":

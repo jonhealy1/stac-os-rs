@@ -514,6 +514,18 @@ impl Store {
         Ok(())
     }
 
+    /// Stable 8-hex hash (FNV-1a) of the physical index name — feeds
+    /// ETags so a tag can only be interpreted against the index that
+    /// produced it.
+    pub fn index_hash(&self, logical: &str) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in self.idx(logical).as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")[..8].to_string()
+    }
+
     pub async fn get_document(
         &self,
         index: &str,
@@ -650,6 +662,33 @@ impl Store {
         })
     }
 
+    /// Delete conditioned on `version` (atomic check-and-delete).
+    /// `false` = the doc moved on (or is already gone).
+    pub async fn delete_document_versioned(
+        &self,
+        index: &str,
+        id: &str,
+        version: DocVersion,
+    ) -> Result<bool, opensearch::Error> {
+        let index = self.idx(index);
+        let resp = self
+            .client
+            .delete(DeleteParts::IndexId(&index, id))
+            .if_seq_no(version.seq_no)
+            .if_primary_term(version.primary_term)
+            .refresh(opensearch::params::Refresh::WaitFor)
+            .send()
+            .await?;
+        Ok(match resp.status_code() {
+            StatusCode::NOT_FOUND | StatusCode::CONFLICT => false,
+            s if s.is_success() => true,
+            _ => {
+                resp.error_for_status_code()?;
+                unreachable!()
+            }
+        })
+    }
+
     /// Delete a document. `false` = it was already gone (raced delete).
     pub async fn delete_document(&self, index: &str, id: &str) -> Result<bool, opensearch::Error> {
         let index = self.idx(index);
@@ -735,8 +774,7 @@ impl Store {
 
         let mut filter = vec![json!({"terms": {"collection": collections}})];
         if !search.ids.is_empty() {
-            // _id == item.id (docs are indexed under their own id)
-            filter.push(json!({"ids": {"values": search.ids}}));
+            filter.push(json!({"terms": {"id": search.ids}}));
         }
         if let Some(bbox) = &search.items.bbox {
             filter.push(bbox_filter(bbox));
@@ -1124,6 +1162,25 @@ fn item_field(field: &str) -> String {
     }
 }
 
+/// Exact-match field for term/terms/wildcard clauses: dynamic string
+/// properties land on `text` + `.keyword` (OpenSearch's default dynamic
+/// mapping), so string comparisons must target the keyword sub-field.
+/// Explicitly-mapped keywords (`id`, `collection`) and dates keep the
+/// plain field.
+fn exact_field(field: &str, value: &Value) -> String {
+    if value.is_string()
+        && field.starts_with("properties.")
+        && !matches!(
+            field,
+            "properties.datetime" | "properties.start_datetime" | "properties.end_datetime"
+        )
+    {
+        format!("{field}.keyword")
+    } else {
+        field.to_string()
+    }
+}
+
 /// Page offset — `offset` isn't a modeled `Search` field, it arrives via
 /// `additional_fields` (same trick stac-server's duckdb backend uses).
 /// POST bodies carry it as a number; GET query params arrive as strings.
@@ -1234,12 +1291,20 @@ pub fn stacql_clauses(query: &Map<String, Value>) -> Result<Vec<Value>, String> 
 
 fn stacql_clause(field: &str, op: &str, value: &Value) -> Result<Value, String> {
     Ok(match op {
-        "eq" | "contains" => json!({"term": {field: value}}),
-        "ne" | "neq" => json!({"bool": {"must_not": [{"term": {field: value}}]}}),
+        "eq" | "contains" => json!({"term": {exact_field(field, value): value}}),
+        "ne" | "neq" => {
+            json!({"bool": {"must_not": [{"term": {exact_field(field, value): value}}]}})
+        }
         "gt" | "gte" | "lt" | "lte" => json!({"range": {field: {op: value}}}),
         "in" => match value {
-            Value::Array(_) => json!({"terms": {field: value}}),
-            _ => json!({"term": {field: value}}),
+            Value::Array(values) => {
+                let field = values
+                    .first()
+                    .map(|v| exact_field(field, v))
+                    .unwrap_or_else(|| field.to_string());
+                json!({"terms": {field: value}})
+            }
+            _ => json!({"term": {exact_field(field, value): value}}),
         },
         other => return Err(format!("unsupported query operator '{other}'")),
     })
@@ -1326,9 +1391,10 @@ fn comparison_clause(op: &str, args: &[Box<cql2::Expr>]) -> Result<Value, String
     };
     let field = item_field(property);
     let value = literal_value(lit)?;
+    let exact = exact_field(&field, &value);
     Ok(match op {
-        "=" => json!({"term": {field: value}}),
-        "<>" => json!({"bool": {"must_not": [{"term": {field: value}}]}}),
+        "=" => json!({"term": {exact: value}}),
+        "<>" => json!({"bool": {"must_not": [{"term": {exact: value}}]}}),
         "<" => json!({"range": {field: {"lt": value}}}),
         "<=" => json!({"range": {field: {"lte": value}}}),
         ">" => json!({"range": {field: {"gt": value}}}),
@@ -1347,6 +1413,10 @@ fn in_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
         .iter()
         .map(|v| literal_value(v))
         .collect::<Result<Vec<_>, _>>()?;
+    let field = values
+        .first()
+        .map(|v| exact_field(&field, v))
+        .unwrap_or(field);
     Ok(json!({"terms": {field: values}}))
 }
 
@@ -1376,9 +1446,9 @@ fn like_clause(args: &[Box<cql2::Expr>]) -> Result<Value, String> {
     let (cql2::Expr::Property { property }, cql2::Expr::Literal(pattern)) = (a, b) else {
         return Err("'like' expects a property and a string pattern".into());
     };
-    // LIKE wildcards -> wildcard-query wildcards; string fields get a
-    // `.keyword` subfield from the default dynamic mapping.
-    let field = format!("{}.keyword", item_field(property));
+    // LIKE wildcards -> wildcard-query wildcards; dynamic string
+    // properties live on the `.keyword` sub-field.
+    let field = exact_field(&item_field(property), &json!(""));
     let pattern = pattern.replace('%', "*").replace('_', "?");
     Ok(json!({"wildcard": {field: {"value": pattern}}}))
 }

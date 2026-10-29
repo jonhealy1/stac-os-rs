@@ -183,12 +183,12 @@
         }
       }
     },
-    "/collections/{collectionId}": {
+    "/collections/{collection_id}": {
       "get": {
         "summary": "Collection document",
         "parameters": [
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -198,7 +198,15 @@
         ],
         "responses": {
           "200": {
-            "description": "STAC Collection"
+            "description": "STAC Collection",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "Not found"
@@ -209,15 +217,40 @@
         "summary": "Update collection (transactions)",
         "responses": {
           "200": {
-            "description": "Updated"
+            "description": "Updated",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "ID mismatch"
           },
           "404": {
             "description": "Not found"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       },
       "delete": {
         "summary": "Delete collection and its items (transactions)",
@@ -227,15 +260,40 @@
           },
           "404": {
             "description": "Not found"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       },
       "patch": {
         "summary": "Patch collection (transactions)",
         "description": "JSON Merge Patch (`application/json` or `application/merge-patch+json`) or RFC 6902 JSON Patch (`application/json-patch+json`). Immutable `id` changes are rejected.",
         "responses": {
           "200": {
-            "description": "Patched"
+            "description": "Patched",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed patch or immutable-field change"
@@ -245,16 +303,33 @@
           },
           "405": {
             "description": "Transactions disabled"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       }
     },
-    "/collections/{collectionId}/sortables": {
+    "/collections/{collection_id}/sortables": {
       "get": {
         "summary": "Per-collection Sortables schema",
         "parameters": [
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -272,12 +347,12 @@
         }
       }
     },
-    "/collections/{collectionId}/items": {
+    "/collections/{collection_id}/items": {
       "get": {
         "summary": "Collection items",
         "parameters": [
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -338,12 +413,12 @@
         }
       }
     },
-    "/collections/{collectionId}/items/{itemId}": {
+    "/collections/{collection_id}/items/{item_id}": {
       "get": {
         "summary": "Item document",
         "parameters": [
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -351,7 +426,7 @@
             }
           },
           {
-            "name": "itemId",
+            "name": "item_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -361,7 +436,15 @@
         ],
         "responses": {
           "200": {
-            "description": "STAC Item"
+            "description": "STAC Item",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "Not found"
@@ -372,15 +455,40 @@
         "summary": "Update item (transactions)",
         "responses": {
           "200": {
-            "description": "Updated"
+            "description": "Updated",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "ID mismatch"
           },
           "404": {
             "description": "Not found"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       },
       "delete": {
         "summary": "Delete item (transactions)",
@@ -390,15 +498,40 @@
           },
           "404": {
             "description": "Not found"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       },
       "patch": {
         "summary": "Patch item (transactions)",
         "description": "JSON Merge Patch (`application/json` or `application/merge-patch+json`) or RFC 6902 JSON Patch (`application/json-patch+json`). Immutable `id`/`collection` changes are rejected.",
         "responses": {
           "200": {
-            "description": "Patched"
+            "description": "Patched",
+            "headers": {
+              "ETag": {
+                "description": "Strong entity tag: <primary_term>-<seq_no>-<index hash>, suffixed by content coding on compressed responses",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed patch or immutable-field change"
@@ -408,8 +541,25 @@
           },
           "405": {
             "description": "Transactions disabled"
+          },
+          "412": {
+            "description": "Precondition Failed \u2014 If-Match did not match the current resource version"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Write only if the supplied strong tag(s) match the current version \u2014 412 on mismatch, 428 when the deployment requires the header and it is absent"
+          }
+        ]
       }
     },
     "/sortables": {
@@ -459,12 +609,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}": {
+    "/catalogs/{catalog_id}": {
       "get": {
         "summary": "Catalog document",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -504,12 +654,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/conformance": {
+    "/catalogs/{catalog_id}/conformance": {
       "get": {
         "summary": "Catalog-scoped conformance",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -527,12 +677,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/children": {
+    "/catalogs/{catalog_id}/children": {
       "get": {
         "summary": "Catalog children",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -575,12 +725,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/catalogs": {
+    "/catalogs/{catalog_id}/catalogs": {
       "get": {
         "summary": "Sub-catalogs",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -629,7 +779,7 @@
         }
       }
     },
-    "/catalogs/{catalogId}/catalogs/{subId}": {
+    "/catalogs/{catalog_id}/catalogs/{sub_id}": {
       "delete": {
         "summary": "Unlink sub-catalog (transactions, non-cascading)",
         "responses": {
@@ -642,12 +792,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/collections": {
+    "/catalogs/{catalog_id}/collections": {
       "get": {
         "summary": "Scoped collections",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -696,12 +846,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/collections/{collectionId}": {
+    "/catalogs/{catalog_id}/collections/{collection_id}": {
       "get": {
         "summary": "Scoped collection document",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -709,7 +859,7 @@
             }
           },
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -749,12 +899,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/collections/{collectionId}/items": {
+    "/catalogs/{catalog_id}/collections/{collection_id}/items": {
       "get": {
         "summary": "Scoped collection items",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -762,7 +912,7 @@
             }
           },
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -817,7 +967,7 @@
         }
       }
     },
-    "/catalogs/{catalogId}/collections/{collectionId}/items/{itemId}": {
+    "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}": {
       "get": {
         "summary": "Scoped item document",
         "responses": {
@@ -966,12 +1116,12 @@
         }
       }
     },
-    "/catalogs/{catalogId}/search": {
+    "/catalogs/{catalog_id}/search": {
       "get": {
         "summary": "Catalog-scoped item search",
         "parameters": [
           {
-            "name": "catalogId",
+            "name": "catalog_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -1117,12 +1267,12 @@
         }
       }
     },
-    "/collections/{collectionId}/queryables": {
+    "/collections/{collection_id}/queryables": {
       "get": {
         "summary": "Collection queryables (JSON Schema)",
         "parameters": [
           {
-            "name": "collectionId",
+            "name": "collection_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -1143,6 +1293,96 @@
           },
           "404": {
             "description": "Collection not found"
+          }
+        }
+      }
+    },
+    "/collections/{collection_id}/bulk_items": {
+      "post": {
+        "summary": "Bulk Item Transactions",
+        "description": "Insert or upsert a set of items in one request. Reports per-item results.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/collection_id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "items"
+                ],
+                "properties": {
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "$ref": "#/components/schemas/item"
+                    }
+                  },
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "insert",
+                      "upsert"
+                    ],
+                    "default": "insert"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-item results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "received": {
+                      "type": "integer"
+                    },
+                    "success": {
+                      "type": "integer"
+                    },
+                    "skipped": {
+                      "type": "integer"
+                    },
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "msg": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "msg"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed bulk request"
+          },
+          "404": {
+            "description": "Collection not found"
+          },
+          "428": {
+            "description": "Precondition Required \u2014 the deployment requires If-Match on writes"
           }
         }
       }
@@ -1260,6 +1500,17 @@
             "default": []
           }
         }
+      }
+    },
+    "parameters": {
+      "collection_id": {
+        "name": "collection_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "Collection identifier"
       }
     }
   }
