@@ -16,6 +16,7 @@ A STAC API Opensearch server built with Rust
 - [Extending (custom routes)](#extending-custom-routes)
 - [Sample Data](#sample-data)
 - [TODO](#todo)
+- [Changelog](CHANGELOG.md)
 
 ## What is this?
 
