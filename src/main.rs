@@ -6,7 +6,8 @@ use std::sync::Arc;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let base_url = "http://localhost:3000";
+    let base_url =
+        std::env::var("STAC_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let opensearch_url =
         std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
     let store = Store::connect(&opensearch_url).expect("Failed to connect to OpenSearch");
@@ -37,9 +38,9 @@ async fn main() {
     let store = store.with_use_datetime(use_datetime);
 
     let state = Arc::new(AppState {
-        base_url: base_url.to_string(),
+        base_url: base_url.clone(),
         store,
-        links: LinkEngine::new(base_url),
+        links: LinkEngine::new(&base_url),
         enable_transactions,
         hide_alternate_parents,
         enable_collections_search,

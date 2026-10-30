@@ -92,6 +92,10 @@ pub struct ChildrenQuery {
     pub limit: Option<u64>,
     /// Opaque pagination cursor (offset-encoded).
     pub token: Option<String>,
+    /// CQL2 filter — parsed and validated like the other listings.
+    pub filter: Option<String>,
+    #[serde(rename = "filter-lang")]
+    pub filter_lang: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -112,6 +116,58 @@ pub struct ListQuery {
     pub filter_lang: Option<String>,
     pub bbox: Option<String>,
     pub datetime: Option<String>,
+}
+
+/// 400 for a CQL2 translation error. Upstream surfaces `to_es`
+/// ValueErrors verbatim under `Error with cql2 filter:` — messages
+/// already carrying that prefix pass through; everything else gets the
+/// generic `Invalid filter parameter:` framing.
+fn bad_filter(e: String) -> ApiError {
+    if e.starts_with("Error with cql2 filter:") {
+        ApiError::BadRequest(e)
+    } else {
+        ApiError::BadRequest(format!("Invalid filter parameter: {e}."))
+    }
+}
+
+/// Upstream listing-route filter handling: `filter`/`filter-lang` is
+/// parsed and validated so malformed CQL2 gets a 400 with upstream's
+/// message. With `cql2-text` or no `filter-lang` a JSON string is tried
+/// first, then CQL2 text — the same "try both" order upstream uses on
+/// listing routes. The parsed filter is not yet applied to listings.
+fn validate_listing_filter(
+    filter: Option<&str>,
+    filter_lang: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(raw) = filter else { return Ok(()) };
+    if let Some(lang) = filter_lang {
+        if !matches!(lang, "cql2-json" | "cql2-text") {
+            return Err(ApiError::BadRequest(format!(
+                "Only 'cql2-json' and 'cql2-text' filter languages are supported for collections. Got '{lang}'."
+            )));
+        }
+    }
+    let invalid = |msg: &str| ApiError::BadRequest(format!("Invalid filter parameter: {msg}."));
+    let parsed: serde_json::Value = if filter_lang == Some("cql2-json") {
+        serde_json::from_str(raw).map_err(|_| invalid("expected valid CQL2 JSON"))?
+    } else {
+        match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => {
+                crate::store::check_cql2_text_args(raw).map_err(|e| invalid(&e))?;
+                cql2::Expr::try_from(stac_api::Filter::Cql2Text(crate::store::rewrite_between(
+                    raw,
+                )))
+                .ok()
+                .and_then(|e| serde_json::to_value(&e).ok())
+                .ok_or_else(|| invalid("expected valid CQL2 text"))?
+            }
+        }
+    };
+    if !parsed.is_object() {
+        return Err(invalid("expected a CQL2 expression with an operator"));
+    }
+    crate::store::check_cql2_literals(&parsed).map_err(|e| invalid(&e))
 }
 
 /// Resolve `?limit=&token=` into `(limit, offset)` — absent limit falls
@@ -360,12 +416,21 @@ fn collection_links(
     scoped_catalog_id: &str,
     parents: &[String],
 ) -> Vec<Link> {
-    state.links.format_scoped_collection_links(
+    let mut links = state.links.format_scoped_collection_links(
         collection_id,
         scoped_catalog_id,
         parents,
         state.hide_alternate_parents,
-    )
+    );
+    // Filter extension: queryables link points at the canonical
+    // resource even on scoped reads (upstream `link_queryables`).
+    let mut q = link_json(
+        format!("{}/collections/{collection_id}/queryables", state.base_url),
+        "queryables",
+    );
+    q.r#type = Some("application/schema+json".to_string());
+    links.push(q);
+    links
 }
 
 /// Links for a collection read at the global `/collections/{id}` route:
@@ -385,6 +450,12 @@ fn global_collection_links(state: &AppState, collection_id: &str, parents: &[Str
     );
     sortables.r#type = Some("application/schema+json".to_string());
     links.push(sortables);
+    let mut q = link_json(
+        format!("{base}/collections/{collection_id}/queryables"),
+        "queryables",
+    );
+    q.r#type = Some("application/schema+json".to_string());
+    links.push(q);
     let mut real: Vec<&str> = parents
         .iter()
         .map(String::as_str)
@@ -638,6 +709,7 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions",
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
+        "https://api.stacspec.org/v1.1.0/collection-search#sortables",
         "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
         "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/search",
         "https://api.stacspec.org/v1.0.0/children",
@@ -655,8 +727,8 @@ pub async fn conformance(State(state): State<Arc<AppState>>) -> Json<serde_json:
     Json(json!({ "conformsTo": conformance_classes(&state) }))
 }
 
-/// Core queryables present on every item (upstream DEFAULT_QUERYABLES —
-/// `$ref`s into the STAC item-spec schema).
+/// Core queryables present on every item — upstream DEFAULT_QUERYABLES
+/// verbatim, including its "Creation Timestamp" on `updated`.
 fn default_queryables() -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
         ("id", json!({"description": "ID", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json#/definitions/core/allOf/2/properties/id"})),
@@ -664,14 +736,22 @@ fn default_queryables() -> serde_json::Map<String, serde_json::Value> {
         ("geometry", json!({"description": "Geometry", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json#/definitions/core/allOf/1/oneOf/0/properties/geometry"})),
         ("datetime", json!({"description": "Acquisition Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/datetime"})),
         ("created", json!({"description": "Creation Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/created"})),
-        ("updated", json!({"description": "Update Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/updated"})),
-        ("title", json!({"type": "string", "description": "Item title"})),
-        ("description", json!({"type": "string", "description": "Item description"})),
-        ("keywords", json!({"type": "array", "items": {"type": "string"}, "description": "Item keywords"})),
+        ("updated", json!({"description": "Creation Timestamp", "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/datetime.json#/properties/updated"})),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect::<serde_json::Map<String, serde_json::Value>>())
+}
+
+/// Upstream ALL_QUERYABLES — DEFAULT plus OPTIONAL (enum-marked fields
+/// populated per-collection at read time).
+fn all_queryables() -> serde_json::Map<String, serde_json::Value> {
+    let mut q = default_queryables();
+    q.insert(
+        "platform".to_string(),
+        json!({"$enum": true, "description": "Satellite platform identifier"}),
+    );
+    q
 }
 
 /// JSON Schema document served by the queryables endpoints.
@@ -703,29 +783,23 @@ fn json_schema(body: serde_json::Value) -> impl IntoResponse {
     )
 }
 
-/// GET /queryables — union of queryables across all items.
+/// GET /queryables — upstream's default is the static DEFAULT_QUERYABLES
+/// set (the union view is an env-flagged opt-in we don't implement).
 pub async fn get_queryables(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mapping = state.store.get_index_mapping(ITEMS_INDEX).await?;
-    let index_mapping = mapping
-        .as_object()
-        .and_then(|o| o.values().next())
-        .and_then(|v| v.get("mappings"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let dynamic = crate::store::queryable_properties(&index_mapping, &state.excluded_queryables);
     Ok(json_schema(queryables_schema(
         &state,
         "/queryables".to_string(),
         "Queryables for stac-os-rs",
-        dynamic,
+        default_queryables(),
     )))
 }
 
-/// GET /collections/{collection_id}/queryables — same union scoped to a
-/// collection (our shared items index means the advertised set is global;
-/// upstream per-collection indices would narrow it).
+/// GET /collections/{collection_id}/queryables — upstream merge: the
+/// ALL_QUERYABLES base plus every indexed field of the items index under
+/// its un-prefixed name, with `$enum` fields populated by a per-
+/// collection terms aggregation.
 pub async fn get_collection_queryables(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -738,20 +812,101 @@ pub async fn get_collection_queryables(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    let mapping = state.store.get_index_mapping(ITEMS_INDEX).await?;
-    let index_mapping = mapping
-        .as_object()
-        .and_then(|o| o.values().next())
-        .and_then(|v| v.get("mappings"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let dynamic = crate::store::queryable_properties(&index_mapping, &state.excluded_queryables);
-    Ok(json_schema(queryables_schema(
+    let mapping = index_mappings(&state, ITEMS_INDEX).await?;
+    let all = all_queryables();
+    let mut properties = all.clone();
+    let mut enum_fields: Vec<(String, String)> = Vec::new();
+
+    // Upstream collection_queryables walk: full document path keys,
+    // exposed un-prefixed (eo:cloud_cover, not properties.eo:cloud_cover).
+    let mut stack: Vec<(String, serde_json::Value)> = mapping
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let is_excluded = |fqn: &str| {
+        state
+            .excluded_queryables
+            .iter()
+            .any(|p| fqn == p || fqn.starts_with(&format!("{p}.")))
+    };
+    while let Some((fqn, def)) = stack.pop() {
+        if is_excluded(&fqn) {
+            continue;
+        }
+        if let Some(children) = def.get("properties").and_then(serde_json::Value::as_object) {
+            stack.extend(
+                children
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.is_object()
+                            && v.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
+                    })
+                    .map(|(k, v)| (format!("{fqn}.{k}"), v.clone())),
+            );
+        }
+        let Some(ty) = def.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if def.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let name = fqn
+            .strip_prefix("properties.")
+            .or_else(|| fqn.strip_prefix("assets."))
+            .unwrap_or(&fqn)
+            .to_string();
+        let mut result = all.get(&name).cloned().unwrap_or_else(|| json!({}));
+        let obj = result.as_object_mut().unwrap();
+        obj.entry("title".to_string())
+            .or_insert_with(|| json!(crate::store::py_title(&name.replace('_', " "))));
+        let json_type = match ty {
+            "boolean" => "boolean",
+            "constant_keyword" | "date" | "date_nanos" | "ip" | "keyword" | "match_only_text"
+            | "text" | "version" | "wildcard" => "string",
+            "integer" => "integer",
+            "byte" | "double" | "float" | "half_float" | "long" | "scaled_float" | "short"
+            | "token_count" | "unsigned_long" => "number",
+            "geo_point" | "geo_shape" => "object",
+            "nested" => "array",
+            other => other,
+        };
+        obj.entry("type".to_string())
+            .or_insert_with(|| json!(json_type));
+        if matches!(ty, "date" | "date_nanos") {
+            obj.entry("format".to_string())
+                .or_insert_with(|| json!("date-time"));
+        }
+        if obj.remove("$enum") == Some(json!(true)) {
+            enum_fields.push((fqn.clone(), ty.to_string()));
+        }
+        properties.insert(name, result);
+    }
+
+    if !enum_fields.is_empty() {
+        let values = state
+            .store
+            .unique_values(&collection_id, &enum_fields)
+            .await?;
+        for (fqn, _) in &enum_fields {
+            let name = fqn
+                .strip_prefix("properties.")
+                .or_else(|| fqn.strip_prefix("assets."))
+                .unwrap_or(fqn);
+            if let Some(vals) = values.get(fqn) {
+                properties[name]["enum"] = vals.clone();
+            }
+        }
+    }
+
+    let mut schema = queryables_schema(
         &state,
         format!("/collections/{collection_id}/queryables"),
         "Queryables for stac-os-rs",
-        dynamic,
-    )))
+        properties,
+    );
+    schema["additionalProperties"] = json!(false);
+    Ok(json_schema(schema))
 }
 
 /// GET /api — OpenAPI service description (hand-maintained).
@@ -777,7 +932,7 @@ pub async fn root_landing_page(
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
-        { "rel": "http://www.opengis.net/def/rel/ogc/1.0/queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" },
+        { "rel": "queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" },
         { "rel": "catalogs", "type": "application/json", "href": format!("{base}/catalogs"), "title": "Multi-Tenant Catalogs Registry" }
     ]);
     // Browseable: a child link per root-level node (collections resolve
@@ -841,6 +996,7 @@ pub async fn list_catalogs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
     let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
         .store
@@ -962,6 +1118,7 @@ pub async fn get_catalog_children(
     Query(query): Query<ChildrenQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
         &ListQuery {
@@ -1058,6 +1215,7 @@ pub async fn list_sub_catalogs(
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
@@ -1103,39 +1261,76 @@ pub async fn list_sub_catalogs(
     })))
 }
 
-/// Shared OGC Sortables schema — `additionalProperties: true` matches our
-/// permissive sort (unknown fields evaluate to null, sorting last).
-fn sortables_schema(base: &str, id_path: &str, title: &str) -> serde_json::Value {
+/// Upstream `DEFAULT_SORTABLES` — the core item-search sortables set.
+fn default_sortables() -> serde_json::Value {
+    json!({
+        "id": {"type": "string", "title": "Id"},
+        "collection": {"type": "string", "title": "Collection"},
+        "properties.datetime": {"type": "string", "format": "date-time", "title": "Datetime"},
+        "properties.created": {"type": "string", "format": "date-time", "title": "Created"},
+        "properties.updated": {"type": "string", "format": "date-time", "title": "Updated"}
+    })
+}
+
+fn sortables_schema(
+    base: &str,
+    id_path: &str,
+    properties: serde_json::Value,
+    additional: bool,
+) -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": format!("{base}{id_path}"),
         "type": "object",
-        "title": title,
-        "description": "Fields usable in the `sortby` parameter.",
-        "properties": {
-            "id": {"type": "string"},
-            "collection": {"type": "string"},
-            "datetime": {"type": "string", "format": "date-time"},
-            "properties.datetime": {"type": "string", "format": "date-time"}
-        },
-        "additionalProperties": true
+        "title": "Sortables",
+        "properties": properties,
+        "additionalProperties": additional
     })
 }
 
-/// GET /sortables — Sortables schema for item search (item-search binding).
-pub async fn sortables(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(sortables_schema(
+/// `GET /{index}/_mapping` -> the mappings body, for the sortables/
+/// queryables schema builders.
+async fn index_mappings(state: &AppState, logical: &str) -> Result<serde_json::Value, ApiError> {
+    let mapping = state.store.get_index_mapping(logical).await?;
+    Ok(mapping
+        .as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|v| v.get("mappings"))
+        .cloned()
+        .unwrap_or_else(|| json!({})))
+}
+
+/// Sortable fields of the items index — DEFAULT_SORTABLES plus every
+/// sortable dynamic leaf (features binding is a closed schema).
+async fn items_sortable_fields(
+    state: &AppState,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let mapping = index_mappings(state, ITEMS_INDEX).await?;
+    let mut fields = crate::store::sortable_properties(&mapping, &state.excluded_queryables);
+    for (k, v) in default_sortables().as_object().cloned().unwrap_or_default() {
+        fields.entry(k).or_insert(v);
+    }
+    Ok(fields)
+}
+
+/// GET /sortables — Sortables schema for item search (item-search
+/// binding advertises `additionalProperties: true`: unmapped fields
+/// sort as null rather than erroring).
+pub async fn sortables(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    json_schema(sortables_schema(
         &state.base_url,
         "/sortables",
-        "Item Search Sortables",
+        default_sortables(),
+        true,
     ))
 }
 
-/// GET /collections/{id}/sortables — features-binding sortables schema.
+/// GET /collections/{id}/sortables — features-binding sortables schema
+/// derived from the items index mapping (`additionalProperties: false`).
 pub async fn collection_sortables(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     if state
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
@@ -1144,10 +1339,26 @@ pub async fn collection_sortables(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    Ok(Json(sortables_schema(
+    Ok(json_schema(sortables_schema(
         &state.base_url,
         &format!("/collections/{collection_id}/sortables"),
-        "Collection Items Sortables",
+        json!(items_sortable_fields(&state).await?),
+        false,
+    )))
+}
+
+/// GET /collections-sortables — collection-search sortables from the
+/// collections index mapping (`additionalProperties: false`).
+pub async fn collections_sortables(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mapping = index_mappings(&state, COLLECTIONS_INDEX).await?;
+    let fields = crate::store::sortable_properties(&mapping, &state.excluded_queryables);
+    Ok(json_schema(sortables_schema(
+        &state.base_url,
+        "/collections-sortables",
+        json!(fields),
+        false,
     )))
 }
 
@@ -1275,6 +1486,8 @@ async fn run_scoped_search(
                     )
                 })?;
                 *filter = stac_api::Filter::Cql2Json(map);
+            } else {
+                *raw = crate::store::rewrite_between(raw);
             }
         }
     }
@@ -1313,16 +1526,10 @@ async fn run_scoped_search(
         .valid()
         .map_err(|e| ApiError::BadRequest(format!("Invalid parameters provided: {e}")))?;
 
-    // A scope with no collections (or a root request filtered to
-    // nothing) short-circuits — after parsing, so malformed extension
-    // params still surface their 400 (#935 semantics).
-    if search.collections.is_empty() {
-        return Ok(geo_json(empty()?));
-    }
-
-    // 3. Query OpenSearch — collections scope + bbox/datetime/intersects/ids
-    // + the `query` (STACQL) and `filter` (CQL2) extensions, translated
-    // to extra filter clauses (malformed expressions are a 400).
+    // 3. Extension translation — `query` (STACQL) and `filter` (CQL2)
+    // become extra OpenSearch filter clauses. Upstream validates these
+    // before the empty-scope short-circuit, so a bad literal on an
+    // empty catalog still surfaces its 400.
     let mut extra_filters = Vec::new();
     if let Some(query) = &search.items.query {
         extra_filters.extend(
@@ -1331,11 +1538,16 @@ async fn run_scoped_search(
         );
     }
     if let Some(filter) = &search.items.filter {
-        extra_filters.push(
-            crate::store::cql2_clause(filter)
-                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
-        );
+        extra_filters.push(crate::store::cql2_clause(filter).map_err(bad_filter)?);
     }
+
+    // A scope with no collections (or a root request filtered to
+    // nothing) short-circuits — after parsing, so malformed extension
+    // params still surface their 400 (#935 semantics).
+    if search.collections.is_empty() {
+        return Ok(geo_json(empty()?));
+    }
+
     let (mut items, matched) = state
         .store
         .search_items(&search.collections, &search, extra_filters)
@@ -1704,6 +1916,7 @@ pub async fn list_scoped_collections(
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
         &query,
@@ -2095,7 +2308,9 @@ fn parse_cql2_filter(raw: &str, lang: Option<&str>) -> Result<stac_api::Filter, 
             )),
         }
     } else {
-        Ok(stac_api::Filter::Cql2Text(raw.to_string()))
+        Ok(stac_api::Filter::Cql2Text(crate::store::rewrite_between(
+            raw,
+        )))
     }
 }
 
@@ -2238,7 +2453,7 @@ async fn collections_page(
     if let Some(f) = &params.filter {
         filters.push(
             crate::store::cql2_clause_with(f, crate::store::COLLECTION_FIELDS)
-                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
+                .map_err(bad_filter)?,
         );
     }
     if let Some(q) = &params.query {
@@ -2292,6 +2507,13 @@ async fn collections_page(
         { "rel": "self", "href": format!("{}{self_path}", state.base_url) },
         { "rel": "root", "href": state.base_url }
     ]);
+    if state.enable_collections_search || state.enable_collections_search_route {
+        links.as_array_mut().unwrap().push(json!({
+            "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables",
+            "type": "application/schema+json",
+            "href": format!("{}/collections-sortables", state.base_url)
+        }));
+    }
     if offset + (returned as u64) < matched {
         let next = if post {
             json!({
@@ -2532,6 +2754,21 @@ async fn items_page(
         search.items.datetime = Some(datetime.clone());
     }
     if let Some(sortby) = &query.sortby {
+        // Features binding is a closed sortables schema — upstream 400s
+        // on fields the collection sortables do not declare.
+        let allowed = items_sortable_fields(state).await?;
+        let mut undeclared: Vec<String> = sortby
+            .split(',')
+            .map(|s| s.trim().trim_start_matches(['+', '-']).to_string())
+            .filter(|f| !allowed.contains_key(f.as_str()))
+            .collect();
+        if !undeclared.is_empty() {
+            undeclared.sort();
+            return Err(ApiError::BadRequest(format!(
+                "Undeclared sort fields: {}.",
+                undeclared.join(", ")
+            )));
+        }
         search.items.sortby = sortby
             .split(',')
             .map(|s| s.parse().expect("infallible"))
@@ -2555,6 +2792,8 @@ async fn items_page(
         }
     }
     if let Some(expr) = &query.filter {
+        // Upstream listing try-both: cql2-json is strict JSON; cql2-text
+        // or an absent filter-lang tries JSON first, then CQL2 text.
         let filter = if query.filter_lang.as_deref() == Some("cql2-json") {
             match serde_json::from_str::<serde_json::Value>(expr) {
                 Ok(serde_json::Value::Object(map)) => stac_api::Filter::Cql2Json(map),
@@ -2565,12 +2804,12 @@ async fn items_page(
                 }
             }
         } else {
-            stac_api::Filter::Cql2Text(expr.clone())
+            match serde_json::from_str::<serde_json::Value>(expr) {
+                Ok(serde_json::Value::Object(map)) => stac_api::Filter::Cql2Json(map),
+                _ => stac_api::Filter::Cql2Text(crate::store::rewrite_between(expr)),
+            }
         };
-        extra_filters.push(
-            crate::store::cql2_clause(&filter)
-                .map_err(|e| ApiError::BadRequest(format!("Invalid filter parameter: {e}.")))?,
-        );
+        extra_filters.push(crate::store::cql2_clause(&filter).map_err(bad_filter)?);
     }
     let (mut items, matched) = state
         .store
