@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `STAC_BASE_URL` env var sets the externally advertised link host,
+  separate from the bind address
+- `/collections-sortables` endpoint (mounted when either
+  collections-search flag is on) plus the matching link on
+  `/collections` and the OGC sortables conformance URI
+- `queryables` links (Filter extension) on the landing page and on
+  collection resources
+- `CONTRIBUTING.md` — dev setup, test workflow, PR requirements, and
+  upstream-compat conventions for new contributors
+- Upstream `sfeos` test coverage: `tests/api/test_datetime_range.py`
+  plus the `tests/extensions/` batch (CQL2 text/JSON-literals, filter,
+  queryables-root, sortables) — 105p/208s/0F on the extensions suite
+
+### Changed
+
+- Root `/queryables` now returns upstream's `DEFAULT_QUERYABLES`
+  verbatim; per-collection queryables merge defaults with the items
+  index mapping and populate `platform.enum` via a terms aggregation
+- CQL2 `LIKE` now honors escape sequences (`\%`, `\_`, `\\` literal;
+  `%`/`_` → `*`/`?` wildcards), targets the analyzed field, and runs
+  `case_insensitive`, matching upstream `cql2_like_to_es`
+- CQL2 `in` with a non-list rhs returns upstream's exact 400
+  (`Error with cql2 filter: Arg {v} is not a list`); cql2-text
+  `IN ('x')` counts as a 1-element list
+- `created`/`updated` CQL2 terms on collections no longer target a
+  nonexistent `.keyword` sub-field
+
+### Fixed
+
+- GET search `next` pagination links dropped the original query
+  parameters; POST `next` links hardcoded `/catalogs/search` —
+  both now preserve the request URL/params and method
+- Default item sort placed undated (`start_datetime`/`end_datetime`
+  range) items mid-list instead of last; explicit `sortby` now gets a
+  deterministic `_id` tiebreaker
+- CQL2 `date`/`timestamp`/`interval` literals are validated as RFC 3339
+  on search and listing routes (incl. `TIMESTAMP()`/`INTERVAL()` args
+  scanned from cql2-text) — previously invalid literals could return
+  200/empty instead of 400
+- cql2-text `x [NOT] BETWEEN a AND b AND <rest>` silently dropped the
+  trailing predicate — cql2-rs 0.4 parser bug, worked around by
+  rewriting to the `BETWEEN(x, a, b)` function form pre-parse
+- Negative `BETWEEN` bounds (`BETWEEN -37.3 AND -37.2`) returned 400 —
+  the parser encodes unary minus as `*(-1, x)`; now folded back
+
 ## [0.1.1] - 2026-10-30
 
 ### Added
