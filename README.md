@@ -1,5 +1,5 @@
 # stac-os-rs
-<img src="assets/brown-osiris-cropped.png" alt="STAC-OSIRIS" width="400">
+<img src="assets/glass-osiris.png" alt="STAC-OSIRIS" width="400">
 <!-- ![StacLabs](https://github.com/StacLabs/.github/raw/main/profile/staclabs-orange-banner.png) -->
 
 A STAC API Opensearch server built with Rust
