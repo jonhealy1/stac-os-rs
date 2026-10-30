@@ -31,7 +31,7 @@ jobs:
       - name: Install aarch64 cross toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      # ring (rustls) compiles vendored C/asm via the cc crate, which
+      # aws-lc-rs (rustls) compiles vendored C/asm via the cc crate, which
       # needs per-target CC/CXX/AR when cross-compiling.
       - name: Build amd64 binary
         run: |
@@ -72,7 +72,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
-            type=ref,event=tag
+            type=semver,pattern={{version}}
 
       # dockerfiles/Dockerfile.ci repackages the binaries above per
       # TARGETARCH — no in-image cargo build, so no QEMU compile time.
