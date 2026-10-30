@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# CI image: consumes release binaries cross-compiled by
+# .github/workflows/publish.yml so a multi-arch push only repackages
+# instead of rebuilding under QEMU. Use the root Dockerfile for local
+# `docker build` / `docker compose` builds (it compiles from source).
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 stac
+
+COPY dist/linux-${TARGETARCH}/stac-os-rs /usr/local/bin/
+
+USER stac
+EXPOSE 3000
+ENV OPENSEARCH_URL=http://opensearch:9200
+CMD ["stac-os-rs"]
