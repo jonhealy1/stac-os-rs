@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Published multi-arch image (`ghcr.io/jonhealy1/stac-os-rs`) on `v*.*.*`
+  tags via `.github/workflows/publish.yml`; `compose.release.yml` runs the
+  released image without building from source
+
 ## [0.1.0] - 2026-10-29
 
 Initial release — a STAC API server in Rust (axum) backed by OpenSearch,
