@@ -20,7 +20,9 @@ A STAC API Opensearch server built with Rust
 
 ## What is this?
 
-A **hybrid** of the STAC API core spec and the [multi-tenant-catalogs extension](https://github.com/StacLabs/multi-tenant-catalogs): catalogs form a poly-hierarchy (a DAG — a catalog or collection can live under multiple parents), and every STAC capability is exposed *scoped* under `/catalogs/{catalog_id}` rather than only at the API root. See [API Routes](#api-routes) for the full surface.
+A **Rust port of [sfeos](https://github.com/stac-utils/stac-fastapi-elasticsearch-opensearch)** — the STAC API implementation backed by OpenSearch — with the same extensions surface (Fields, Query, Filter/CQL2, Sort, Queryables, Sortables, transactions, collections-search). The upstream Python test suite is vendored under `tests/upstream/` and runs against this server over HTTP, so behavior stays compatible.
+
+sfeos also supports the [multi-tenant-catalogs extension](https://github.com/StacLabs/multi-tenant-catalogs), which this project implements too: catalogs form a poly-hierarchy (a DAG — a catalog or collection can live under multiple parents), and every STAC capability is exposed *scoped* under `/catalogs/{catalog_id}` rather than only at the API root. It's an optional extension — the catalogs surface is currently always mounted, with an opt-out flag (`ENABLE_CATALOGS_ROUTE`, like upstream's) coming soon. See [API Routes](#api-routes) for the full surface.
 
 The catalog DAG is stored in OpenSearch as one `{kind, parents}` document per node (`stac-hierarchy` index) — children are derived via `term` queries on `parents`, so linking a shared resource is a single-document write, and orphans are automatically adopted under `root`.
 
