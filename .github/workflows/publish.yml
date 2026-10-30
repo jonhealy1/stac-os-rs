@@ -1,0 +1,92 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*" # Triggers when a tag like 'v0.2.0' is pushed
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-push-image:
+    name: Build and Push Docker Image
+    # Pinned, not ubuntu-latest: the produced binary must link against a
+    # glibc no newer than the image base (ubuntu:24.04 in
+    # dockerfiles/Dockerfile.ci). Keep the two in sync.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish
+
+      - name: Install aarch64 cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      # aws-lc-rs (rustls) compiles vendored C/asm via the cc crate, which
+      # needs per-target CC/CXX/AR when cross-compiling.
+      - name: Build amd64 binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+          mkdir -p dist/linux-amd64
+          strip target/x86_64-unknown-linux-gnu/release/stac-os-rs \
+            -o dist/linux-amd64/stac-os-rs
+
+      - name: Build arm64 binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+          mkdir -p dist/linux-arm64
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/stac-os-rs \
+            -o dist/linux-arm64/stac-os-rs
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}}
+
+      # dockerfiles/Dockerfile.ci repackages the binaries above per
+      # TARGETARCH — no in-image cargo build, so no QEMU compile time.
+      - name: Push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: dockerfiles/Dockerfile.ci
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

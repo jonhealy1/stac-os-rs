@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+
+# CI image: consumes release binaries cross-compiled by
+# .github/workflows/publish.yml so a multi-arch push only repackages
+# instead of rebuilding under QEMU. Use the root Dockerfile for local
+# `docker build` / `docker compose` builds (it compiles from source).
+
+# ubuntu:24.04, not debian:*-slim — the binary is built on the pinned
+# ubuntu-24.04 runner (glibc 2.39); bookworm's glibc 2.36 is too old
+# and the image exits with "GLIBC_2.38 not found".
+FROM ubuntu:24.04
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 stac
+
+COPY dist/linux-${TARGETARCH}/stac-os-rs /usr/local/bin/
+
+USER stac
+EXPOSE 3000
+ENV OPENSEARCH_URL=http://opensearch:9200
+CMD ["stac-os-rs"]

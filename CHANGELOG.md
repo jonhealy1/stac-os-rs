@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-30
+
+### Added
+
+- Published multi-arch image (`ghcr.io/jonhealy1/stac-os-rs`) on `v*.*.*`
+  tags via `.github/workflows/publish.yml`; `compose.release.yml` runs the
+  released image without building from source
+
+### Fixed
+
+- Published image crashed on start (`GLIBC_2.38 not found`) — the
+  cross-compiled binary needed a newer glibc than the `debian:bookworm-slim`
+  runtime provided; CI image now runs on `ubuntu:24.04` matching the pinned
+  build runner
+
 ## [0.1.0] - 2026-10-29
 
 Initial release — a STAC API server in Rust (axum) backed by OpenSearch,
@@ -81,3 +96,7 @@ implementing the core spec plus the multi-tenant-catalogs extension.
 - CI: fmt + clippy + tests, advisory `stac-api-validator` job
 - ~150 Rust tests (incl. a port of upstream's `test_catalogs.py`) and a
   vendored sfeos API suite under `tests/upstream/` running over HTTP
+
+[Unreleased]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.1...main
+[0.1.1]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/jonhealy1/stac-os-rs/releases/tag/v0.1.0

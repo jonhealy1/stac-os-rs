@@ -1,6 +1,6 @@
 # stac-os-rs
-
-![StacLabs](https://github.com/StacLabs/.github/raw/main/profile/staclabs-orange-banner.png)
+<img src="assets/glass-osiris.png" alt="STAC-OSIRIS" width="400">
+<!-- ![StacLabs](https://github.com/StacLabs/.github/raw/main/profile/staclabs-orange-banner.png) -->
 
 A STAC API Opensearch server built with Rust
 
@@ -139,6 +139,14 @@ cargo --version   # verify install
 ```bash
 docker compose up -d          # API :3000, OpenSearch :9200, Dashboards :5601
 ```
+
+> **Just want to run it, not hack on it?** `compose.release.yml` pulls the published
+> image (`ghcr.io/jonhealy1/stac-os-rs`) instead of building from source — no
+> Rust toolchain or repo checkout needed:
+>
+> ```bash
+> docker compose -f compose.release.yml up -d   # API :3000, OpenSearch :9200
+> ```
 
 **3. Or run the API locally** — iterate on Rust code while OpenSearch stays in Docker:
 

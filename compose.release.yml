@@ -1,0 +1,45 @@
+# Consumer compose: runs the published image, no source/build needed.
+#   docker compose -f compose.release.yml up -d
+services:
+  api:
+    image: ghcr.io/jonhealy1/stac-os-rs:latest
+    container_name: stac-os-api
+    ports:
+      - "3000:3000"
+    environment:
+      OPENSEARCH_URL: http://opensearch:9200
+      ENABLE_TRANSACTIONS_EXTENSIONS: "true"
+      ENABLE_COLLECTIONS_SEARCH_ROUTE: "true"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  opensearch:
+    image: opensearchproject/opensearch:3.8.0
+    container_name: stac-os-opensearch
+    environment:
+      - cluster.name=stac-os-cluster
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  opensearch-data:
