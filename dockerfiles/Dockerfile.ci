@@ -5,7 +5,10 @@
 # instead of rebuilding under QEMU. Use the root Dockerfile for local
 # `docker build` / `docker compose` builds (it compiles from source).
 
-FROM debian:bookworm-slim
+# ubuntu:24.04, not debian:*-slim — the binary is built on the pinned
+# ubuntu-24.04 runner (glibc 2.39); bookworm's glibc 2.36 is too old
+# and the image exits with "GLIBC_2.38 not found".
+FROM ubuntu:24.04
 ARG TARGETARCH
 
 RUN apt-get update \
