@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
 ### Added
 
 - `STAC_BASE_URL` env var sets the externally advertised link host,
@@ -144,6 +146,7 @@ implementing the core spec plus the multi-tenant-catalogs extension.
 - ~150 Rust tests (incl. a port of upstream's `test_catalogs.py`) and a
   vendored sfeos API suite under `tests/upstream/` running over HTTP
 
-[Unreleased]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.1...main
+[Unreleased]: https://github.com/jonhealy1/stac-os-rs/compare/v0.2.0...main
+[0.2.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jonhealy1/stac-os-rs/releases/tag/v0.1.0
