@@ -157,6 +157,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(collections_search_get).post(collections_search_post),
         );
     }
+    // Collections-search sortables — registered when either collections-
+    // search flag is on (upstream gates it on the same condition).
+    if state.enable_collections_search || state.enable_collections_search_route {
+        app = app.route("/collections-sortables", get(collections_sortables));
+    }
     if state.enable_transactions {
         app = app.merge(transaction_router());
     }

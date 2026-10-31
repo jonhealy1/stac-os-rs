@@ -20,7 +20,9 @@ A STAC API Opensearch server built with Rust
 
 ## What is this?
 
-A **hybrid** of the STAC API core spec and the [multi-tenant-catalogs extension](https://github.com/StacLabs/multi-tenant-catalogs): catalogs form a poly-hierarchy (a DAG — a catalog or collection can live under multiple parents), and every STAC capability is exposed *scoped* under `/catalogs/{catalog_id}` rather than only at the API root. See [API Routes](#api-routes) for the full surface.
+A **Rust port of [sfeos](https://github.com/stac-utils/stac-fastapi-elasticsearch-opensearch)** — the STAC API implementation backed by OpenSearch — with the same extensions surface (Fields, Query, Filter/CQL2, Sort, Queryables, Sortables, transactions, collections-search). The upstream Python test suite is vendored under `tests/upstream/` and runs against this server over HTTP, so behavior stays compatible.
+
+sfeos also supports the [multi-tenant-catalogs extension](https://github.com/StacLabs/multi-tenant-catalogs), which this project implements too: catalogs form a poly-hierarchy (a DAG — a catalog or collection can live under multiple parents), and every STAC capability is exposed *scoped* under `/catalogs/{catalog_id}` rather than only at the API root. It's an optional extension — the catalogs surface is currently always mounted, with an opt-out flag (`ENABLE_CATALOGS_ROUTE`, like upstream's) coming soon. See [API Routes](#api-routes) for the full surface.
 
 The catalog DAG is stored in OpenSearch as one `{kind, parents}` document per node (`stac-hierarchy` index) — children are derived via `term` queries on `parents`, so linking a shared resource is a single-document write, and orphans are automatically adopted under `root`.
 
@@ -44,13 +46,14 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
-| GET | `/queryables` | OGC Queryables JSON Schema — core fields + properties discovered from the items index mapping (`application/schema+json`) |
+| GET | `/queryables` | OGC Queryables JSON Schema — core item fields (`application/schema+json`) |
 | GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry. Collections-search extensions: `sortby`, `fields`, `q` (free text), `filter` + `filter-lang`, `query`, `datetime`, `bbox` |
 | GET/POST | `/collections-search` | Requires `ENABLE_COLLECTIONS_SEARCH_ROUTE`. Same parameter surface as extended `/collections`; POST takes `{sortby:[{field,direction}], fields:{include,exclude}, q, filter, query, datetime, bbox, limit, token}` — `next` links carry `body.token` |
-| GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`) |
+| GET | `/collections-sortables` | Sortables schema for collections-search (mounted when either collections-search flag is on) |
+| GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`, `queryables`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
-| GET | `/collections/{collection_id}/queryables` | Per-collection Queryables schema (union — our shared items index can't narrow per collection) |
+| GET | `/collections/{collection_id}/queryables` | Per-collection Queryables — core fields merged with the items index mapping; `platform.enum` populated from indexed values |
 | GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
 | GET | `/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 
@@ -164,6 +167,7 @@ All variables are read once at startup — changing them requires a restart.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `OPENSEARCH_URL` | OpenSearch endpoint the store connects to. | `http://localhost:9200` | Optional |
+| `STAC_BASE_URL` | External base URL used for advertised links (`self`, `root`, `next`, queryables/sortables `$id`s) — set this behind a reverse proxy so links point at the public origin rather than the bind address. | `http://localhost:{port}` | Optional |
 
 **Feature Flags**
 
@@ -261,13 +265,13 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 **Search**
 - `collections`, `ids`, `bbox` (incl. antimeridian crossing), `intersects`, `datetime`, `sortby`, `limit`, `fields`, `query` (STACQL), and `filter` (CQL2 json + text) are applied
 - `filter` coverage is basic-cql2 + advanced comparisons + basic spatial predicates — temporal functions (`t_*`), arithmetic, and array ops are not yet supported (400)
-- `sortby` works on `/search` + `/catalogs/*/search` (item-search binding), on items listings `?sortby=±field` (features binding), and on `/collections` + `/collections-search`; sortables at `/sortables` + `/collections/{id}/sortables`
+- `sortby` works on `/search` + `/catalogs/*/search` (item-search binding), on items listings `?sortby=±field` (features binding), and on `/collections` + `/collections-search`; sortables at `/sortables` + `/collections/{id}/sortables` + `/collections-sortables`
 - Collections-search extension is on: `/collections` and `/collections-search` (GET+POST) support `sortby`, `fields`, `q` free text, CQL2 `filter`, STACQL `query`, `datetime` (temporal-extent overlap), and `bbox` (geo_shape on the derived `bbox_shape` field — injected at write time, stripped on read)
 - `datetime` bounds require full RFC3339 date-times — date-only inputs (`2023-06-01`) 400, matching the spec and upstream. Accepting them as whole-day intervals (OGC Features' leniency) would be a client-friendliness enhancement: normalize bounds to `T00:00:00Z`/`T23:59:59.999Z` before `valid()` runs — OpenSearch's `date` mapping already accepts date-only
 - Paging is opaque-token based: `next` links carry a base64 `token` (in the href for GET, in `body` for POST); `{offset: n}` in a POST body is still accepted. Item listings use `?limit=&token=`; collection cursors are lenient (unknown values restart at page 1, matching upstream), item tokens 400. All paged responses include `numberMatched`/`numberReturned`. Deep paging (>10k) needs `search_after`/cursor — not implemented
 
 **Core STAC routes**
-- `GET /queryables` (root + per-collection) serve the union of mapped item properties — per-collection narrowing would need per-collection indices or an aggregation pass
+- `GET /queryables` (root) serves upstream's core queryables set; per-collection queryables merge that with the items index mapping (`platform.enum` comes from a terms aggregation). True per-collection narrowing would need per-collection indices
 - `service-doc` (human-readable API docs page) — OpenAPI JSON exists at `/api`; no HTML variant
 - `src/openapi.json` is hand-maintained and drifts as features land — generate it from the route types instead (`utoipa` or `aide`)
 

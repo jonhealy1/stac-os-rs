@@ -290,7 +290,7 @@ async fn test_sortables_endpoint() {
     let props = body["properties"].as_object().unwrap();
     assert!(props.contains_key("id"));
     assert!(props.contains_key("collection"));
-    assert!(props.contains_key("datetime"));
+    assert!(props.contains_key("properties.datetime"));
 }
 
 #[tokio::test]
@@ -504,11 +504,11 @@ async fn test_items_sortby() {
             .collect()
     };
 
-    // asc shorthand: ?sortby=+datetime (encoded %2B)
+    // asc shorthand: ?sortby=+properties.datetime (encoded %2B)
     let (_, asc) = call(
         &app,
         "GET",
-        &format!("/collections/{col}/items?sortby=%2Bdatetime"),
+        &format!("/collections/{col}/items?sortby=%2Bproperties.datetime"),
         None,
     )
     .await;
@@ -521,7 +521,7 @@ async fn test_items_sortby() {
     let (_, desc) = call(
         &app,
         "GET",
-        &format!("/collections/{col}/items?sortby=-datetime"),
+        &format!("/collections/{col}/items?sortby=-properties.datetime"),
         None,
     )
     .await;
@@ -542,7 +542,8 @@ async fn test_collection_sortables() {
     let (s, body) = call(&app, "GET", &format!("/collections/{col}/sortables"), None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["type"], "object");
-    assert_eq!(body["additionalProperties"], true);
+    // features binding is a closed schema (upstream `additional_properties=False`)
+    assert_eq!(body["additionalProperties"], false);
 
     let (s, body) = call(&app, "GET", &format!("/collections/{col}"), None).await;
     assert_eq!(s, StatusCode::OK);

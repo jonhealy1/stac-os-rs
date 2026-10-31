@@ -160,6 +160,8 @@ impl Store {
                     "extent": {"properties": {"temporal": {"properties": {
                         "interval": {"type": "date"}
                     }}}},
+                    // upstream alias so collections sort on `temporal`.
+                    "temporal": {"type": "alias", "path": "extent.temporal.interval"},
                     "bbox_shape": {"type": "geo_shape"}
                 }}),
             ),
@@ -190,7 +192,11 @@ impl Store {
                             "datetime": {"type": "date"},
                             "start_datetime": {"type": "date"},
                             "end_datetime": {"type": "date"}
-                        }}
+                        }},
+                        // links/assets are response material, not query
+                        // fields — matching upstream's disabled mapping.
+                        "links": {"enabled": false},
+                        "assets": {"enabled": false}
                     }
                 }),
             ),
@@ -253,6 +259,50 @@ impl Store {
             .error_for_status_code()?
             .json()
             .await
+    }
+
+    /// Distinct values for enum-marked queryable fields, scoped to a
+    /// collection — upstream `get_items_unique_values`. `fields` are
+    /// `(field_fqn, engine_type)`; text fields aggregate on `.keyword`.
+    /// Returns `{field_fqn: [values]}`.
+    pub async fn unique_values(
+        &self,
+        collection_id: &str,
+        fields: &[(String, String)],
+    ) -> Result<Map<String, Value>, opensearch::Error> {
+        let mut aggs = Map::new();
+        for (fqn, ty) in fields {
+            let field = match ty.as_str() {
+                "text" | "match_only_text" => format!("{fqn}.keyword"),
+                _ => fqn.clone(),
+            };
+            aggs.insert(
+                fqn.clone(),
+                json!({"terms": {"field": field, "size": 1000}}),
+            );
+        }
+        let resp = self
+            .client
+            .search(SearchParts::Index(&[&self.idx(ITEMS_INDEX)]))
+            .body(json!({
+                "size": 0,
+                "query": {"term": {"collection": collection_id}},
+                "aggs": aggs,
+            }))
+            .send()
+            .await?
+            .error_for_status_code()?
+            .json::<Value>()
+            .await?;
+        let mut out = Map::new();
+        for (fqn, _) in fields {
+            let values: Vec<Value> = resp["aggregations"][fqn]["buckets"]
+                .as_array()
+                .map(|b| b.iter().map(|e| e["key"].clone()).collect())
+                .unwrap_or_default();
+            out.insert(fqn.clone(), json!(values));
+        }
+        Ok(out)
     }
 
     // --- Hierarchy DAG ---
@@ -820,7 +870,17 @@ impl Store {
                 }})
             })
             .collect();
-        if !sort.is_empty() {
+        if sort.is_empty() {
+            // No sortby — upstream's DEFAULT_SORT (mappings.py) is an
+            // index-level segment sort, which orders docs missing the
+            // field last. `_last` replicates that at query time.
+            sort = vec![
+                json!({"properties.datetime": {"order": "desc", "missing": "_last"}}),
+                json!({"properties.start_datetime": {"order": "desc", "missing": "_last"}}),
+                json!({"id": {"order": "desc"}}),
+                json!({"collection": {"order": "desc"}}),
+            ];
+        } else {
             sort.push(json!({"_id": {"order": "asc"}}));
         }
 
@@ -1212,6 +1272,168 @@ pub fn queryable_properties(mapping: &Value, excluded: &[String]) -> Map<String,
     props
 }
 
+/// OpenSearch field types a plain `sort` clause can use — mirrors
+/// upstream `SORTABLE_FIELD_TYPES` (sort client).
+const SORTABLE_FIELD_TYPES: &[&str] = &[
+    "boolean",
+    "byte",
+    "constant_keyword",
+    "date",
+    "date_nanos",
+    "double",
+    "float",
+    "half_float",
+    "integer",
+    "ip",
+    "keyword",
+    "long",
+    "scaled_float",
+    "short",
+    "unsigned_long",
+    "version",
+    "wildcard",
+];
+
+/// Upstream `_is_sortable`: text sorts through a keyword multi-field;
+/// everything else must be a sortable engine type.
+fn is_sortable(def: &Value) -> bool {
+    if def.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return false;
+    }
+    match def.get("type").and_then(Value::as_str) {
+        Some("text") => def
+            .get("fields")
+            .and_then(Value::as_object)
+            .map(|f| {
+                f.values()
+                    .any(|s| s.get("type").and_then(Value::as_str) == Some("keyword"))
+            })
+            .unwrap_or(false),
+        Some(ty) => SORTABLE_FIELD_TYPES.contains(&ty),
+        None => false,
+    }
+}
+
+/// Upstream `_resolve_alias`: an alias field advertises the definition
+/// its `path` points at.
+fn resolve_alias<'a>(properties: &'a Map<String, Value>, def: &'a Value) -> Option<&'a Value> {
+    let mut level: Option<&Map<String, Value>> = Some(properties);
+    let mut node: Option<&Value> = None;
+    for part in def
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .split('.')
+    {
+        node = level?.get(part);
+        level = node?.get("properties").and_then(Value::as_object);
+    }
+    node.filter(|v| v.is_object())
+}
+
+/// Python `str.title()` — uppercase after every non-letter.
+pub(crate) fn py_title(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut word_start = true;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            out.push(if word_start {
+                c.to_uppercase().next().unwrap_or(c)
+            } else {
+                c.to_lowercase().next().unwrap_or(c)
+            });
+            word_start = false;
+        } else {
+            out.push(c);
+            word_start = true;
+        }
+    }
+    out
+}
+
+/// Upstream `_to_property_schema`: sortables keep the full document
+/// path as the key (`properties.datetime`), unlike queryables.
+fn sortable_schema(fqn: &str, field_type: &str) -> Value {
+    let name = fqn
+        .strip_prefix("properties.")
+        .or_else(|| fqn.strip_prefix("assets."))
+        .unwrap_or(fqn);
+    let mut schema = json!({"title": py_title(&name.replace(['_', '-'], " "))});
+    let json_type = match field_type {
+        "boolean" => Some("boolean"),
+        "constant_keyword" | "date" | "date_nanos" | "ip" | "keyword" | "match_only_text"
+        | "text" | "version" | "wildcard" => Some("string"),
+        "integer" => Some("integer"),
+        "byte" | "double" | "float" | "half_float" | "long" | "scaled_float" | "short"
+        | "token_count" | "unsigned_long" => Some("number"),
+        "geo_point" | "geo_shape" => Some("object"),
+        "nested" => Some("array"),
+        _ => None,
+    };
+    if let Some(t) = json_type {
+        schema["type"] = json!(t);
+    }
+    if matches!(field_type, "date" | "date_nanos") {
+        schema["format"] = json!("date-time");
+    }
+    schema
+}
+
+/// Upstream `get_sortable_properties_shared`: walks an index mapping's
+/// `properties` and yields the fields a plain sortby can use — keyword
+/// (or text+keyword), numeric, date and boolean leaves; objects are
+/// flattened, `nested` leaves and `enabled: false`/`geo`/`excluded`
+/// fields are not advertised. Keys are full document paths.
+pub fn sortable_properties(mapping: &Value, excluded: &[String]) -> Map<String, Value> {
+    let is_excluded = |fqn: &str| {
+        excluded
+            .iter()
+            .any(|p| fqn == p || fqn.starts_with(&format!("{p}.")))
+    };
+    let root = mapping
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut props = Map::new();
+    let mut stack: Vec<(String, Value)> =
+        root.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    while let Some((fqn, def)) = stack.pop() {
+        if !def.is_object() {
+            continue;
+        }
+        // Object fields flatten, so their leaves sort directly; `nested`
+        // leaves need a nested sort clause plain sortby can't express.
+        if def.get("type").and_then(Value::as_str) != Some("nested") {
+            if let Some(children) = def.get("properties").and_then(Value::as_object) {
+                stack.extend(
+                    children
+                        .iter()
+                        .filter(|(_, v)| v.is_object())
+                        .map(|(k, v)| (format!("{fqn}.{k}"), v.clone()))
+                        .filter(|(k, _)| !is_excluded(k)),
+                );
+            }
+        }
+        if is_excluded(&fqn) || def.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let mut def = def;
+        if def.get("type").and_then(Value::as_str) == Some("alias") {
+            match resolve_alias(&root, &def) {
+                Some(target) => def = target.clone(),
+                None => continue,
+            }
+        }
+        if !is_sortable(&def) {
+            continue;
+        }
+        let ty = def.get("type").and_then(Value::as_str).unwrap_or_default();
+        props.insert(fqn.clone(), sortable_schema(&fqn, ty));
+    }
+    props
+}
+
 /// OpenSearch field type -> JSON Schema fragment for a queryable.
 fn os_type_schema(ty: &str) -> Value {
     match ty {
@@ -1273,6 +1495,8 @@ fn collection_sort_field(field: &str) -> String {
 fn collection_exact_field(field: &str, value: &Value) -> String {
     if value.is_string()
         && field != "id"
+        && field != "created"
+        && field != "updated"
         && !field.starts_with("extent.")
         && !field.ends_with(".keyword")
     {
@@ -1448,11 +1672,497 @@ pub fn cql2_clause(filter: &stac_api::Filter) -> Result<Value, String> {
 }
 
 pub fn cql2_clause_with(filter: &stac_api::Filter, spec: FieldSpec) -> Result<Value, String> {
-    let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| e.to_string())?;
-    expr_clause(&expr, spec)
+    match filter {
+        stac_api::Filter::Cql2Json(map) => {
+            check_cql2_literals(&Value::Object(map.clone()))?;
+        }
+        stac_api::Filter::Cql2Text(raw) => {
+            check_cql2_text_args(raw)?;
+        }
+    }
+    let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| match filter {
+        // upstream cql2_text_to_json maps every text parse failure
+        stac_api::Filter::Cql2Text(_) => "expected valid CQL2 text".to_string(),
+        _ => e.to_string(),
+    })?;
+    // The parser rewrites temporal literals it can read (e.g. a +25:00
+    // offset as UTC); check what it produced for anything the
+    // pre-parse scans miss.
+    if let Ok(json) = serde_json::to_value(&expr) {
+        check_cql2_literals(&json)?;
+    }
+    expr_clause(&expr, spec, matches!(filter, stac_api::Filter::Cql2Text(_)))
 }
 
-fn expr_clause(expr: &cql2::Expr, spec: FieldSpec) -> Result<Value, String> {
+/// Upstream `check_cql2_literals`: walks a CQL2 JSON expression and
+/// rejects `{"date"}`/`{"timestamp"}`/`{"interval"}` literals that are
+/// not RFC 3339. `".."` and non-string interval bounds pass.
+pub(crate) fn check_cql2_literals(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Array(items) => items.iter().try_for_each(check_cql2_literals),
+        Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(d) = map.get("date") {
+                    return check_cql2_instant("DATE", d, Some(true));
+                }
+                if let Some(t) = map.get("timestamp") {
+                    return check_cql2_instant("TIMESTAMP", t, Some(false));
+                }
+                if let Some(Value::Array(bounds)) = map.get("interval") {
+                    for bound in bounds {
+                        if bound.as_str().is_some_and(|b| b != "..") {
+                            check_cql2_instant("INTERVAL", bound, None)?;
+                        }
+                    }
+                }
+            }
+            map.values().try_for_each(check_cql2_literals)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Upstream `_check_instant` — `date_only` Some(true) requires a full
+/// date, Some(false) a date-time, None accepts either.
+fn check_cql2_instant(kind: &str, literal: &Value, date_only: Option<bool>) -> Result<(), String> {
+    if let Some(s) = literal.as_str() {
+        if date_only != Some(false) && is_rfc3339_date(s) {
+            return Ok(());
+        }
+        if date_only != Some(true) && is_rfc3339_datetime(s) {
+            return Ok(());
+        }
+    }
+    let expected = match date_only {
+        Some(true) => "date",
+        Some(false) => "date-time",
+        None => "date or date-time",
+    };
+    Err(format!(
+        "{kind}({}) is not an RFC 3339 {expected}",
+        py_repr(literal)
+    ))
+}
+
+/// Python `repr` for the error message: strings single-quoted,
+/// anything else as its JSON literal.
+fn py_repr(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        other => other.to_string(),
+    }
+}
+
+/// RFC 3339 full-date (`\d{4}-\d{2}-\d{2}`) with a real calendar day.
+fn is_rfc3339_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !s[..4]
+            .bytes()
+            .chain(s[5..7].bytes())
+            .chain(s[8..10].bytes())
+            .all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    s.parse::<jiff::civil::Date>().is_ok()
+}
+
+/// RFC 3339 date-time: `full-date [Tt] hh:mm:ss[.frac] (Z|±hh:mm)`,
+/// the same shape upstream's `_DATE_TIME` regex bounds.
+fn is_rfc3339_datetime(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || !is_rfc3339_date(&s[..10])
+        || !b[10].eq_ignore_ascii_case(&b't')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return false;
+    }
+    let pair = |i: usize| -> Option<u32> {
+        let (a, c) = (b.get(i)?, b.get(i + 1)?);
+        (a.is_ascii_digit() && c.is_ascii_digit()).then(|| ((a - b'0') * 10 + (c - b'0')) as u32)
+    };
+    let (Some(h), Some(m), Some(sec)) = (pair(11), pair(14), pair(17)) else {
+        return false;
+    };
+    if h > 23 || m > 59 || sec > 59 {
+        return false;
+    }
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    match b.get(i) {
+        Some(z) if z.eq_ignore_ascii_case(&b'z') => i + 1 == b.len(),
+        Some(b'+') | Some(b'-') => {
+            b.len() == i + 6
+                && b[i + 3] == b':'
+                && pair(i + 1).is_some_and(|hh| hh <= 23)
+                && pair(i + 4).is_some_and(|mm| mm <= 59)
+        }
+        _ => false,
+    }
+}
+
+/// Upstream `_TEMPORAL_ARGS` scan: validates `TIMESTAMP('...')` and
+/// `INTERVAL('...', '...')` arguments as written in CQL2 text, skipping
+/// anything inside other quoted strings.
+pub(crate) fn check_cql2_text_args(text: &str) -> Result<(), String> {
+    let lower = text.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            i = skip_cql2_string(b, i + 1);
+            continue;
+        }
+        for (kw, kind, date_only) in [
+            ("timestamp", "TIMESTAMP", Some(false)),
+            ("interval", "INTERVAL", None),
+        ] {
+            if !lower[i..].starts_with(kw)
+                || (i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            {
+                continue;
+            }
+            let mut j = i + kw.len();
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'(') {
+                continue;
+            }
+            j += 1;
+            loop {
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'\'') {
+                    break;
+                }
+                let (lit, next) = read_cql2_string(text, j + 1);
+                if !lit.is_empty() && lit != ".." {
+                    check_cql2_instant(kind, &Value::String(lit), date_only)?;
+                }
+                j = next;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b',') {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Byte index just past a closing `'` (honouring `''` escapes).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b':'
+}
+
+/// `b[..i]` ends with `kw` as a whole word → returns the word's start.
+fn word_before(b: &[u8], mut i: usize, kw: &[u8]) -> Option<usize> {
+    while i > 0 && b[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i < kw.len() || !b[i - kw.len()..i].eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let s = i - kw.len();
+    if s > 0 && (ident_byte(b[s - 1])) {
+        return None;
+    }
+    Some(s)
+}
+
+/// `b[i..]` starts with `kw` as a whole word → index just past it.
+fn word_after(b: &[u8], i: usize, kw: &[u8]) -> Option<usize> {
+    let mut j = i;
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j + kw.len() > b.len() || !b[j..j + kw.len()].eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let e = j + kw.len();
+    if e < b.len() && ident_byte(b[e]) {
+        return None;
+    }
+    Some(e)
+}
+
+/// Forward-scan one CQL2 operand starting at `i`: sign, literal,
+/// quoted identifier/string, parenthesized group, identifier or
+/// function call. Returns the index just past it.
+fn scan_operand_fwd(b: &[u8], mut i: usize) -> Option<usize> {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    match *b.get(i)? {
+        b'\'' | b'"' => {
+            let q = b[i];
+            i += 1;
+            while i < b.len() {
+                if b[i] == q {
+                    if b.get(i + 1) == Some(&q) {
+                        i += 2;
+                        continue;
+                    }
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            None
+        }
+        b'(' => {
+            let mut depth = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'\'' => i = skip_cql2_string(b, i + 1),
+                    b'(' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b')' => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        c if ident_byte(c) => {
+            while i < b.len() && ident_byte(b[i]) {
+                i += 1;
+            }
+            // A function call continues into its argument list.
+            if b.get(i) == Some(&b'(') {
+                i = scan_operand_fwd(b, i)?;
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+/// Backward-scan the operand ending at `i` (exclusive); returns its
+/// start index — covers `f(...)` calls, quoted strings, idents, numbers.
+fn scan_operand_back(b: &[u8], mut i: usize) -> Option<usize> {
+    while i > 0 && b[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let mut s = i;
+    match b[i - 1] {
+        b')' => {
+            let mut depth = 0;
+            while s > 0 {
+                s -= 1;
+                match b[s] {
+                    b'\'' => {
+                        // walk back to the opening quote
+                        while s > 0 {
+                            s -= 1;
+                            if b[s] == b'\'' {
+                                break;
+                            }
+                        }
+                    }
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            // `ident(` prefix → part of the same operand (function call).
+            let mut j = s;
+            while j > 0 && ident_byte(b[j - 1]) {
+                j -= 1;
+            }
+            Some(j)
+        }
+        b'\'' => {
+            s = i - 1;
+            while s > 0 {
+                s -= 1;
+                if b[s] == b'\'' {
+                    break;
+                }
+            }
+            Some(s)
+        }
+        c if ident_byte(c) => {
+            while s > 0 && ident_byte(b[s - 1]) {
+                s -= 1;
+            }
+            // leading unary sign belongs to a numeric operand
+            if s > 0 && matches!(b[s - 1], b'+' | b'-') && (s < 2 || !ident_byte(b[s - 2])) {
+                s -= 1;
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// cql2-rs 0.4 Pratt parser bug: `x BETWEEN lo AND hi AND rest` parses
+/// `rest` as a BETWEEN bound and silently drops it. Rewriting the infix
+/// form to the equivalent function call `BETWEEN(x, lo, hi)` (which the
+/// grammar treats as `Operation{"between", [x,lo,hi]}`) avoids the buggy
+/// stitching path while keeping `NOT` as a prefix on the call.
+pub(crate) fn rewrite_between(text: &str) -> String {
+    let mut text = text.to_string();
+    for _ in 0..8 {
+        let b = text.as_bytes().to_vec();
+        let mut rewrite: Option<(usize, usize, String)> = None;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => i = skip_cql2_string(&b, i + 1),
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                _ => {
+                    if let Some(op_end) = word_after(&b, i, b"between") {
+                        // Already a function call — nothing to fix.
+                        let mut j = op_end;
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if b.get(j) != Some(&b'(') {
+                            if let Some(r) = rewrite_one(&b, i, op_end) {
+                                rewrite = Some(r);
+                            }
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let Some((s, e, replacement)) = rewrite else {
+            break;
+        };
+        text.replace_range(s..e, &replacement);
+    }
+    text
+}
+
+/// Builds `NOT BETWEEN(lhs, lo, hi)` for the infix span ending a
+/// `between` keyword at `kw_start`; returns `(span_start, span_end,
+/// replacement)` or None when the shape is unexpected.
+fn rewrite_one(b: &[u8], kw_start: usize, kw_end: usize) -> Option<(usize, usize, String)> {
+    // Optional `NOT` flag, then the left-hand operand.
+    let (not, lhs_boundary) = match word_before(b, kw_start, b"not") {
+        Some(s) => ("NOT ", s),
+        None => ("", kw_start),
+    };
+    let lhs_start = scan_operand_back(b, lhs_boundary)?;
+    // The operand must be preceded by an expression boundary —
+    // start, `(`, `,`, or a boolean operator — not another atom.
+    let mut p = lhs_start;
+    while p > 0 && b[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    let ok_boundary = p == 0
+        || matches!(b[p - 1], b'(' | b',')
+        || word_before(b, p, b"and").is_some()
+        || word_before(b, p, b"or").is_some()
+        || word_before(b, p, b"not").is_some()
+        || matches!(b[p - 1], b'=' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/');
+    if !ok_boundary {
+        return None;
+    }
+
+    let lo_end = scan_operand_fwd(b, kw_end)?;
+    let and_end = word_after(b, lo_end, b"and")?;
+    let hi_end = scan_operand_fwd(b, and_end)?;
+
+    let lhs = &b[lhs_start..lhs_boundary];
+    let lo = &b[kw_end..lo_end];
+    let hi = &b[and_end..hi_end];
+    let replacement = format!(
+        "{not}BETWEEN({}, {}, {})",
+        String::from_utf8_lossy(lhs).trim(),
+        String::from_utf8_lossy(lo).trim(),
+        String::from_utf8_lossy(hi).trim(),
+    );
+    Some((lhs_start, hi_end, replacement))
+}
+
+fn skip_cql2_string(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Reads a quoted literal from `text` starting after the opening quote;
+/// returns the unescaped content and the index past the closing quote.
+fn read_cql2_string(text: &str, mut i: usize) -> (String, usize) {
+    let b = text.as_bytes();
+    let mut lit = String::new();
+    let mut start = i;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            lit.push_str(&text[start..i]);
+            if b.get(i + 1) == Some(&b'\'') {
+                lit.push('\'');
+                i += 2;
+                start = i;
+                continue;
+            }
+            return (lit, i + 1);
+        }
+        i += 1;
+    }
+    (lit, i)
+}
+
+fn expr_clause(expr: &cql2::Expr, spec: FieldSpec, from_text: bool) -> Result<Value, String> {
     use cql2::Expr;
     match expr {
         Expr::Bool(true) => Ok(json!({"match_all": {}})),
@@ -1461,7 +2171,7 @@ fn expr_clause(expr: &cql2::Expr, spec: FieldSpec) -> Result<Value, String> {
             "and" | "or" => {
                 let clauses = args
                     .iter()
-                    .map(|a| expr_clause(a, spec))
+                    .map(|a| expr_clause(a, spec, from_text))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(if op == "and" {
                     json!({"bool": {"filter": clauses}})
@@ -1473,10 +2183,10 @@ fn expr_clause(expr: &cql2::Expr, spec: FieldSpec) -> Result<Value, String> {
                 let [a] = args.as_slice() else {
                     return Err("'not' expects one operand".into());
                 };
-                Ok(json!({"bool": {"must_not": [expr_clause(a, spec)?]}}))
+                Ok(json!({"bool": {"must_not": [expr_clause(a, spec, from_text)?]}}))
             }
             "=" | "<>" | "<" | "<=" | ">" | ">=" => comparison_clause(op, args, spec),
-            "in" => in_clause(args, spec),
+            "in" => in_clause(args, spec, from_text),
             "between" => between_clause(args, spec),
             "like" => like_clause(args, spec),
             "isNull" => {
@@ -1538,16 +2248,34 @@ fn comparison_clause(op: &str, args: &[Box<cql2::Expr>], spec: FieldSpec) -> Res
     })
 }
 
-fn in_clause(args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
+fn in_clause(args: &[Box<cql2::Expr>], spec: FieldSpec, from_text: bool) -> Result<Value, String> {
     let (a, b) = two_args("in", args)?;
-    let (cql2::Expr::Property { property }, cql2::Expr::Array(values)) = (a, b) else {
-        return Err("'in' expects a property and an array".into());
+    let cql2::Expr::Property { property } = a else {
+        return Err("'in' expects a property as its first arg".into());
+    };
+    let values: Vec<Value> = match b {
+        cql2::Expr::Array(values) => values
+            .iter()
+            .map(|v| literal_value(v))
+            .collect::<Result<_, _>>()?,
+        scalar if from_text => {
+            // CQL2-text `IN ('x')` — a parenthesized single literal is a
+            // 1-element list upstream, but the crate parses the parens
+            // away to a bare scalar.
+            vec![literal_value(scalar)?]
+        }
+        scalar => {
+            // Upstream `to_es` raises ValueError("Arg {v} is not a
+            // list"), surfaced verbatim under the prefix.
+            let rendered = literal_value(scalar)
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                .unwrap_or_else(|_| format!("{scalar:?}"));
+            return Err(format!(
+                "Error with cql2 filter: Arg {rendered} is not a list"
+            ));
+        }
     };
     let field = (spec.map)(property);
-    let values = values
-        .iter()
-        .map(|v| literal_value(v))
-        .collect::<Result<Vec<_>, _>>()?;
     let field = values
         .first()
         .map(|v| (spec.exact)(&field, v))
@@ -1581,11 +2309,32 @@ fn like_clause(args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, Strin
     let (cql2::Expr::Property { property }, cql2::Expr::Literal(pattern)) = (a, b) else {
         return Err("'like' expects a property and a string pattern".into());
     };
-    // LIKE wildcards -> wildcard-query wildcards; dynamic string
-    // properties live on the `.keyword` sub-field.
-    let field = (spec.exact)(&(spec.map)(property), &json!(""));
-    let pattern = pattern.replace('%', "*").replace('_', "?");
-    Ok(json!({"wildcard": {field: {"value": pattern}}}))
+    // Upstream `cql2_like_to_es`: `\\`->`\`, `\%`->`%`, `\_`->`_`,
+    // `%`->`*`, `_`->`?`; any other escape sequence is a ValueError.
+    // `fields[0]` is the analyzed string field and the wildcard runs
+    // case-insensitive, so no `.keyword` here.
+    let field = (spec.map)(property);
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('%') => out.push('%'),
+                Some('_') => out.push('_'),
+                other => {
+                    let bad = other
+                        .map(|c| format!("\\{c}"))
+                        .unwrap_or_else(|| "\\".into());
+                    return Err(format!("'{bad}' is not a valid escape sequence"));
+                }
+            },
+            '%' => out.push('*'),
+            '_' => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    Ok(json!({"wildcard": {field: {"value": out, "case_insensitive": true}}}))
 }
 
 fn spatial_clause(op: &str, args: &[Box<cql2::Expr>], spec: FieldSpec) -> Result<Value, String> {
@@ -1618,6 +2367,18 @@ fn literal_value(expr: &cql2::Expr) -> Result<Value, String> {
         Expr::Timestamp { timestamp } => literal_value(timestamp),
         Expr::Date { date } => literal_value(date),
         Expr::Null => Ok(Value::Null),
+        // The text grammar has no unary minus — `-1.5` arrives as
+        // `*(-1, 1.5)`; fold it back so BETWEEN negative bounds work.
+        Expr::Operation { op, args }
+            if op == "*"
+                && args.len() == 2
+                && matches!(&*args[0], Expr::Float(f) if *f == -1.0) =>
+        {
+            match literal_value(&args[1])? {
+                Value::Number(n) => Ok(json!(-n.as_f64().unwrap_or_default())),
+                other => Err(format!("unsupported cql2 literal -{other:?}")),
+            }
+        }
         other => Err(format!("unsupported cql2 literal {other:?}")),
     }
 }
@@ -1864,7 +2625,7 @@ mod tests {
         );
         assert_eq!(
             clause(json!({"op": "like", "args": [{"property": "platform"}, "sent%"]})),
-            json!({"wildcard": {"properties.platform.keyword": {"value": "sent*"}}})
+            json!({"wildcard": {"properties.platform": {"value": "sent*", "case_insensitive": true}}})
         );
         assert_eq!(
             clause(json!({"op": "isNull", "args": [{"property": "eo:x"}]})),

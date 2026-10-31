@@ -99,6 +99,25 @@ def _install_optional_dep_stubs():
 _install_optional_dep_stubs()
 
 STAC_API_URL = os.environ.get("STAC_API_URL", "http://localhost:3000").rstrip("/")
+
+
+class _UpstreamHostTransport(httpx.AsyncHTTPTransport):
+    """Send `http://test-server` URLs to the real API listener.
+
+    Upstream tests pin link hrefs and `$id`s to the in-process app's
+    `http://test-server` base URL. The API is started with
+    `STAC_BASE_URL=http://test-server` so every advertised link carries
+    that host; this transport rewrites the connection target so those
+    URLs still reach the real listener.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == "test-server":
+            target = httpx.URL(STAC_API_URL)
+            request.url = request.url.copy_with(
+                scheme=target.scheme, host=target.host, port=target.port
+            )
+        return await super().handle_async_request(request)
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200").rstrip("/")
 # Physical index prefix used by the running server (`Store::connect` default).
 INDEX_PREFIX = os.environ.get("STAC_INDEX_PREFIX", "stac")
@@ -363,6 +382,8 @@ _INDEX_MAPPINGS = {
                     "temporal": {"properties": {"interval": {"type": "date"}}}
                 }
             },
+            # upstream alias so collections sort on `temporal`.
+            "temporal": {"type": "alias", "path": "extent.temporal.interval"},
             "bbox_shape": {"type": "geo_shape"},
         }
     },
@@ -395,6 +416,9 @@ _INDEX_MAPPINGS = {
                     "end_datetime": {"type": "date"},
                 }
             },
+            # response material, not query fields — mirrors store.rs.
+            "links": {"enabled": False},
+            "assets": {"enabled": False},
         }
     },
 }
@@ -578,7 +602,9 @@ class HttpTxnClient:
 
     def __init__(self, os_client):
         self.database = _HttpDatabase(os_client)
-        self._http = httpx.AsyncClient(base_url=STAC_API_URL, timeout=60.0)
+        self._http = httpx.AsyncClient(
+            base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
+        )
 
     async def create_collection(self, collection, request=None, refresh=False):
         r = await self._http.post("/collections", json=_dump(collection))
@@ -715,7 +741,7 @@ async def bulk_txn_client():
 @pytest_asyncio.fixture()
 async def app_client():
     async with httpx.AsyncClient(
-        base_url=STAC_API_URL, timeout=60.0
+        base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
     ) as c:
         yield c
 
@@ -723,7 +749,7 @@ async def app_client():
 @pytest_asyncio.fixture()
 async def catalogs_app_client():
     async with httpx.AsyncClient(
-        base_url=STAC_API_URL, timeout=60.0
+        base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
     ) as c:
         yield c
 
@@ -756,6 +782,24 @@ mock_datetime_env = _skip_fixture("mock_datetime_env")
 def stac_validator_off(monkeypatch):
     """No-op: stac-os-rs has no ENABLE_STAC_VALIDATOR toggle (always off)."""
     monkeypatch.setenv("ENABLE_STAC_VALIDATOR", "false")
+
+
+@pytest_asyncio.fixture()
+async def datetime_nanos_off(txn_client):
+    """Upstream remaps item datetimes to `date` (USE_DATETIME_NANOS=false)
+    for a test; our items index is always millisecond `date`, so a plain
+    reset is the equivalent setup."""
+    await delete_collections_and_items(txn_client)
+    yield
+
+
+async def use_datetime_nanos(value: bool) -> None:
+    """In-process helper — rewrites upstream's index template for
+    USE_DATETIME_NANOS. No external equivalent; callers skip."""
+    pytest.skip(
+        "USE_DATETIME_NANOS rewrites upstream's index template in-process; "
+        "our datetime fields are always mapped `date`"
+    )
 
 
 def get_flattened_routes(router_obj, prefix=""):
@@ -865,6 +909,51 @@ _IN_PROCESS_TESTS = {
         "monkeypatches the in-process cql2_text_to_json — an external "
         "API never calls it"
     ),
+    "test_datetime_aggregations_cover_all_dates": (
+        "the aggregation extension (`/aggregate`) is not implemented"
+    ),
+    "test_sort_spans_date_and_date_nanos_indexes": (
+        "rewrites upstream's index template mid-test via in-process "
+        "use_datetime_nanos + USE_DATETIME_NANOS env — no HTTP equivalent"
+    ),
+    "test_get_sortable_properties_shared": "calls sfeos_helpers sort internals",
+    "test_get_sortable_properties_shared_aliases": "calls sfeos_helpers sort internals",
+    "test_get_sortable_properties_shared_exclusions": (
+        "calls sfeos_helpers sort internals"
+    ),
+    "test_get_sortable_field_types_shared": "calls sfeos_helpers sort internals",
+    "test_populate_sort_shared_unmapped_type": "calls sfeos_helpers sort internals",
+    "test_populate_sort_shared_item_datetime_compares_in_milliseconds": (
+        "calls sfeos_helpers sort internals"
+    ),
+    "test_collections_sortables_route_gated_on_collection_search": (
+        "instantiates an in-process sfeos app to inspect registered routes"
+    ),
+    "test_sortby_union_membership": (
+        "mutates ROOT_QUERYABLES_UNION via monkeypatch — env-only/inert "
+        "against an external API process"
+    ),
+    "test_get_aggregate_cql2_like_not_double_url_decoded": (
+        "calls the in-process aggregate helper — /aggregate not implemented"
+    ),
+    "test_root_queryables_config_file": (
+        "loads a queryables config file into an in-process app"
+    ),
+    "test_root_queryables_union_served_from_cache": (
+        "exercises the in-process queryables cache"
+    ),
+    "test_root_queryables_union": (
+        "mutates ROOT_QUERYABLES_UNION via monkeypatch — env-only/inert "
+        "against an external API process"
+    ),
+    "test_root_queryables_union_cache_refreshed_after_ttl": (
+        "mutates QUERYABLES_CACHE_TTL via monkeypatch — env-only/inert "
+        "against an external API process"
+    ),
+    "test_queryables_excluded_fields": (
+        "mutates EXCLUDED_FROM_QUERYABLES via monkeypatch — env-only/inert "
+        "against an external API process"
+    ),
 }
 
 
@@ -915,6 +1004,13 @@ def pytest_collection_modifyitems(items):
                 pytest.mark.skip(
                     reason="ENABLE_REDIS_QUEUE=true — Redis queueing is out "
                     "of scope; env-only mutation can't affect external API"
+                )
+            )
+        elif params.get("use_datetime") == "false":
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="fixture mutates USE_DATETIME=false in-process; "
+                    "external API reads config at startup"
                 )
             )
         elif params.get("field") in ("start_datetime", "end_datetime"):
