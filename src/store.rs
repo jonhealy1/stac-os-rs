@@ -402,6 +402,14 @@ impl Store {
         Ok(())
     }
 
+    /// The node's kind when it exists.
+    pub async fn get_node_kind(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<NodeKind>, opensearch::Error> {
+        Ok(self.get_node(node_id).await?.map(|n| n.kind))
+    }
+
     pub async fn get_parents(&self, node_id: &str) -> Result<Vec<String>, opensearch::Error> {
         Ok(self
             .get_node(node_id)

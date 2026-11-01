@@ -305,7 +305,28 @@ fn resolve_href(href: &str, base_url: &str) -> String {
 /// Write path (`resolve_links`): drop inferred rels and absolutize
 /// relative hrefs against the advertised base URL. User links survive.
 fn filter_stored_links(links: &mut Vec<Link>, base_url: &str) {
-    links.retain(|l| !INFERRED_LINK_RELS.contains(&l.rel.as_str()));
+    filter_stored_links_rels(links, INFERRED_LINK_RELS, base_url);
+}
+
+/// Catalog writes additionally strip `child`/`children` (upstream's
+/// `create_catalog`/`update_catalog` dynamic-link filter).
+const INFERRED_CATALOG_LINK_RELS: &[&str] = &[
+    "self",
+    "item",
+    "parent",
+    "collection",
+    "root",
+    "items",
+    "child",
+    "children",
+];
+
+fn filter_stored_catalog_links(links: &mut Vec<Link>, base_url: &str) {
+    filter_stored_links_rels(links, INFERRED_CATALOG_LINK_RELS, base_url);
+}
+
+fn filter_stored_links_rels(links: &mut Vec<Link>, rels: &[&str], base_url: &str) {
+    links.retain(|l| !rels.contains(&l.rel.as_str()));
     for l in links.iter_mut() {
         l.href = resolve_href(&l.href, base_url);
     }
@@ -660,12 +681,50 @@ async fn global_collection_doc(
 
 /// Serialize a catalog with its DAG-derived links injected — write
 /// responses mirror what a subsequent GET would return.
-async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::Value, ApiError> {
+/// Poly-hierarchy links only — `parent`/`related` per upstream's
+/// `generate_poly_hierarchy_links` for `resource_type=Catalog`. This is
+/// the link set write responses carry (GET responses add the full
+/// structural set via `catalog_links`).
+fn catalog_hierarchy_links(state: &AppState, parents: &[String]) -> Vec<Link> {
+    let base = &state.base_url;
+    let mut real: Vec<&str> = parents
+        .iter()
+        .map(String::as_str)
+        .filter(|p| *p != ROOT_CATALOG_ID)
+        .collect();
+    real.sort_unstable();
+    real.dedup();
+    let mut links = Vec::new();
+    if real.is_empty() {
+        links.push(link_json(base.clone(), "parent").title("Root Catalog".to_string()));
+    } else {
+        links.push(
+            link_json(format!("{base}/catalogs/{}", real[0]), "parent")
+                .title(real[0].to_string()),
+        );
+        if !state.hide_alternate_parents {
+            for p in &real[1..] {
+                links.push(
+                    link_json(format!("{base}/catalogs/{p}"), "related").title(p.to_string()),
+                );
+            }
+        }
+    }
+    links
+}
+
+/// Serialize a catalog for create/update responses — stored user links
+/// plus poly-hierarchy `parent`/`related` links (upstream's write-path
+/// shape: no `self`/`root`/`children`/`search` links).
+async fn catalog_write_doc(
+    state: &AppState,
+    catalog: &Catalog,
+) -> Result<serde_json::Value, ApiError> {
     let parents = state.store.get_parents(&catalog.id).await?;
     let mut doc = serde_json::to_value(catalog).map_err(|e| ApiError::Internal(e.to_string()))?;
     merge_doc_links(
         &mut doc,
-        catalog_links(state, &catalog.id, &parents).await?,
+        catalog_hierarchy_links(state, &parents),
         &state.base_url,
     );
     Ok(doc)
@@ -786,10 +845,15 @@ fn if_match_holds(header_value: &str, current_etag: &str) -> bool {
 }
 
 /// 412 unless `If-Match` is absent or holds against `current_etag`.
+/// With `REQUIRE_IF_MATCH=true` the header is mandatory (428 when
+/// absent), matching upstream's conditional-write toggle.
 fn require_if_match(headers: &axum::http::HeaderMap, current_etag: &str) -> Result<(), ApiError> {
     match headers.get(header::IF_MATCH) {
         Some(v) if !if_match_holds(v.to_str().unwrap_or_default(), current_etag) => {
             Err(ApiError::PreconditionFailed)
+        }
+        None if std::env::var("REQUIRE_IF_MATCH").is_ok_and(|v| v == "true") => {
+            Err(ApiError::PreconditionRequired)
         }
         _ => Ok(()),
     }
@@ -1244,7 +1308,7 @@ pub async fn create_root_catalog(
     State(state): State<Arc<AppState>>,
     StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
-    filter_stored_links(&mut catalog.links, &state.base_url);
+    filter_stored_catalog_links(&mut catalog.links, &state.base_url);
     // 409 on collision with an existing catalog OR collection id
     for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
         if state
@@ -1274,9 +1338,15 @@ pub async fn create_root_catalog(
     {
         return Err(ApiError::Conflict(catalog.id));
     }
-    Ok((
+    let (_, version) = state
+        .store
+        .get_document_versioned(CATALOGS_INDEX, &catalog.id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("catalog vanished after create".into()))?;
+    Ok(etag_response(
         StatusCode::CREATED,
-        Json(catalog_doc(&state, &catalog).await?),
+        &etag_of(&state, CATALOGS_INDEX, &version),
+        Json(catalog_write_doc(&state, &catalog).await?),
     ))
 }
 
@@ -1286,17 +1356,21 @@ pub async fn get_catalog(
 ) -> Result<impl IntoResponse, ApiError> {
     match state
         .store
-        .get_document(CATALOGS_INDEX, &catalog_id)
+        .get_document_versioned(CATALOGS_INDEX, &catalog_id)
         .await?
     {
-        Some(mut doc) => {
+        Some((mut doc, version)) => {
             let parents = state.store.get_parents(&catalog_id).await?;
             merge_doc_links(
                 &mut doc,
                 catalog_links(&state, &catalog_id, &parents).await?,
                 &state.base_url,
             );
-            Ok(Json(doc))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, CATALOGS_INDEX, &version),
+                Json(doc),
+            ))
         }
         None => Err(ApiError::NotFound(catalog_id)),
     }
@@ -1305,6 +1379,7 @@ pub async fn get_catalog(
 pub async fn update_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
@@ -1314,15 +1389,41 @@ pub async fn update_catalog(
             catalog.id
         )));
     }
-    filter_stored_links(&mut catalog.links, &state.base_url);
-    if !state
+    let (_, version) = state
         .store
-        .replace_document(CATALOGS_INDEX, &catalog_id, &catalog)
+        .get_document_versioned(CATALOGS_INDEX, &catalog_id)
         .await?
-    {
-        return Err(ApiError::WriteConflict(catalog_id));
+        .ok_or_else(|| ApiError::NotFound(catalog_id.clone()))?;
+    require_if_match(&headers, &etag_of(&state, CATALOGS_INDEX, &version))?;
+    filter_stored_catalog_links(&mut catalog.links, &state.base_url);
+    let applied = if headers.contains_key(header::IF_MATCH) {
+        state
+            .store
+            .index_document_versioned(CATALOGS_INDEX, &catalog_id, &catalog, version)
+            .await?
+    } else {
+        state
+            .store
+            .replace_document(CATALOGS_INDEX, &catalog_id, &catalog)
+            .await?
+    };
+    if !applied {
+        return Err(if headers.contains_key(header::IF_MATCH) {
+            ApiError::PreconditionFailed
+        } else {
+            ApiError::WriteConflict(catalog_id)
+        });
     }
-    Ok(Json(catalog_doc(&state, &catalog).await?))
+    let (_, version) = state
+        .store
+        .get_document_versioned(CATALOGS_INDEX, &catalog_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal("catalog vanished after write".into()))?;
+    Ok(etag_response(
+        StatusCode::OK,
+        &etag_of(&state, CATALOGS_INDEX, &version),
+        Json(catalog_write_doc(&state, &catalog).await?),
+    ))
 }
 
 pub async fn get_catalog_children(
@@ -2201,21 +2302,25 @@ pub async fn link_or_create_sub_catalog(
             {
                 return Err(ApiError::WriteConflict(id));
             }
-            let mut doc = state
+            let (mut doc, version) = state
                 .store
-                .get_document(CATALOGS_INDEX, &id)
+                .get_document_versioned(CATALOGS_INDEX, &id)
                 .await?
                 .unwrap();
             let parents = state.store.get_parents(&id).await?;
             merge_doc_links(
                 &mut doc,
-                catalog_links(&state, &id, &parents).await?,
+                catalog_hierarchy_links(&state, &parents),
                 &state.base_url,
             );
-            Ok((StatusCode::OK, Json(doc)))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, CATALOGS_INDEX, &version),
+                Json(doc),
+            ))
         }
         CreateOrLinkPayload::FullResource(mut new_catalog) => {
-            filter_stored_links(&mut new_catalog.links, &state.base_url);
+            filter_stored_catalog_links(&mut new_catalog.links, &state.base_url);
             // Mode A: full-body repost of an existing id is a conflict
             for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
                 if state
@@ -2241,9 +2346,15 @@ pub async fn link_or_create_sub_catalog(
             {
                 return Err(ApiError::Conflict(new_catalog.id));
             }
-            Ok((
+            let (_, version) = state
+                .store
+                .get_document_versioned(CATALOGS_INDEX, &new_catalog.id)
+                .await?
+                .ok_or_else(|| ApiError::Internal("catalog vanished after create".into()))?;
+            Ok(etag_response(
                 StatusCode::CREATED,
-                Json(catalog_doc(&state, &new_catalog).await?),
+                &etag_of(&state, CATALOGS_INDEX, &version),
+                Json(catalog_write_doc(&state, &new_catalog).await?),
             ))
         }
     }
@@ -2375,9 +2486,9 @@ pub async fn link_or_create_scoped_collection(
             {
                 return Err(ApiError::WriteConflict(id));
             }
-            let mut doc = state
+            let (mut doc, version) = state
                 .store
-                .get_document(COLLECTIONS_INDEX, &id)
+                .get_document_versioned(COLLECTIONS_INDEX, &id)
                 .await?
                 .unwrap();
             strip_collection_internals(&mut doc);
@@ -2387,7 +2498,11 @@ pub async fn link_or_create_scoped_collection(
                 collection_links(&state, &id, &catalog_id, &parents),
                 &state.base_url,
             );
-            Ok((StatusCode::OK, Json(doc)))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, COLLECTIONS_INDEX, &version),
+                Json(doc),
+            ))
         }
         CreateOrLinkPayload::FullResource(collection) => {
             // Mode A: full-body repost of an existing id is a conflict
@@ -2423,8 +2538,14 @@ pub async fn link_or_create_scoped_collection(
             {
                 return Err(ApiError::Conflict(collection.id));
             }
-            Ok((
+            let (_, version) = state
+                .store
+                .get_document_versioned(COLLECTIONS_INDEX, &collection.id)
+                .await?
+                .ok_or_else(|| ApiError::Internal("collection vanished after create".into()))?;
+            Ok(etag_response(
                 StatusCode::CREATED,
+                &etag_of(&state, COLLECTIONS_INDEX, &version),
                 Json(collection_doc(&state, &collection, &catalog_id).await?),
             ))
         }
@@ -2438,10 +2559,10 @@ pub async fn get_scoped_collection(
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     match state
         .store
-        .get_document(COLLECTIONS_INDEX, &collection_id)
+        .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
     {
-        Some(mut doc) => {
+        Some((mut doc, version)) => {
             strip_collection_internals(&mut doc);
             let parents = state.store.get_parents(&collection_id).await?;
             merge_doc_links(
@@ -2449,7 +2570,11 @@ pub async fn get_scoped_collection(
                 collection_links(&state, &collection_id, &catalog_id, &parents),
                 &state.base_url,
             );
-            Ok(Json(doc))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, COLLECTIONS_INDEX, &version),
+                Json(doc),
+            ))
         }
         None => Err(ApiError::NotFound(collection_id)),
     }
@@ -3031,25 +3156,52 @@ pub async fn get_collection_item(
 pub async fn disband_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    require_catalog(&state, &catalog_id).await?;
-    // Safety Disband: Unlink direct children only and auto-adopt orphans to Root.
-    let direct_children = state.store.get_children(&catalog_id).await?;
-    for child in direct_children {
-        if !state.store.unlink_and_adopt(&child, &catalog_id).await? {
-            return Err(ApiError::WriteConflict(child));
+    let current = state
+        .store
+        .get_document_versioned(CATALOGS_INDEX, &catalog_id)
+        .await?;
+    if let Some((_, version)) = &current {
+        require_if_match(&headers, &etag_of(&state, CATALOGS_INDEX, version))?;
+        // Atomic check-and-delete — a raced write between our read
+        // and the delete surfaces as 412 *before* any child edges
+        // are touched.
+        if !state
+            .store
+            .delete_document_versioned(CATALOGS_INDEX, &catalog_id, *version)
+            .await?
+        {
+            return Err(ApiError::PreconditionFailed);
         }
     }
 
-    // Deleting the node's doc detaches it from all parents (children are
-    // derived from `parents` lookups — no reverse cleanup needed)
-    state.store.remove_node(&catalog_id).await?;
+    // Safety Disband: unlink direct children only and auto-adopt orphans
+    // to Root. Cleanup runs when the doc was deleted above, and also when
+    // the doc is already gone but the node is still a catalog — a retried
+    // delete releases edges left behind by a failed earlier one. A
+    // non-catalog node id (e.g. a collection) is left untouched.
+    let cleanup = current.is_some()
+        || matches!(
+            state.store.get_node_kind(&catalog_id).await?,
+            Some(NodeKind::Catalog)
+        );
+    if cleanup {
+        let direct_children = state.store.get_children(&catalog_id).await?;
+        for child in direct_children {
+            if !state.store.unlink_and_adopt(&child, &catalog_id).await? {
+                return Err(ApiError::WriteConflict(child));
+            }
+        }
 
-    // Delete the catalog document itself (never child collections or items)
-    state
-        .store
-        .delete_document(CATALOGS_INDEX, &catalog_id)
-        .await?;
+        // Deleting the node's doc detaches it from all parents (children are
+        // derived from `parents` lookups — no reverse cleanup needed)
+        state.store.remove_node(&catalog_id).await?;
+    }
+
+    if current.is_none() {
+        return Err(ApiError::NotFound(catalog_id));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3286,10 +3438,10 @@ pub async fn get_scoped_item(
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     match state
         .store
-        .get_document(ITEMS_INDEX, &item_key(&item_id, &collection_id))
+        .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
         .await?
     {
-        Some(mut doc) if doc["collection"] == collection_id => {
+        Some((mut doc, version)) if doc["collection"] == collection_id => {
             merge_doc_links(
                 &mut doc,
                 item_links(&state, &item_id, &collection_id, Some(&catalog_id)),
@@ -3298,7 +3450,11 @@ pub async fn get_scoped_item(
             if let Some(obj) = doc.as_object_mut() {
                 strip_excluded_item_fields(&state, obj);
             }
-            Ok(geo_json(doc))
+            Ok(etag_response(
+                StatusCode::OK,
+                &etag_of(&state, ITEMS_INDEX, &version),
+                geo_json(doc),
+            ))
         }
         _ => Err(ApiError::NotFound(item_id)),
     }
@@ -4040,6 +4196,8 @@ pub enum ApiError {
     Conflict(String),
     /// `If-Match` precondition failed.
     PreconditionFailed,
+    /// `If-Match` header required but absent (428).
+    PreconditionRequired,
     /// Optimistic-concurrency retries exhausted — retry the request.
     WriteConflict(String),
     Internal(String),
@@ -4064,6 +4222,10 @@ impl IntoResponse for ApiError {
             ApiError::PreconditionFailed => (
                 StatusCode::PRECONDITION_FAILED,
                 "If-Match precondition failed".to_string(),
+            ),
+            ApiError::PreconditionRequired => (
+                StatusCode::PRECONDITION_REQUIRED,
+                "If-Match header is required".to_string(),
             ),
             ApiError::WriteConflict(id) => (
                 StatusCode::CONFLICT,

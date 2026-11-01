@@ -15,6 +15,7 @@ Run against a live stack:  make up   (or OPENSEARCH_URL/STAC_API_URL to point
 elsewhere).  Requires: pytest, pytest-asyncio, httpx, sfeos (for its imports).
 """
 
+import asyncio
 import copy
 import json
 import os
@@ -578,6 +579,16 @@ class _HttpDatabase:
                 "mappings": _INDEX_MAPPINGS[logical],
             },
         )
+        # Shards are not write-ready the moment PUT index returns —
+        # an immediate write can race and 500 with no_shard_available.
+        for _ in range(50):
+            try:
+                health = await self.client.cluster.health(index=index, timeout="5s")
+                if health.get("status") != "red":
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
 
     async def delete_items(self) -> None:
         await self._reset("items")
@@ -1000,6 +1011,14 @@ _IN_PROCESS_TESTS = {
     "test_hidden_items_counter": (
         "mutates HIDE_ITEM_PATH via monkeypatch — env-only/inert against "
         "an external API process"
+    ),
+    "test_a_delete_that_fails_after_the_catalog_is_gone_can_be_retried": (
+        "monkeypatches upstream's unlink_catalog_children_shared — the "
+        "hook never fires against an external API"
+    ),
+    "test_a_catalog_created_again_under_the_id_survives_a_stale_retry": (
+        "monkeypatches upstream's unlink_catalog_children_shared — the "
+        "hook never fires against an external API"
     ),
 }
 
