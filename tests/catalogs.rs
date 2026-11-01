@@ -1978,8 +1978,32 @@ async fn test_posted_catalog_dynamic_links_not_persisted() {
 }
 
 #[tokio::test]
-#[ignore = "semantic choice: we replace links entirely; theirs merge user links"]
-async fn test_posted_catalog_user_links_are_persisted() {}
+async fn test_posted_catalog_user_links_are_persisted() {
+    // User links survive the write/read cycle alongside generated links.
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let id = uniq("user-links");
+    let mut c = catalog(&id);
+    c["links"] = json!([
+        {"rel": "license", "href": "https://example.com/license", "type": "text/html"}
+    ]);
+    call(&app, "POST", "/catalogs", Some(c)).await;
+    let (_, body) = call(&app, "GET", &format!("/catalogs/{id}"), None).await;
+    let license = links_by_rel(&body, "license");
+    assert_eq!(license.len(), 1);
+    assert_eq!(
+        license[0]["href"].as_str().unwrap(),
+        "https://example.com/license"
+    );
+    for rel in ["self", "root", "parent"] {
+        assert_eq!(
+            links_by_rel(&body, rel).len(),
+            1,
+            "expected exactly one {rel} link"
+        );
+    }
+}
 
 #[tokio::test]
 async fn test_subcatalog_list_endpoint_includes_links() {

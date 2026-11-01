@@ -269,6 +269,108 @@ fn filter_link_extra(filter: Option<&str>, filter_lang: Option<&str>) -> Option<
     (!pairs.is_empty()).then(|| extra_params(&pairs))
 }
 
+/// Rels stripped on write — the API regenerates these on every read, so
+/// stored copies would only be stale duplicates (upstream
+/// `INFERRED_LINK_RELS`, applied via `resolve_links`).
+const INFERRED_LINK_RELS: &[&str] = &["self", "item", "parent", "collection", "root", "items"];
+
+/// Rels the API owns on reads (upstream `GENERATED_COLLECTION_RELS`):
+/// a stored link with one of these rels is a copy of a generated link
+/// and is dropped when the read generated that rel itself.
+const GENERATED_RESOURCE_RELS: &[&str] = &[
+    "queryables",
+    "aggregate",
+    "aggregations",
+    "canonical",
+    "duplicate",
+    "http://www.opengis.net/def/rel/ogc/1.0/sortables",
+];
+
+/// `related` is dual-use: generated for poly-hierarchy parents, but also
+/// a generic user rel for external resources (DOIs). A stored copy only
+/// counts as generated when its href was generated or points inside
+/// this API.
+fn resolve_href(href: &str, base_url: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            href.trim_start_matches('/')
+        )
+    }
+}
+
+/// Write path (`resolve_links`): drop inferred rels and absolutize
+/// relative hrefs against the advertised base URL. User links survive.
+fn filter_stored_links(links: &mut Vec<Link>, base_url: &str) {
+    links.retain(|l| !INFERRED_LINK_RELS.contains(&l.rel.as_str()));
+    for l in links.iter_mut() {
+        l.href = resolve_href(&l.href, base_url);
+    }
+}
+
+/// Stored user links for a read: inferred rels removed, hrefs resolved.
+fn stored_user_links(doc: &serde_json::Value, base_url: &str) -> Vec<serde_json::Value> {
+    doc["links"]
+        .as_array()
+        .map(|links| {
+            links
+                .iter()
+                .filter(|l| !INFERRED_LINK_RELS.contains(&l["rel"].as_str().unwrap_or_default()))
+                .map(|l| {
+                    let mut l = l.clone();
+                    if let Some(href) = l["href"].as_str() {
+                        l["href"] = json!(resolve_href(href, base_url));
+                    }
+                    l
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read path (`db_to_stac`): set `doc["links"]` to `generated` plus the
+/// stored user links that aren't stale copies of generated ones —
+/// rels the API owns (when this read generated them), dual-use
+/// `related` pointing at generated/in-API hrefs, and exact duplicates.
+fn merge_doc_links(doc: &mut serde_json::Value, generated: Vec<Link>, base_url: &str) {
+    let mut out: Vec<serde_json::Value> = generated
+        .into_iter()
+        .map(|l| serde_json::to_value(l).unwrap_or_default())
+        .collect();
+    let gen_rels: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|l| l["rel"].as_str().map(String::from))
+        .collect();
+    let gen_hrefs: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|l| l["href"].as_str().map(String::from))
+        .collect();
+    for link in stored_user_links(doc, base_url) {
+        let rel = link["rel"].as_str().unwrap_or_default();
+        let href = link["href"].as_str().unwrap_or_default();
+        if GENERATED_RESOURCE_RELS.contains(&rel) && gen_rels.contains(rel) {
+            continue;
+        }
+        if rel == "related"
+            && gen_rels.contains("related")
+            && (gen_hrefs.contains(href) || href.starts_with(base_url))
+        {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|g| g["rel"] == link["rel"] && g["href"] == link["href"])
+        {
+            continue;
+        }
+        out.push(link);
+    }
+    doc["links"] = json!(out);
+}
+
 fn parse_kind(raw: Option<&str>) -> Option<NodeKind> {
     match raw {
         Some("Catalog") => Some(NodeKind::Catalog),
@@ -548,7 +650,11 @@ async fn global_collection_doc(
         .ok_or_else(|| ApiError::NotFound(collection_id.to_string()))?;
     strip_collection_internals(&mut doc);
     let parents = state.store.get_parents(collection_id).await?;
-    doc["links"] = json!(global_collection_links(state, collection_id, &parents));
+    merge_doc_links(
+        &mut doc,
+        global_collection_links(state, collection_id, &parents),
+        &state.base_url,
+    );
     Ok(doc)
 }
 
@@ -557,7 +663,11 @@ async fn global_collection_doc(
 async fn catalog_doc(state: &AppState, catalog: &Catalog) -> Result<serde_json::Value, ApiError> {
     let parents = state.store.get_parents(&catalog.id).await?;
     let mut doc = serde_json::to_value(catalog).map_err(|e| ApiError::Internal(e.to_string()))?;
-    doc["links"] = json!(catalog_links(state, &catalog.id, &parents).await?);
+    merge_doc_links(
+        &mut doc,
+        catalog_links(state, &catalog.id, &parents).await?,
+        &state.base_url,
+    );
     Ok(doc)
 }
 
@@ -621,6 +731,9 @@ fn strip_collection_internals(doc: &mut serde_json::Value) {
 /// otherwise).
 fn stored_collection_doc(state: &AppState, collection: &Collection) -> serde_json::Value {
     let mut doc = serde_json::to_value(collection).unwrap_or_default();
+    // User links persist; inferred rels are stripped (upstream
+    // `resolve_links`) since reads regenerate them.
+    doc["links"] = json!(stored_user_links(&doc, &state.base_url));
     if state.collections_search_enabled() {
         if let Some(obj) = doc.as_object_mut() {
             collection_search_fields(obj);
@@ -698,7 +811,11 @@ fn etag_response(status: StatusCode, etag: &str, body: impl IntoResponse) -> imp
 fn item_doc(state: &AppState, item: &Item, scoped_catalog_id: Option<&str>) -> serde_json::Value {
     let mut doc = serde_json::to_value(item).unwrap_or_default();
     if let Some(col) = item.collection.as_deref() {
-        doc["links"] = json!(item_links(state, &item.id, col, scoped_catalog_id));
+        merge_doc_links(
+            &mut doc,
+            item_links(state, &item.id, col, scoped_catalog_id),
+            &state.base_url,
+        );
     }
     doc
 }
@@ -712,12 +829,11 @@ async fn collection_doc(
     let parents = state.store.get_parents(&collection.id).await?;
     let mut doc =
         serde_json::to_value(collection).map_err(|e| ApiError::Internal(e.to_string()))?;
-    doc["links"] = json!(collection_links(
-        state,
-        &collection.id,
-        scoped_catalog_id,
-        &parents
-    ));
+    merge_doc_links(
+        &mut doc,
+        collection_links(state, &collection.id, scoped_catalog_id, &parents),
+        &state.base_url,
+    );
     Ok(doc)
 }
 
@@ -1089,9 +1205,13 @@ pub async fn list_catalogs(
         .collect();
     let parents_map = state.store.get_parents_many(&page).await?;
     for doc in catalogs.iter_mut() {
-        if let Some(id) = doc["id"].as_str() {
-            let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(catalog_links(&state, id, &parents).await?);
+        if let Some(id) = doc["id"].as_str().map(str::to_owned) {
+            let parents = parents_map.get(&id).cloned().unwrap_or_default();
+            merge_doc_links(
+                doc,
+                catalog_links(&state, &id, &parents).await?,
+                &state.base_url,
+            );
         }
     }
     let mut links = json!([
@@ -1122,8 +1242,9 @@ pub async fn list_catalogs(
 
 pub async fn create_root_catalog(
     State(state): State<Arc<AppState>>,
-    StacJson(catalog): StacJson<Catalog>,
+    StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
+    filter_stored_links(&mut catalog.links, &state.base_url);
     // 409 on collision with an existing catalog OR collection id
     for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
         if state
@@ -1170,7 +1291,11 @@ pub async fn get_catalog(
     {
         Some(mut doc) => {
             let parents = state.store.get_parents(&catalog_id).await?;
-            doc["links"] = json!(catalog_links(&state, &catalog_id, &parents).await?);
+            merge_doc_links(
+                &mut doc,
+                catalog_links(&state, &catalog_id, &parents).await?,
+                &state.base_url,
+            );
             Ok(Json(doc))
         }
         None => Err(ApiError::NotFound(catalog_id)),
@@ -1180,7 +1305,7 @@ pub async fn get_catalog(
 pub async fn update_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    StacJson(catalog): StacJson<Catalog>,
+    StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
     if catalog.id != catalog_id {
@@ -1189,6 +1314,7 @@ pub async fn update_catalog(
             catalog.id
         )));
     }
+    filter_stored_links(&mut catalog.links, &state.base_url);
     if !state
         .store
         .replace_document(CATALOGS_INDEX, &catalog_id, &catalog)
@@ -1247,12 +1373,11 @@ pub async fn get_catalog_children(
                 continue;
             };
             let parents = parents_map.get(&id).cloned().unwrap_or_default();
-            doc["links"] = match kind_map.get(&id) {
-                Some(NodeKind::Collection) => {
-                    json!(collection_links(&state, &id, &catalog_id, &parents))
-                }
-                _ => json!(catalog_links(&state, &id, &parents).await?),
+            let generated = match kind_map.get(&id) {
+                Some(NodeKind::Collection) => collection_links(&state, &id, &catalog_id, &parents),
+                _ => catalog_links(&state, &id, &parents).await?,
             };
+            merge_doc_links(&mut doc, generated, &state.base_url);
             out.push(doc);
         }
         (out, m as usize)
@@ -1296,16 +1421,14 @@ pub async fn get_catalog_children(
             let Some(mut doc) = docs_by_id.remove(&node.id) else {
                 continue; // hierarchy node exists but doc is missing — skip
             };
-            doc["links"] = match node.kind {
+            let generated = match node.kind {
                 // parent link locked to this listing's catalog context
-                NodeKind::Catalog => json!(catalog_links(&state, &node.id, &node.parents).await?),
-                NodeKind::Collection => json!(collection_links(
-                    &state,
-                    &node.id,
-                    &catalog_id,
-                    &node.parents
-                )),
+                NodeKind::Catalog => catalog_links(&state, &node.id, &node.parents).await?,
+                NodeKind::Collection => {
+                    collection_links(&state, &node.id, &catalog_id, &node.parents)
+                }
             };
+            merge_doc_links(&mut doc, generated, &state.base_url);
             children.push(doc);
         }
         (children, matched)
@@ -1388,9 +1511,13 @@ pub async fn list_sub_catalogs(
         .collect();
     let parents_map = state.store.get_parents_many(&page).await?;
     for doc in catalogs.iter_mut() {
-        if let Some(id) = doc["id"].as_str() {
-            let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(catalog_links(&state, id, &parents).await?);
+        if let Some(id) = doc["id"].as_str().map(str::to_owned) {
+            let parents = parents_map.get(&id).cloned().unwrap_or_default();
+            merge_doc_links(
+                doc,
+                catalog_links(&state, &id, &parents).await?,
+                &state.base_url,
+            );
         }
     }
     let mut links = json!([
@@ -1547,6 +1674,39 @@ async fn run_scoped_search(
         Ok::<_, ApiError>(c)
     };
 
+    // Request-level validation runs before the catalog 404 — pydantic
+    // rejects malformed bodies upstream before scope resolution.
+    // `validate_datetime`: an interval needs at least one real bound —
+    // `""`, `/`, `../..` are rejected with its message.
+    if let Some(dt) = &search.items.datetime {
+        let (s, e) = dt.split_once('/').unwrap_or((dt.as_str(), dt.as_str()));
+        let bound = |b: &str| !matches!(b, "" | ".." | "null");
+        if !bound(s) && !bound(e) {
+            return Err(ApiError::BadRequest(
+                "Invalid parameters provided: At least one of the start or end dates must be provided"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // `validate_bbox`: every latitude in [-90, 90], longitude in
+    // [-180, 180] — before antimeridian rewriting so `[100,0,0,105]`
+    // is a 400, not a wrap.
+    if let Some(bbox) = search.items.bbox {
+        let in_range = match bbox {
+            Bbox::TwoDimensional([xmin, ymin, xmax, ymax])
+            | Bbox::ThreeDimensional([xmin, ymin, _, xmax, ymax, _]) => {
+                [xmin, xmax].iter().all(|x| (-180.0..=180.0).contains(x))
+                    && [ymin, ymax].iter().all(|y| (-90.0..=90.0).contains(y))
+            }
+        };
+        if !in_range {
+            return Err(ApiError::BadRequest(
+                "Invalid parameters provided: bbox".to_string(),
+            ));
+        }
+    }
+
     // A scoped search on a missing catalog is a 404, not an empty page
     // (upstream semantics). Root scope always exists.
     if scope_id != ROOT_CATALOG_ID
@@ -1585,7 +1745,12 @@ async fn run_scoped_search(
     // descendants. A request naming only out-of-scope collections is a
     // 403 (upstream semantics); parsing happens after this check.
     let allowed_collections = state.store.get_descendant_collections(scope_id).await?;
-    if !search.collections.is_empty() {
+    let explicit_collections = search
+        .items
+        .additional_fields
+        .shift_remove("__explicit_collections")
+        .is_some();
+    if !search.collections.is_empty() || explicit_collections {
         search
             .collections
             .retain(|c| allowed_collections.contains(c));
@@ -1727,10 +1892,13 @@ async fn run_scoped_search(
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
         if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            item.insert(
-                "links".to_string(),
-                json!(item_links(state, &item_id, &col, link_scope)),
+            let mut doc = serde_json::Value::Object(std::mem::take(item));
+            merge_doc_links(
+                &mut doc,
+                item_links(state, &item_id, &col, link_scope),
+                base,
             );
+            *item = doc.as_object().unwrap().clone();
         }
     }
     for item in items.iter_mut() {
@@ -1903,6 +2071,15 @@ fn percent_decode_plus(s: &str) -> String {
 /// stashed — both are parsed inside `run_scoped_search` so the
 /// catalog-scope check precedes parsing errors (upstream order).
 fn get_to_search(mut params: GetSearch) -> Result<Search, ApiError> {
+    // `?collections=` (empty value) is no constraint — upstream's str2list
+    // produces an empty list rather than [""] (#935).
+    if params
+        .collections
+        .as_deref()
+        .is_some_and(|c| c.trim().is_empty())
+    {
+        params.collections = None;
+    }
     let intersects_raw = params.intersects.take();
     let filter_lang = params.items.filter_lang.take();
     let mut search = Search::try_from(params)
@@ -1940,9 +2117,17 @@ impl<'de> serde::Deserialize<'de> for SearchBody {
         if value.get("filter").is_some() && value.get("filter-lang").is_none() {
             value["filter-lang"] = json!("cql2-json");
         }
-        serde_json::from_value::<Search>(value)
-            .map(Self)
-            .map_err(D::Error::custom)
+        // `"collections": []` names zero collections — upstream matches
+        // nothing; absent `collections` instead scopes to all (#935).
+        let explicit_collections = value.get("collections").is_some();
+        let mut search = serde_json::from_value::<Search>(value).map_err(D::Error::custom)?;
+        if explicit_collections && search.collections.is_empty() {
+            search
+                .items
+                .additional_fields
+                .insert("__explicit_collections".to_string(), json!(true));
+        }
+        Ok(Self(search))
     }
 }
 
@@ -2022,10 +2207,15 @@ pub async fn link_or_create_sub_catalog(
                 .await?
                 .unwrap();
             let parents = state.store.get_parents(&id).await?;
-            doc["links"] = json!(catalog_links(&state, &id, &parents).await?);
+            merge_doc_links(
+                &mut doc,
+                catalog_links(&state, &id, &parents).await?,
+                &state.base_url,
+            );
             Ok((StatusCode::OK, Json(doc)))
         }
-        CreateOrLinkPayload::FullResource(new_catalog) => {
+        CreateOrLinkPayload::FullResource(mut new_catalog) => {
+            filter_stored_links(&mut new_catalog.links, &state.base_url);
             // Mode A: full-body repost of an existing id is a conflict
             for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
                 if state
@@ -2126,9 +2316,13 @@ pub async fn list_scoped_collections(
     let parents_map = state.store.get_parents_many(&page).await?;
     for doc in collections.iter_mut() {
         strip_collection_internals(doc);
-        if let Some(id) = doc["id"].as_str() {
-            let parents = parents_map.get(id).cloned().unwrap_or_default();
-            doc["links"] = json!(collection_links(&state, id, &catalog_id, &parents));
+        if let Some(id) = doc["id"].as_str().map(str::to_owned) {
+            let parents = parents_map.get(&id).cloned().unwrap_or_default();
+            merge_doc_links(
+                doc,
+                collection_links(&state, &id, &catalog_id, &parents),
+                &state.base_url,
+            );
         }
     }
     let mut links = json!([
@@ -2188,7 +2382,11 @@ pub async fn link_or_create_scoped_collection(
                 .unwrap();
             strip_collection_internals(&mut doc);
             let parents = state.store.get_parents(&id).await?;
-            doc["links"] = json!(collection_links(&state, &id, &catalog_id, &parents));
+            merge_doc_links(
+                &mut doc,
+                collection_links(&state, &id, &catalog_id, &parents),
+                &state.base_url,
+            );
             Ok((StatusCode::OK, Json(doc)))
         }
         CreateOrLinkPayload::FullResource(collection) => {
@@ -2246,12 +2444,11 @@ pub async fn get_scoped_collection(
         Some(mut doc) => {
             strip_collection_internals(&mut doc);
             let parents = state.store.get_parents(&collection_id).await?;
-            doc["links"] = json!(collection_links(
-                &state,
-                &collection_id,
-                &catalog_id,
-                &parents
-            ));
+            merge_doc_links(
+                &mut doc,
+                collection_links(&state, &collection_id, &catalog_id, &parents),
+                &state.base_url,
+            );
             Ok(Json(doc))
         }
         None => Err(ApiError::NotFound(collection_id)),
@@ -2813,7 +3010,11 @@ pub async fn get_collection_item(
         .await?
     {
         Some((mut doc, version)) if doc["collection"] == collection_id => {
-            doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
+            merge_doc_links(
+                &mut doc,
+                item_links(&state, &item_id, &collection_id, None),
+                &state.base_url,
+            );
             if let Some(obj) = doc.as_object_mut() {
                 strip_excluded_item_fields(&state, obj);
             }
@@ -2855,7 +3056,12 @@ pub async fn disband_catalog(
 // --- Scoped Items (reads: always on; writes: ENABLE_TRANSACTIONS_EXTENSIONS) ---
 
 /// Enforce that the item's declared `collection` matches the path.
-fn validate_item_collection(item: &mut Item, collection_id: &str) -> Result<(), ApiError> {
+fn validate_item_collection(
+    item: &mut Item,
+    collection_id: &str,
+    base_url: &str,
+) -> Result<(), ApiError> {
+    filter_stored_links(&mut item.links, base_url);
     match &item.collection {
         Some(c) if c != collection_id => Err(ApiError::BadRequest(
             "Collection ID from path does not match Collection ID from request body".to_string(),
@@ -2937,10 +3143,22 @@ async fn items_page(
             .map(|s| s.parse())
             .collect::<Result<_, _>>()
             .map_err(|_| ApiError::BadRequest("Invalid parameters provided: bbox".to_string()))?;
-        search.items.bbox =
-            Some(nums.try_into().map_err(|_| {
-                ApiError::BadRequest("Invalid parameters provided: bbox".to_string())
-            })?);
+        let parsed: Bbox = nums
+            .try_into()
+            .map_err(|_| ApiError::BadRequest("Invalid parameters provided: bbox".to_string()))?;
+        let in_range = match parsed {
+            Bbox::TwoDimensional([xmin, ymin, xmax, ymax])
+            | Bbox::ThreeDimensional([xmin, ymin, _, xmax, ymax, _]) => {
+                [xmin, xmax].iter().all(|x| (-180.0..=180.0).contains(x))
+                    && [ymin, ymax].iter().all(|y| (-90.0..=90.0).contains(y))
+            }
+        };
+        if !in_range {
+            return Err(ApiError::BadRequest(
+                "Invalid parameters provided: bbox".to_string(),
+            ));
+        }
+        search.items.bbox = Some(parsed);
     }
     if let Some(datetime) = &query.datetime {
         search.items.datetime = Some(datetime.clone());
@@ -3072,12 +3290,11 @@ pub async fn get_scoped_item(
         .await?
     {
         Some(mut doc) if doc["collection"] == collection_id => {
-            doc["links"] = json!(item_links(
-                &state,
-                &item_id,
-                &collection_id,
-                Some(&catalog_id)
-            ));
+            merge_doc_links(
+                &mut doc,
+                item_links(&state, &item_id, &collection_id, Some(&catalog_id)),
+                &state.base_url,
+            );
             if let Some(obj) = doc.as_object_mut() {
                 strip_excluded_item_fields(&state, obj);
             }
@@ -3093,7 +3310,7 @@ pub async fn create_scoped_item(
     StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    validate_item_collection(&mut item, &collection_id)?;
+    validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     // Atomic create — 409 on repost, no get-then-write race
     if !state
         .store
@@ -3114,7 +3331,7 @@ pub async fn update_scoped_item(
     StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    validate_item_collection(&mut item, &collection_id)?;
+    validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     if !state
         .store
         .put_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
@@ -3205,7 +3422,7 @@ pub async fn update_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    StacJson(mut collection): StacJson<Collection>,
+    StacJson(collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
     if collection.id != collection_id {
         return Err(ApiError::BadRequest(format!(
@@ -3222,7 +3439,6 @@ pub async fn update_root_collection(
         return Err(ApiError::NotFound(collection_id));
     };
     require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
-    collection.links.clear();
     // With If-Match the write is conditioned on the version that
     // satisfied the check — check and write are one atomic step.
     let applied = if headers.contains_key(header::IF_MATCH) {
@@ -3327,7 +3543,7 @@ pub async fn create_root_item(
     }
     let mut item: Item = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
-    validate_item_collection(&mut item, &collection_id)?;
+    validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     if state
         .store
         .get_document(ITEMS_INDEX, &item_key(&item.id, &collection_id))
@@ -3374,7 +3590,7 @@ async fn create_root_items_batch(
     for f in features {
         let mut item: Item = serde_json::from_value(f.clone())
             .map_err(|e| ApiError::BadRequest(format!("invalid feature: {e}")))?;
-        validate_item_collection(&mut item, collection_id)?;
+        validate_item_collection(&mut item, collection_id, &state.base_url)?;
         if !by_id.contains_key(&item.id) {
             order.push(item.id.clone());
         }
@@ -3435,7 +3651,7 @@ pub async fn update_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
-            validate_item_collection(&mut item, &collection_id)?;
+            validate_item_collection(&mut item, &collection_id, &state.base_url)?;
             require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
             let applied = if headers.contains_key(header::IF_MATCH) {
@@ -3722,7 +3938,11 @@ pub async fn patch_root_item(
                     ApiError::WriteConflict(item_id)
                 });
             }
-            doc["links"] = json!(item_links(&state, &item_id, &collection_id, None));
+            merge_doc_links(
+                &mut doc,
+                item_links(&state, &item_id, &collection_id, None),
+                &state.base_url,
+            );
             let (_, version) = state
                 .store
                 .get_document_versioned(ITEMS_INDEX, &item_key(&item_id, &collection_id))
@@ -3779,7 +3999,7 @@ pub async fn bulk_create_items(
                 continue;
             }
         };
-        if let Err(e) = validate_item_collection(&mut item, &collection_id) {
+        if let Err(e) = validate_item_collection(&mut item, &collection_id, &state.base_url) {
             let msg = match e {
                 ApiError::BadRequest(m) => m,
                 _ => "invalid collection identity".to_string(),

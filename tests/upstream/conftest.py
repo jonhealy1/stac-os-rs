@@ -630,6 +630,20 @@ class HttpTxnClient:
             out.append(_check_status(r).json())
         return out
 
+    async def delete_collection(self, collection_id, request=None, refresh=False):
+        r = await self._http.delete(f"/collections/{collection_id}")
+        if r.status_code not in (200, 204, 404):
+            _check_status(r)
+        return r
+
+    async def delete_item(self, item_id, collection_id, request=None, refresh=False):
+        r = await self._http.delete(
+            f"/collections/{collection_id}/items/{item_id}"
+        )
+        if r.status_code not in (200, 204, 404):
+            _check_status(r)
+        return r
+
     async def aclose(self):
         try:
             await self.database.client.close()
@@ -748,6 +762,9 @@ def _os_client():
 @pytest_asyncio.fixture()
 async def txn_client():
     client = HttpTxnClient(_os_client())
+    # Tests not using `ctx` still start on an empty registry — upstream
+    # gets the same isolation from ctx teardowns elsewhere.
+    await delete_collections_and_items(client)
     yield client
     await client.aclose()
 
@@ -755,6 +772,7 @@ async def txn_client():
 @pytest_asyncio.fixture()
 async def bulk_txn_client():
     client = HttpTxnClient(_os_client())
+    await delete_collections_and_items(client)
     yield client
     await client.aclose()
 
@@ -975,6 +993,14 @@ _IN_PROCESS_TESTS = {
         "mutates EXCLUDED_FROM_QUERYABLES via monkeypatch — env-only/inert "
         "against an external API process"
     ),
+    "test_hidden_item_true": (
+        "mutates HIDE_ITEM_PATH via monkeypatch — env-only/inert against "
+        "an external API process"
+    ),
+    "test_hidden_items_counter": (
+        "mutates HIDE_ITEM_PATH via monkeypatch — env-only/inert against "
+        "an external API process"
+    ),
 }
 
 
@@ -1039,6 +1065,13 @@ def pytest_collection_modifyitems(items):
                 pytest.mark.skip(
                     reason="fixture mutates USE_DATETIME=false in-process; "
                     "external API reads config at startup"
+                )
+            )
+        elif params.get("path") == "/aggregate":
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="the aggregation extension (/aggregate) is not "
+                    "implemented"
                 )
             )
         elif name in _IN_PROCESS_TESTS:
