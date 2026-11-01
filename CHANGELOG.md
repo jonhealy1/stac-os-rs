@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `/api.html` — Swagger UI service documentation, linked from the
+  landing page as `service-doc`
+- `/_mgmt/ping` health endpoint returning `{"message":"PONG"}`
+- `filter`/`filter-lang` query params declared in the OpenAPI document
+  for the catalog/collection listing routes that accept them
+- Upstream `sfeos` test coverage: `tests/extensions/test_catalogs*`,
+  `test_bulk_transactions`, `test_catalog_parent_cleanup`,
+  `test_aggregation`, and the `tests/resources/` batch (item,
+  collection, conformance, mgmt) run against the live server via an
+  HTTP-backed `txn_client`/`ctx` adapter in `tests/upstream/conftest.py`
+
+### Changed
+
+- `filter`/`filter-lang` are now *applied* (previously only validated)
+  on `/catalogs`, `/catalogs/{id}/children`, `/catalogs/{id}/catalogs`,
+  `/catalogs/{id}/collections`, and `/collections` — listings run a
+  scoped OpenSearch query so filtered results paginate correctly
+- Link persistence matches upstream `resolve_links`/`db_to_stac`
+  semantics: inferred rels (`self`, `item`, `parent`, `collection`,
+  `root`, `items`) are stripped on write and user links are stored;
+  on read, stored user links merge with generated structural links
+  while API-owned rels (`queryables`, `aggregate(s)`, `canonical`,
+  `duplicate`, `sortables`) and in-API `related` hrefs are filtered —
+  a GET→PUT round-trip no longer duplicates generated links
+- Explicit `POST /search {"collections": []}` now matches zero
+  features; `GET /search?collections=` remains unconstrained, matching
+  upstream's str2list semantics
+- Search request validation (malformed bbox/datetime/filter) runs
+  before catalog-scope resolution, so bad params on a missing catalog
+  return 400 rather than 404
+
+### Fixed
+
+- Item listing `next` pagination links dropped `filter`/`query` params
+- Empty datetime intervals (`""`, `/`, `../..`) and out-of-range bbox
+  latitude/longitude now return 400 instead of 200/500
+- Scoped search on a nonexistent catalog returns 404 (was empty 200)
+- cql2-text filters on listing routes were serialized to JSON before
+  translation, losing text-mode semantics — `IN ('x')` single-element
+  lists and LIKE escaping now behave correctly; translation errors
+  surface as `Error with cql2 filter: …`
+
 ## [0.2.0] - 2026-10-31
 
 ### Added

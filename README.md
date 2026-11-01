@@ -42,9 +42,11 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 
 | Method | Path | Supports |
 |---|---|---|
-| GET | `/` | Landing page (`conformsTo`, `child` links per root node, `search`/`data`/`conformance`/`service-desc` links) |
+| GET | `/` | Landing page (`conformsTo`, `child` links per root node, `search`/`data`/`conformance`/`service-desc`/`service-doc` links) |
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
+| GET | `/api.html` | Swagger UI service documentation (`service-doc` link target) |
+| GET | `/_mgmt/ping` | Health check — `{"message":"PONG"}` |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
 | GET | `/queryables` | OGC Queryables JSON Schema — core item fields (`application/schema+json`) |
 | GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
@@ -61,12 +63,12 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 
 | Method | Path | Supports |
 |---|---|---|
-| GET | `/catalogs` | `?limit=&token=` paging (default 10) |
+| GET | `/catalogs` | `?limit=&token=` paging (default 10); `filter` + `filter-lang` (cql2) |
 | GET | `/catalogs/{catalog_id}` | Dynamic links (`parent` per parent, `children`, `data`, `search`) |
-| GET | `/catalogs/{catalog_id}/catalogs` | `?limit=&token=` paging |
+| GET | `/catalogs/{catalog_id}/catalogs` | `?limit=&token=` paging; `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/conformance` | Scoped `conformsTo` classes |
-| GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging |
-| GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging |
+| GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging; `filter` + `filter-lang` |
+| GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging; `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}` | Contextual `self`/`parent`, alt parents as `related`/`duplicate` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, scoped item links |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
@@ -272,14 +274,14 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Core STAC routes**
 - `GET /queryables` (root) serves upstream's core queryables set; per-collection queryables merge that with the items index mapping (`platform.enum` comes from a terms aggregation). True per-collection narrowing would need per-collection indices
-- `service-doc` (human-readable API docs page) — OpenAPI JSON exists at `/api`; no HTML variant
+- `service-doc` exists at `/api.html` (Swagger UI) alongside `/api` OpenAPI JSON
 - `src/openapi.json` is hand-maintained and drifts as features land — generate it from the route types instead (`utoipa` or `aide`)
 
 **Hierarchy & data**
 - Children/descendants capped at 10k per level — real pagination needed on the DAG itself
 - Reserved IDs: a catalog named `search` collides with the static route — should 400 on create
 - Orphaned docs: a hierarchy node whose document is missing is silently skipped in children listings and `rel: child` links — needs a consistency check
-- User-provided `links` in POST/PUT bodies are replaced by generated links on read (upstream merges non-dynamic user links — a deliberate divergence for now)
+- User-provided `links` follow upstream `resolve_links` semantics — inferred structural rels (`self`, `item`, `parent`, `collection`, `root`, `items`) are stripped on write; stored user links merge with generated links on read
 - No request-body STAC schema validation yet (`stac-validate` crate planned)
 
 **Ops**
