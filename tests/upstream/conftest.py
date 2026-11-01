@@ -18,6 +18,10 @@ elsewhere).  Requires: pytest, pytest-asyncio, httpx, sfeos (for its imports).
 import copy
 import json
 import os
+
+# Test modules switch imports on BACKEND — we always run the opensearch
+# variant (conftest loads before any test module's module-level imports).
+os.environ.setdefault("BACKEND", "opensearch")
 import sys
 import types
 from typing import Any, Callable
@@ -666,6 +670,23 @@ class HttpTxnClient:
 # app, which does not exist against a remote server.
 database = _SkipProxy("database")
 core_client = _SkipProxy("core_client")
+
+
+def build_test_app(*_args, **_kwargs):
+    pytest.skip("build_test_app constructs an in-process sfeos app")
+
+
+def build_test_app_with_catalogs(*_args, **_kwargs):
+    pytest.skip("build_test_app_with_catalogs constructs an in-process sfeos app")
+
+
+def get_flattened_routes(*_args, **_kwargs):
+    pytest.skip("get_flattened_routes inspects an in-process router")
+
+
+@pytest_asyncio.fixture()
+async def catalogs_client():
+    pytest.skip("catalogs_client is an in-process sfeos client")
 
 
 async def create_collection(txn_client, collection: dict) -> None:
