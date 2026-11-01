@@ -21,6 +21,8 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/", get(root_landing_page))
         .route("/conformance", get(conformance))
         .route("/api", get(api))
+        .route("/api.html", get(api_docs_html))
+        .route("/_mgmt/ping", get(mgmt_ping))
         .route("/sortables", get(sortables))
         .route("/queryables", get(get_queryables))
         // --- Core STAC item search (registry-wide; same as /catalogs/search) ---

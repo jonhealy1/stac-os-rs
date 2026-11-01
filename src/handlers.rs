@@ -131,15 +131,16 @@ fn bad_filter(e: String) -> ApiError {
 }
 
 /// Upstream listing-route filter handling: `filter`/`filter-lang` is
-/// parsed and validated so malformed CQL2 gets a 400 with upstream's
-/// message. With `cql2-text` or no `filter-lang` a JSON string is tried
-/// first, then CQL2 text — the same "try both" order upstream uses on
-/// listing routes. The parsed filter is not yet applied to listings.
-fn validate_listing_filter(
+/// parsed, validated, and translated to an OpenSearch clause. With
+/// `cql2-text` or no `filter-lang` a JSON string is tried first, then
+/// CQL2 text — the same "try both" order upstream uses on listing
+/// routes. Returns None when no filter was given.
+fn listing_filter_clause(
     filter: Option<&str>,
     filter_lang: Option<&str>,
-) -> Result<(), ApiError> {
-    let Some(raw) = filter else { return Ok(()) };
+    spec: crate::store::FieldSpec,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(raw) = filter else { return Ok(None) };
     if let Some(lang) = filter_lang {
         if !matches!(lang, "cql2-json" | "cql2-text") {
             return Err(ApiError::BadRequest(format!(
@@ -148,26 +149,32 @@ fn validate_listing_filter(
         }
     }
     let invalid = |msg: &str| ApiError::BadRequest(format!("Invalid filter parameter: {msg}."));
-    let parsed: serde_json::Value = if filter_lang == Some("cql2-json") {
-        serde_json::from_str(raw).map_err(|_| invalid("expected valid CQL2 JSON"))?
+    // Keep the text path as Cql2Text — `cql2_clause_with` uses it to
+    // permit a single-element `IN ('x')` list, which the parser reports
+    // as a scalar.
+    let cql2: stac_api::Filter = if filter_lang == Some("cql2-json") {
+        stac_api::Filter::Cql2Json(json_map(raw, invalid)?)
     } else {
-        match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(_) => {
-                crate::store::check_cql2_text_args(raw).map_err(|e| invalid(&e))?;
-                cql2::Expr::try_from(stac_api::Filter::Cql2Text(crate::store::rewrite_between(
-                    raw,
-                )))
-                .ok()
-                .and_then(|e| serde_json::to_value(&e).ok())
-                .ok_or_else(|| invalid("expected valid CQL2 text"))?
-            }
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v) if v.is_object() => stac_api::Filter::Cql2Json(v.as_object().cloned().unwrap()),
+            Ok(_) => return Err(invalid("expected a CQL2 expression with an operator")),
+            Err(_) => stac_api::Filter::Cql2Text(crate::store::rewrite_between(raw)),
         }
     };
-    if !parsed.is_object() {
-        return Err(invalid("expected a CQL2 expression with an operator"));
+    crate::store::cql2_clause_with(&cql2, spec)
+        .map(Some)
+        .map_err(bad_filter)
+}
+
+fn json_map(
+    raw: &str,
+    invalid: impl Fn(&str) -> ApiError,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) if v.is_object() => Ok(v.as_object().cloned().unwrap()),
+        Ok(_) => Err(invalid("expected a CQL2 expression with an operator")),
+        Err(_) => Err(invalid("expected valid CQL2 JSON")),
     }
-    crate::store::check_cql2_literals(&parsed).map_err(|e| invalid(&e))
 }
 
 /// Resolve `?limit=&token=` into `(limit, offset)` — absent limit falls
@@ -228,6 +235,38 @@ fn list_next_link(
         href.push_str(e);
     }
     Some(json!({ "rel": "next", "href": href }))
+}
+
+/// `&k=v&...` suffix for `list_next_link`'s `extra` param — percent-
+/// encodes values so filters like `id LIKE 'a-%'` survive the link.
+fn extra_params(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            let enc: String = v
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect();
+            format!("&{k}={enc}")
+        })
+        .collect()
+}
+
+/// `next`-link `extra` carrying `filter`/`filter-lang` params forward.
+fn filter_link_extra(filter: Option<&str>, filter_lang: Option<&str>) -> Option<String> {
+    let mut pairs = Vec::new();
+    if let Some(f) = filter {
+        pairs.push(("filter", f));
+    }
+    if let Some(l) = filter_lang {
+        pairs.push(("filter-lang", l));
+    }
+    (!pairs.is_empty()).then(|| extra_params(&pairs))
 }
 
 fn parse_kind(raw: Option<&str>) -> Option<NodeKind> {
@@ -920,6 +959,25 @@ pub async fn api() -> impl IntoResponse {
     )
 }
 
+/// `GET /api.html` — human-readable service docs (Swagger UI pointed at
+/// `/api`), upstream's `service-doc` link target.
+pub async fn api_docs_html() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html")],
+        "<!DOCTYPE html><html><head><title>STAC API Docs</title>\
+         <link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist/swagger-ui.css\"></head>\
+         <body><div id=\"swagger-ui\"></div>\
+         <script src=\"https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js\"></script>\
+         <script>window.onload=()=>{SwaggerUIBundle({url:'/api',dom_id:'#swagger-ui'})}</script>\
+         </body></html>",
+    )
+}
+
+/// `GET /_mgmt/ping` — upstream health-check endpoint.
+pub async fn mgmt_ping() -> Json<serde_json::Value> {
+    Json(json!({"message": "PONG"}))
+}
+
 pub async fn root_landing_page(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -929,6 +987,7 @@ pub async fn root_landing_page(
         { "rel": "root", "type": "application/json", "href": format!("{base}/") },
         { "rel": "conformance", "type": "application/json", "href": format!("{base}/conformance") },
         { "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0", "href": format!("{base}/api") },
+        { "rel": "service-doc", "type": "text/html", "href": format!("{base}/api.html") },
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
@@ -996,20 +1055,39 @@ pub async fn list_catalogs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
+    let clause = listing_filter_clause(
+        query.filter.as_deref(),
+        query.filter_lang.as_deref(),
+        crate::store::COLLECTION_FIELDS,
+    )?;
     let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
         .store
         .get_children_by_kind(ROOT_CATALOG_ID, NodeKind::Catalog)
         .await?;
-    let matched = ids.len();
-    let page: Vec<String> = ids
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
+    let (mut catalogs, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
+        let (docs, m) = state
+            .store
+            .search_docs_in_scope(&[CATALOGS_INDEX], &ids, clause, offset, limit)
+            .await?;
+        (docs, m as usize)
+    } else {
+        let page: Vec<String> = ids
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        (
+            state.store.get_documents(CATALOGS_INDEX, &page).await?,
+            ids.len(),
+        )
+    };
+    let page: Vec<String> = catalogs
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
         .collect();
     let parents_map = state.store.get_parents_many(&page).await?;
-    let mut catalogs = state.store.get_documents(CATALOGS_INDEX, &page).await?;
     for doc in catalogs.iter_mut() {
         if let Some(id) = doc["id"].as_str() {
             let parents = parents_map.get(id).cloned().unwrap_or_default();
@@ -1022,8 +1100,16 @@ pub async fn list_catalogs(
         { "rel": "parent", "href": state.base_url }
     ]);
     let returned = catalogs.len();
-    if let Some(next) = list_next_link(&state, "/catalogs", limit, offset, returned, matched, None)
-    {
+    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
+    if let Some(next) = list_next_link(
+        &state,
+        "/catalogs",
+        limit,
+        offset,
+        returned,
+        matched,
+        extra.as_deref(),
+    ) {
         links.as_array_mut().unwrap().push(next);
     }
     Ok(Json(json!({
@@ -1118,7 +1204,11 @@ pub async fn get_catalog_children(
     Query(query): Query<ChildrenQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
+    let clause = listing_filter_clause(
+        query.filter.as_deref(),
+        query.filter_lang.as_deref(),
+        crate::store::COLLECTION_FIELDS,
+    )?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
         &ListQuery {
@@ -1131,64 +1221,112 @@ pub async fn get_catalog_children(
     )?;
     let kind = parse_kind(query.r#type.as_deref());
     let nodes = state.store.get_child_nodes(&catalog_id, kind).await?;
-    let matched = nodes.len();
-    let nodes: Vec<_> = nodes
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
 
-    // Fetch the child documents (split by kind — catalogs and collections
-    // live in different indices) then re-assemble in node order.
-    let cat_ids: Vec<String> = nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Catalog)
-        .map(|n| n.id.clone())
-        .collect();
-    let col_ids: Vec<String> = nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Collection)
-        .map(|n| n.id.clone())
-        .collect();
-    let mut docs = state.store.get_documents(CATALOGS_INDEX, &cat_ids).await?;
-    docs.extend(
-        state
+    let (children, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
+        // Filtered listing — query the docs directly, scoped to child ids.
+        let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let kind_map: HashMap<String, NodeKind> =
+            nodes.into_iter().map(|n| (n.id.clone(), n.kind)).collect();
+        let indexes: &[&str] = match kind {
+            Some(NodeKind::Catalog) => &[CATALOGS_INDEX],
+            Some(NodeKind::Collection) => &[COLLECTIONS_INDEX],
+            None => &[CATALOGS_INDEX, COLLECTIONS_INDEX],
+        };
+        let (docs, m) = state
             .store
-            .get_documents(COLLECTIONS_INDEX, &col_ids)
-            .await?,
-    );
-    let mut docs_by_id: HashMap<String, serde_json::Value> = docs
-        .into_iter()
-        .filter_map(|d| {
-            let id = d["id"].as_str()?.to_string();
-            Some((id, d))
-        })
-        .collect();
+            .search_docs_in_scope(indexes, &ids, clause, offset, limit)
+            .await?;
+        let doc_ids: Vec<String> = docs
+            .iter()
+            .filter_map(|d| d["id"].as_str().map(str::to_owned))
+            .collect();
+        let parents_map = state.store.get_parents_many(&doc_ids).await?;
+        let mut out = Vec::with_capacity(docs.len());
+        for mut doc in docs {
+            let Some(id) = doc["id"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            let parents = parents_map.get(&id).cloned().unwrap_or_default();
+            doc["links"] = match kind_map.get(&id) {
+                Some(NodeKind::Collection) => {
+                    json!(collection_links(&state, &id, &catalog_id, &parents))
+                }
+                _ => json!(catalog_links(&state, &id, &parents).await?),
+            };
+            out.push(doc);
+        }
+        (out, m as usize)
+    } else {
+        let matched = nodes.len();
+        let nodes: Vec<_> = nodes
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
 
-    let mut children = Vec::with_capacity(nodes.len());
-    for node in &nodes {
-        let Some(mut doc) = docs_by_id.remove(&node.id) else {
-            continue; // hierarchy node exists but doc is missing — skip
-        };
-        doc["links"] = match node.kind {
-            // parent link locked to this listing's catalog context
-            NodeKind::Catalog => json!(catalog_links(&state, &node.id, &node.parents).await?),
-            NodeKind::Collection => json!(collection_links(
-                &state,
-                &node.id,
-                &catalog_id,
-                &node.parents
-            )),
-        };
-        children.push(doc);
-    }
+        // Fetch the child documents (split by kind — catalogs and collections
+        // live in different indices) then re-assemble in node order.
+        let cat_ids: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Catalog)
+            .map(|n| n.id.clone())
+            .collect();
+        let col_ids: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Collection)
+            .map(|n| n.id.clone())
+            .collect();
+        let mut docs = state.store.get_documents(CATALOGS_INDEX, &cat_ids).await?;
+        docs.extend(
+            state
+                .store
+                .get_documents(COLLECTIONS_INDEX, &col_ids)
+                .await?,
+        );
+        let mut docs_by_id: HashMap<String, serde_json::Value> = docs
+            .into_iter()
+            .filter_map(|d| {
+                let id = d["id"].as_str()?.to_string();
+                Some((id, d))
+            })
+            .collect();
+
+        let mut children = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let Some(mut doc) = docs_by_id.remove(&node.id) else {
+                continue; // hierarchy node exists but doc is missing — skip
+            };
+            doc["links"] = match node.kind {
+                // parent link locked to this listing's catalog context
+                NodeKind::Catalog => json!(catalog_links(&state, &node.id, &node.parents).await?),
+                NodeKind::Collection => json!(collection_links(
+                    &state,
+                    &node.id,
+                    &catalog_id,
+                    &node.parents
+                )),
+            };
+            children.push(doc);
+        }
+        (children, matched)
+    };
 
     let mut links = json!([
         { "rel": "self", "href": format!("{}/catalogs/{catalog_id}/children", state.base_url) },
         { "rel": "root", "href": state.base_url },
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
-    let type_param = query.r#type.as_deref().map(|t| format!("&type={t}"));
+    let mut pairs = Vec::new();
+    if let Some(t) = query.r#type.as_deref() {
+        pairs.push(("type", t));
+    }
+    if let Some(f) = query.filter.as_deref() {
+        pairs.push(("filter", f));
+    }
+    if let Some(l) = query.filter_lang.as_deref() {
+        pairs.push(("filter-lang", l));
+    }
+    let extra = (!pairs.is_empty()).then(|| extra_params(&pairs));
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/children"),
@@ -1196,7 +1334,7 @@ pub async fn get_catalog_children(
         offset,
         children.len(),
         matched,
-        type_param.as_deref(),
+        extra.as_deref(),
     ) {
         links.as_array_mut().unwrap().push(next);
     }
@@ -1215,21 +1353,40 @@ pub async fn list_sub_catalogs(
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
+    let clause = listing_filter_clause(
+        query.filter.as_deref(),
+        query.filter_lang.as_deref(),
+        crate::store::COLLECTION_FIELDS,
+    )?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
     let ids = state
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Catalog)
         .await?;
-    let matched = ids.len();
-    let page: Vec<String> = ids
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
+    let (mut catalogs, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
+        let (docs, m) = state
+            .store
+            .search_docs_in_scope(&[CATALOGS_INDEX], &ids, clause, offset, limit)
+            .await?;
+        (docs, m as usize)
+    } else {
+        let page: Vec<String> = ids
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        (
+            state.store.get_documents(CATALOGS_INDEX, &page).await?,
+            ids.len(),
+        )
+    };
+    let page: Vec<String> = catalogs
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
         .collect();
     let parents_map = state.store.get_parents_many(&page).await?;
-    let mut catalogs = state.store.get_documents(CATALOGS_INDEX, &page).await?;
     for doc in catalogs.iter_mut() {
         if let Some(id) = doc["id"].as_str() {
             let parents = parents_map.get(id).cloned().unwrap_or_default();
@@ -1242,6 +1399,7 @@ pub async fn list_sub_catalogs(
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
     let returned = catalogs.len();
+    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/catalogs"),
@@ -1249,7 +1407,7 @@ pub async fn list_sub_catalogs(
         offset,
         returned,
         matched,
-        None,
+        extra.as_deref(),
     ) {
         links.as_array_mut().unwrap().push(next);
     }
@@ -1388,6 +1546,18 @@ async fn run_scoped_search(
         c.number_returned = Some(0);
         Ok::<_, ApiError>(c)
     };
+
+    // A scoped search on a missing catalog is a 404, not an empty page
+    // (upstream semantics). Root scope always exists.
+    if scope_id != ROOT_CATALOG_ID
+        && state
+            .store
+            .get_document(CATALOGS_INDEX, scope_id)
+            .await?
+            .is_none()
+    {
+        return Err(ApiError::NotFound(scope_id.to_string()));
+    }
 
     // Pagination token → numeric offset (rejected before any lookup).
     if let Some(t) = search.items.additional_fields.get("token").cloned() {
@@ -1916,7 +2086,11 @@ pub async fn list_scoped_collections(
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_listing_filter(query.filter.as_deref(), query.filter_lang.as_deref())?;
+    let clause = listing_filter_clause(
+        query.filter.as_deref(),
+        query.filter_lang.as_deref(),
+        crate::store::COLLECTION_FIELDS,
+    )?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
         &query,
@@ -1927,14 +2101,29 @@ pub async fn list_scoped_collections(
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Collection)
         .await?;
-    let matched = ids.len();
-    let page: Vec<String> = ids
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
+    let (mut collections, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
+        let (docs, m) = state
+            .store
+            .search_docs_in_scope(&[COLLECTIONS_INDEX], &ids, clause, offset, limit)
+            .await?;
+        (docs, m as usize)
+    } else {
+        let page: Vec<String> = ids
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        (
+            state.store.get_documents(COLLECTIONS_INDEX, &page).await?,
+            ids.len(),
+        )
+    };
+    let page: Vec<String> = collections
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
         .collect();
     let parents_map = state.store.get_parents_many(&page).await?;
-    let mut collections = state.store.get_documents(COLLECTIONS_INDEX, &page).await?;
     for doc in collections.iter_mut() {
         strip_collection_internals(doc);
         if let Some(id) = doc["id"].as_str() {
@@ -1948,6 +2137,7 @@ pub async fn list_scoped_collections(
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
     let returned = collections.len();
+    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/collections"),
@@ -1955,7 +2145,7 @@ pub async fn list_scoped_collections(
         offset,
         returned,
         matched,
-        None,
+        extra.as_deref(),
     ) {
         links.as_array_mut().unwrap().push(next);
     }
@@ -2597,6 +2787,7 @@ pub async fn list_collection_items(
         limit,
         offset,
         &collection,
+        filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref()).as_deref(),
     ) {
         collection.links.push(next);
     }
@@ -2707,6 +2898,7 @@ pub async fn list_scoped_items(
         limit,
         offset,
         &collection,
+        filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref()).as_deref(),
     ) {
         collection.links.push(next);
     }
@@ -2848,21 +3040,23 @@ fn items_next_link(
     limit: u64,
     offset: u64,
     collection: &ItemCollection,
+    extra: Option<&str>,
 ) -> Option<Link> {
     let returned = collection.number_returned.unwrap_or(0);
     let matched = collection.number_matched.unwrap_or(0);
     if offset + returned >= matched {
         return None;
     }
-    let mut link = Link::new(
-        format!(
-            "{}{path}?limit={}&token={}",
-            state.base_url,
-            limit,
-            encode_item_token(offset + limit)
-        ),
-        "next",
+    let mut href = format!(
+        "{}{path}?limit={}&token={}",
+        state.base_url,
+        limit,
+        encode_item_token(offset + limit)
     );
+    if let Some(e) = extra {
+        href.push_str(e);
+    }
+    let mut link = Link::new(href, "next");
     link.r#type = Some("application/geo+json".to_string());
     Some(link)
 }

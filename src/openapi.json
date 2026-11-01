@@ -589,6 +589,25 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
           }
         ],
         "responses": {
@@ -713,6 +732,25 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
           }
         ],
         "responses": {
@@ -749,6 +787,25 @@
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
             }
           }
         ],
@@ -816,6 +873,25 @@
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
             }
           }
         ],
@@ -947,6 +1023,25 @@
               "type": "string"
             },
             "description": "Fields extension \u2014 comma-separated field paths, `-` prefix excludes"
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter extension \u2014 CQL2 expression in `filter-lang` (default cql2-text)"
+          },
+          {
+            "name": "filter-lang",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "cql2-text",
+                "cql2-json"
+              ]
+            }
           }
         ],
         "responses": {
