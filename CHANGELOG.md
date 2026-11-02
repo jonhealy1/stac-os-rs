@@ -23,10 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog PUT/DELETE (412 on mismatch, 428 when `REQUIRE_IF_MATCH` is
   set and the header is absent)
 - Upstream `sfeos` test coverage: `tests/extensions/test_catalogs*`,
-  `test_bulk_transactions`, `test_catalog_parent_cleanup`,
-  `test_aggregation`, and the `tests/resources/` batch (item,
-  collection, conformance, mgmt) run against the live server via an
-  HTTP-backed `txn_client`/`ctx` adapter in `tests/upstream/conftest.py`
+  `test_bulk_transactions`, `test_catalog_parent_cleanup`, and the
+  `tests/resources/` batch (item, collection, conformance, mgmt) run
+  against the live server via an HTTP-backed `txn_client`/`ctx` adapter
+  in `tests/upstream/conftest.py`; `test_aggregation*` is vendored but
+  ignored via `collect_ignore` until the `/aggregate` extension lands
 
 ### Changed
 
