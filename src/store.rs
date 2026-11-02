@@ -152,7 +152,8 @@ impl Store {
                     // text+keyword: free-text (`q`) needs analysis; term/
                     // sort on strings needs the keyword sub-field.
                     "title": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                    "description": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    // upstream maps description as plain text — not sortable.
+                    "description": {"type": "text"},
                     "keywords": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
                     // collections-search: temporal-extent overlap +
                     // `bbox_shape` (injected at write time, upstream
@@ -400,6 +401,14 @@ impl Store {
             resp.error_for_status_code()?;
         }
         Ok(())
+    }
+
+    /// The node's kind when it exists.
+    pub async fn get_node_kind(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<NodeKind>, opensearch::Error> {
+        Ok(self.get_node(node_id).await?.map(|n| n.kind))
     }
 
     pub async fn get_parents(&self, node_id: &str) -> Result<Vec<String>, opensearch::Error> {
@@ -813,6 +822,85 @@ impl Store {
             .filter(|d| d["found"] == true)
             .map(|d| d["_source"].clone())
             .collect())
+    }
+
+    /// Documents of `logical_indexes` whose `_id` is in `scope_ids`,
+    /// additionally matching `clause` when given — paged and counted at
+    /// query level (catalog listing `filter` support). Sources pass
+    /// through verbatim; `id` sorts asc for stable paging.
+    pub async fn search_docs_in_scope(
+        &self,
+        logical_indexes: &[&str],
+        scope_ids: &[String],
+        clause: Option<Value>,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<Value>, u64), opensearch::Error> {
+        if scope_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let indexes: Vec<String> = logical_indexes.iter().map(|i| self.idx(i)).collect();
+        let index_refs: Vec<&str> = indexes.iter().map(String::as_str).collect();
+        let mut filter = vec![json!({"ids": {"values": scope_ids}})];
+        if let Some(c) = clause {
+            filter.push(c);
+        }
+        let resp = self
+            .client
+            .search(SearchParts::Index(&index_refs))
+            .body(json!({
+                "track_total_hits": true,
+                "query": {"bool": {"filter": filter}},
+                "sort": [{"id": "asc"}],
+                "from": offset,
+                "size": limit,
+            }))
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let body = resp.json::<Value>().await?;
+        let matched = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let docs = body["hits"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| h["_source"].clone())
+            .collect();
+        Ok((docs, matched))
+    }
+
+    /// Filtered listing across logical indexes, sorted by `id`.
+    pub async fn search_docs_filtered(
+        &self,
+        logical_indexes: &[&str],
+        clause: Option<Value>,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<Value>, u64), opensearch::Error> {
+        let indexes: Vec<String> = logical_indexes.iter().map(|i| self.idx(i)).collect();
+        let index_refs: Vec<&str> = indexes.iter().map(String::as_str).collect();
+        let resp = self
+            .client
+            .search(SearchParts::Index(&index_refs))
+            .body(json!({
+                "track_total_hits": true,
+                "query": {"bool": {"filter": clause.unwrap_or(json!({"match_all": {}}))}},
+                "sort": [{"id": "asc"}],
+                "from": offset,
+                "size": limit,
+            }))
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let body = resp.json::<Value>().await?;
+        let matched = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let docs = body["hits"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| h["_source"].clone())
+            .collect();
+        Ok((docs, matched))
     }
 
     /// Item search scoped to a set of collections.
@@ -1691,7 +1779,11 @@ pub fn cql2_clause_with(filter: &stac_api::Filter, spec: FieldSpec) -> Result<Va
     if let Ok(json) = serde_json::to_value(&expr) {
         check_cql2_literals(&json)?;
     }
+    // to_es translation errors — upstream surfaces them verbatim under
+    // `Error with cql2 filter:`; parse/validation failures above keep
+    // the `Invalid filter parameter:` framing.
     expr_clause(&expr, spec, matches!(filter, stac_api::Filter::Cql2Text(_)))
+        .map_err(|e| format!("Error with cql2 filter: {e}"))
 }
 
 /// Upstream `check_cql2_literals`: walks a CQL2 JSON expression and
@@ -2266,13 +2358,12 @@ fn in_clause(args: &[Box<cql2::Expr>], spec: FieldSpec, from_text: bool) -> Resu
         }
         scalar => {
             // Upstream `to_es` raises ValueError("Arg {v} is not a
-            // list"), surfaced verbatim under the prefix.
+            // list"); the caller adds the `Error with cql2 filter:`
+            // prefix.
             let rendered = literal_value(scalar)
                 .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
                 .unwrap_or_else(|_| format!("{scalar:?}"));
-            return Err(format!(
-                "Error with cql2 filter: Arg {rendered} is not a list"
-            ));
+            return Err(format!("Arg {rendered} is not a list"));
         }
     };
     let field = (spec.map)(property);

@@ -21,6 +21,8 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/", get(root_landing_page))
         .route("/conformance", get(conformance))
         .route("/api", get(api))
+        .route("/api.html", get(api_docs_html))
+        .route("/_mgmt/ping", get(mgmt_ping))
         .route("/sortables", get(sortables))
         .route("/queryables", get(get_queryables))
         // --- Core STAC item search (registry-wide; same as /catalogs/search) ---
@@ -168,7 +170,15 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     app.with_state(state)
         // Compression first so it runs innermost on the way out; the
         // etag layer is outermost and sees the final Content-Encoding.
-        .layer(tower_http::compression::CompressionLayer::new())
+        // Upstream's BrotliMiddleware only compresses bodies >= 400
+        // bytes (`minimum_size`) — small single-resource responses stay
+        // uncompressed and keep their plain strong ETag.
+        .layer(
+            tower_http::compression::CompressionLayer::new().compress_when({
+                use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
+                DefaultPredicate::new().and(SizeAbove::new(400))
+            }),
+        )
         .layer(axum::middleware::from_fn(etag_content_coding))
 }
 

@@ -1,4 +1,6 @@
 pytest
 pytest-asyncio
 httpx
+ciso8601
 stac-fastapi.opensearch
+stac-fastapi-catalogs-extension

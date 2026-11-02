@@ -41,7 +41,9 @@ impl LinkEngine {
             Link::self_(scoped_self.to_string()).json(),
             Link::root(self.base_url.to_string()).json(),
             // MUST lock parent link to the contextual path for UI breadcrumbs
-            Link::parent(contextual_parent.to_string()).json(),
+            Link::parent(contextual_parent.to_string())
+                .json()
+                .title(scoped_catalog_id.to_string()),
             Link::new(canonical_url.to_string(), "canonical").json(),
             Link::new(format!("{scoped_self}/items"), "items").geojson(),
         ];
@@ -58,12 +60,12 @@ impl LinkEngine {
                 links.push(
                     Link::new(alt_parent_url.to_string(), "related")
                         .json()
-                        .title(format!("Alternate parent: {parent}")),
+                        .title(parent.clone()),
                 );
                 links.push(
                     Link::new(dup_scoped_url.to_string(), "duplicate")
                         .json()
-                        .title(format!("Duplicate path via {parent}")),
+                        .title(format!("Collection in catalog: {parent}")),
                 );
             }
         }

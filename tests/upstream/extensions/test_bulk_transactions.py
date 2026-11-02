@@ -1,0 +1,620 @@
+import os
+import uuid
+from copy import deepcopy
+from unittest.mock import patch
+
+import pytest
+from pydantic import ValidationError
+
+from stac_fastapi.core.validate import validate_batch_with_stac_validator
+from stac_fastapi.extensions.bulk_transactions import Items
+from stac_fastapi.sfeos_helpers.database import BulkIndexError, ItemAlreadyExistsError
+
+from ..conftest import MockRequest, create_collection, create_item
+
+if os.getenv("BACKEND", "elasticsearch").lower() == "opensearch":
+    from stac_fastapi.opensearch.config import OpensearchSettings as SearchSettings
+else:
+    from stac_fastapi.elasticsearch.config import (
+        ElasticsearchSettings as SearchSettings,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert(ctx, core_client, txn_client, bulk_txn_client):
+    items = {}
+    for _ in range(10):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        items[_item["id"]] = _item
+
+    # fc = es_core.item_collection(coll["id"], request=MockStarletteRequest)
+    # assert len(fc["features"]) == 0
+
+    bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert len(fc["features"]) >= 10
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert_with_raise_on_error(
+    ctx, core_client, txn_client, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Test bulk_item_insert behavior with RAISE_ON_BULK_ERROR set to true and false.
+
+    This test verifies that when RAISE_ON_BULK_ERROR is set to true, a ItemAlreadyExistsError
+    is raised for conflicting items. When set to false, the operation logs errors
+    and continues gracefully.
+    """
+
+    # Insert an initial item to set up a conflict
+    initial_item = deepcopy(ctx.item)
+    initial_item["id"] = str(uuid.uuid4())
+    await create_item(txn_client, initial_item)
+
+    # Verify the initial item is inserted
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert len(fc["features"]) >= 1
+
+    # Create conflicting items (same ID as the initial item)
+    conflicting_items = {initial_item["id"]: deepcopy(initial_item)}
+
+    # Test with RAISE_ON_BULK_ERROR set to true
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    with pytest.raises(ItemAlreadyExistsError):
+        bulk_txn_client.bulk_item_insert(Items(items=conflicting_items), refresh=True)
+
+    # Test with RAISE_ON_BULK_ERROR set to false
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "false")
+    bulk_txn_client.database.sync_settings = SearchSettings()  # Reinitialize settings
+    result = bulk_txn_client.bulk_item_insert(
+        Items(items=conflicting_items), refresh=True
+    )
+
+    # Validate the results - duplicate should be skipped, not inserted
+    assert result["received"] == 1
+    assert result["success"] == 0
+    assert result["skipped"] == 1
+
+    # Clean up the inserted item
+    await txn_client.delete_item(initial_item["id"], ctx.item["collection"])
+
+
+@pytest.mark.asyncio
+async def test_feature_collection_insert(
+    core_client,
+    txn_client,
+    ctx,
+):
+    features = []
+    for _ in range(10):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        features.append(_item)
+
+    feature_collection = {"type": "FeatureCollection", "features": features}
+
+    await create_item(txn_client, feature_collection)
+
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert len(fc["features"]) >= 10
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert_validation_error(
+    ctx, core_client, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("ENABLE_STAC_VALIDATOR", "true")
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+
+    items = {}
+    # Add 9 valid items
+    for _ in range(9):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        items[_item["id"]] = _item
+
+    # Add 1 invalid item (e.g., missing "datetime")
+    invalid_item = deepcopy(ctx.item)
+    invalid_item["id"] = str(uuid.uuid4())
+    invalid_item["properties"].pop(
+        "datetime", None
+    )  # Remove datetime to make it invalid
+    items[invalid_item["id"]] = invalid_item
+
+    # The bulk insert should raise an HTTPException due to the invalid item
+    with pytest.raises(HTTPException) as exc_info:
+        bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    # Verify structured error payload includes summary telemetry
+    detail = exc_info.value.detail
+    assert "Bulk insertion rejected. 1 items failed validation." in detail["message"]
+    assert "errors" in detail
+    assert "summary" in detail
+    summary = detail["summary"]
+    assert summary["input_count"] == 10
+    assert summary["processed_count"] == 10
+    assert summary["valid_count"] == 9
+    assert summary["validation_error_count"] == 1
+    assert summary["skipped_total"] == 1
+    assert summary["conflict_count"] == 0
+    assert summary["database_error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert_reports_validation_error_per_item(
+    ctx, core_client, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ENABLE_STAC_VALIDATOR", "true")
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "false")
+
+    items = {}
+    for _ in range(9):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        items[_item["id"]] = _item
+
+    invalid_item = deepcopy(ctx.item)
+    invalid_item["id"] = str(uuid.uuid4())
+    invalid_item["properties"].pop("datetime", None)
+    items[invalid_item["id"]] = invalid_item
+
+    result = bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    assert result == {
+        "received": 10,
+        "success": 9,
+        "skipped": 0,
+        "errors": [
+            {
+                "id": invalid_item["id"],
+                "msg": "; ".join(
+                    msg
+                    for msg, item_ids in validate_batch_with_stac_validator(
+                        [invalid_item]
+                    )[1].items()
+                    if invalid_item["id"] in item_ids
+                ),
+            }
+        ],
+    }
+
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert len(fc["features"]) >= 9
+
+
+@pytest.mark.asyncio
+async def test_feature_collection_insert_validation_error(
+    core_client,
+    txn_client,
+    ctx,
+):
+    features = []
+    # Add 9 valid items
+    for _ in range(9):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        features.append(_item)
+
+    # Add 1 invalid item (e.g., missing "datetime")
+    invalid_item = deepcopy(ctx.item)
+    invalid_item["id"] = str(uuid.uuid4())
+    invalid_item["properties"].pop(
+        "datetime", None
+    )  # Remove datetime to make it invalid
+    features.append(invalid_item)
+
+    feature_collection = {"type": "FeatureCollection", "features": features}
+
+    # Assert that a ValidationError is raised due to the invalid item
+    with pytest.raises(ValidationError):
+        await create_item(txn_client, feature_collection)
+
+
+@pytest.mark.asyncio
+async def test_feature_collection_insert_duplicate_detection(
+    ctx, core_client, txn_client, monkeypatch: pytest.MonkeyPatch, stac_validator_off
+):
+    """
+    Test that duplicate items are detected when inserting via FeatureCollection.
+
+    This test verifies that when an item already exists in the collection,
+    attempting to insert the same item ID via FeatureCollection will raise
+    a ItemAlreadyExistsError (when RAISE_ON_BULK_ERROR is true).
+    """
+    # ctx.item is already created in the fixture
+    existing_item_id = ctx.item["id"]
+
+    # Create a FeatureCollection with a duplicate item (same ID as existing)
+    duplicate_item = deepcopy(ctx.item)
+    # Change datetime to simulate the scenario where same item ID is sent with different datetime
+    duplicate_item["properties"]["datetime"] = "2025-06-15T00:00:00Z"
+
+    feature_collection = {"type": "FeatureCollection", "features": [duplicate_item]}
+
+    # Set RAISE_ON_BULK_ERROR to true to get ItemAlreadyExistsError
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    txn_client.database.sync_settings = SearchSettings()
+
+    # Should raise ItemAlreadyExistsError because item already exists
+    with pytest.raises(ItemAlreadyExistsError) as exc_info:
+        await create_item(txn_client, feature_collection)
+
+    assert existing_item_id in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_feature_collection_insert_duplicate_with_different_datetime(
+    ctx, core_client, txn_client, monkeypatch: pytest.MonkeyPatch, stac_validator_off
+):
+    """
+    Test that duplicate detection works when item has different datetime.
+
+    This test specifically verifies the fix for the datetime index filtering issue
+    where items with different datetime values could potentially bypass duplicate
+    detection when stored in different datetime-based indexes.
+    """
+    existing_item_id = ctx.item["id"]
+
+    # Create a duplicate item with significantly different datetime
+    duplicate_item = deepcopy(ctx.item)
+    duplicate_item["properties"]["datetime"] = "2030-12-31T23:59:59Z"
+
+    feature_collection = {"type": "FeatureCollection", "features": [duplicate_item]}
+
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    txn_client.database.sync_settings = SearchSettings()
+
+    # Should still detect the duplicate even with different datetime
+    with pytest.raises(ItemAlreadyExistsError) as exc_info:
+        await create_item(txn_client, feature_collection)
+
+    assert existing_item_id in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_bulk_sync_duplicate_detection(
+    ctx, core_client, txn_client, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Test that bulk_sync_prep_create_item properly detects duplicates across indexes.
+
+    This test verifies that the synchronous bulk insert also correctly detects
+    duplicates when an item with the same ID already exists in the collection.
+    """
+    existing_item_id = ctx.item["id"]
+
+    # Create a duplicate item with different datetime
+    duplicate_item = deepcopy(ctx.item)
+    duplicate_item["properties"]["datetime"] = "2028-07-20T12:00:00Z"
+
+    conflicting_item = {existing_item_id: duplicate_item}
+
+    # Test with RAISE_ON_BULK_ERROR set to true
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    with pytest.raises(ItemAlreadyExistsError) as exc_info:
+        bulk_txn_client.bulk_item_insert(Items(items=conflicting_item), refresh=True)
+
+    assert existing_item_id in str(exc_info.value)
+    assert exc_info.value.item_id == existing_item_id
+    assert exc_info.value.collection_id == ctx.item["collection"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_insert_multiple_items_with_one_duplicate(
+    ctx, core_client, txn_client, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Test bulk insert behavior when one item out of many is a duplicate.
+
+    When RAISE_ON_BULK_ERROR is true, the entire batch should fail if any
+    item is a duplicate.
+    """
+    existing_item_id = ctx.item["id"]
+
+    # Create items: 2 new + 1 duplicate
+    items = {}
+
+    # Add 2 new valid items
+    for i in range(2):
+        new_item = deepcopy(ctx.item)
+        new_item["id"] = str(uuid.uuid4())
+        items[new_item["id"]] = new_item
+
+    # Add 1 duplicate item (with different datetime)
+    duplicate_item = deepcopy(ctx.item)
+    duplicate_item["properties"]["datetime"] = "2027-03-15T08:30:00Z"
+    items[existing_item_id] = duplicate_item
+
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    # Should fail on the duplicate
+    with pytest.raises(ItemAlreadyExistsError) as exc_info:
+        bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    assert existing_item_id in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_bulk_insert_with_in_batch_duplicates(ctx, core_client, bulk_txn_client):
+    """
+    Test bulk insert behavior when the same item ID appears multiple times in the batch.
+
+    When the same ID is submitted multiple times in a single batch:
+    - Duplicates within the batch should be detected and counted as skipped
+    - Only the last occurrence of each ID should be inserted
+    - The response message should accurately reflect the number of items added
+    """
+    # Create a unique item for this test
+    test_item = deepcopy(ctx.item)
+    unique_id = str(uuid.uuid4())
+    test_item["id"] = unique_id
+
+    # Create 3 copies of the same item with the same ID
+    items = {}
+    for i in range(3):
+        item_copy = deepcopy(test_item)
+        item_copy["properties"]["description"] = f"Version {i}"
+        items[f"{unique_id}_{i}"] = item_copy  # Different keys but same item ID
+
+    result = bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    # Should report 1 item added and 2 skipped (in-batch duplicates)
+    # bulk_item_insert returns: {"received": 3, "success": 1, "skipped": 2, "errors": []}
+    assert result["received"] == 3
+    assert result["success"] == 1
+    assert result["skipped"] == 2
+    assert result["errors"] == []
+
+    # Verify only 1 item exists in the collection with this ID
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    matching_items = [f for f in fc["features"] if f["id"] == unique_id]
+    assert len(matching_items) == 1
+
+    # Clean up
+    from stac_fastapi.core.core import TransactionsClient
+
+    txn = TransactionsClient(database=bulk_txn_client.database, settings=None)
+    await txn.delete_item(unique_id, ctx.item["collection"])
+
+
+@pytest.mark.asyncio
+async def test_feature_collection_insert_with_in_batch_duplicates(
+    ctx, core_client, txn_client
+):
+    """
+    Test FeatureCollection insert behavior when the same item ID appears multiple times.
+
+    When the same ID is submitted multiple times in a FeatureCollection:
+    - Duplicates within the batch should be detected and counted as skipped
+    - Only the last occurrence of each ID should be inserted
+    - The response message should accurately reflect the number of items added
+    """
+    from stac_pydantic import ItemCollection as api_ItemCollection
+
+    unique_id = str(uuid.uuid4())
+
+    # Create 3 features with the same ID but different properties
+    features = []
+    for i in range(3):
+        item = deepcopy(ctx.item)
+        item["id"] = unique_id
+        item["properties"]["description"] = f"Version {i}"
+        features.append(item)
+
+    feature_collection = {"type": "FeatureCollection", "features": features}
+
+    # Call create_item directly to get the result string
+    result = await txn_client.create_item(
+        collection_id=ctx.collection["id"],
+        item=api_ItemCollection(**feature_collection),
+        request=MockRequest(),
+        refresh=True,
+    )
+
+    # Should report 1 item added and 2 skipped (in-batch duplicates)
+    # New format: "Processed {n} items: {m} added | {k} input duplicates"
+    assert "1 added" in result["message"]
+    assert "2 input duplicates" in result["message"]
+
+    # Verify only 1 item exists in the collection with this ID
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    matching_items = [f for f in fc["features"] if f["id"] == unique_id]
+    assert len(matching_items) == 1
+
+    # The last version should be the one that was inserted
+    assert matching_items[0]["properties"].get("description") == "Version 2"
+
+    # Clean up
+    await txn_client.delete_item(unique_id, ctx.item["collection"])
+
+
+@pytest.mark.asyncio
+async def test_bulk_index_error_raised_on_non_conflict_errors_strict_mode(
+    ctx, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    items = {}
+    for _ in range(3):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        items[_item["id"]] = _item
+
+    mock_other_errors = [
+        {
+            "create": {
+                "_id": f"{list(items.keys())[0]}|{ctx.collection['id']}",
+                "status": 400,
+                "error": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "failed to parse field [geometry]",
+                },
+            }
+        },
+    ]
+
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    with patch.object(
+        bulk_txn_client.database, "bulk_sync", return_value=(2, mock_other_errors)
+    ):
+        with pytest.raises(BulkIndexError) as exc_info:
+            bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+        assert exc_info.value.collection_id == ctx.collection["id"]
+        assert len(exc_info.value.errors) == 1
+        assert exc_info.value.errors[0]["create"]["status"] == 400
+
+
+@pytest.mark.asyncio
+async def test_bulk_non_conflict_errors_not_raised_in_permissive_mode(
+    ctx, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    items = {}
+    for _ in range(3):
+        _item = deepcopy(ctx.item)
+        _item["id"] = str(uuid.uuid4())
+        items[_item["id"]] = _item
+
+    mock_other_errors = [
+        {
+            "create": {
+                "_id": f"{list(items.keys())[0]}|{ctx.collection['id']}",
+                "status": 500,
+                "error": {
+                    "type": "es_rejected_execution_exception",
+                    "reason": "rejected execution",
+                },
+            }
+        },
+        {
+            "create": {
+                "_id": f"{list(items.keys())[1]}|{ctx.collection['id']}",
+                "status": 400,
+                "error": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "failed to parse",
+                },
+            }
+        },
+    ]
+
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "false")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    with patch.object(
+        bulk_txn_client.database, "bulk_sync", return_value=(1, mock_other_errors)
+    ):
+        result = bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+    assert result["received"] == 3
+    assert result["success"] == 1
+    assert result["skipped"] == 0
+    assert result["errors"] == [
+        {"id": list(items)[0], "msg": "rejected execution"},
+        {"id": list(items)[1], "msg": "failed to parse"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bulk_conflict_error_takes_precedence_over_other_errors(
+    ctx, bulk_txn_client, monkeypatch: pytest.MonkeyPatch
+):
+    item_id = str(uuid.uuid4())
+    items = {}
+    _item = deepcopy(ctx.item)
+    _item["id"] = item_id
+    items[item_id] = _item
+
+    # Mix of conflict (409) and non-conflict (400) errors
+    mock_mixed_errors = [
+        {
+            "create": {
+                "_id": f"{item_id}|{ctx.collection['id']}",
+                "status": 409,
+                "error": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "document already exists",
+                },
+            }
+        },
+        {
+            "create": {
+                "_id": f"other_id|{ctx.collection['id']}",
+                "status": 400,
+                "error": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "failed to parse",
+                },
+            }
+        },
+    ]
+
+    monkeypatch.setenv("RAISE_ON_BULK_ERROR", "true")
+    bulk_txn_client.database.sync_settings = SearchSettings()
+
+    with patch.object(
+        bulk_txn_client.database, "bulk_sync", return_value=(0, mock_mixed_errors)
+    ):
+        with pytest.raises(ItemAlreadyExistsError) as exc_info:
+            bulk_txn_client.bulk_item_insert(Items(items=items), refresh=True)
+
+        assert exc_info.value.item_id == item_id
+        assert exc_info.value.collection_id == ctx.collection["id"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert_without_request_uses_first_named_collection(
+    ctx, core_client, txn_client, bulk_txn_client
+):
+    other = {**ctx.collection, "id": "bulk-direct-other-collection"}
+    await create_collection(txn_client, other)
+    ok = {**deepcopy(ctx.item), "id": str(uuid.uuid4())}
+    bad = {**deepcopy(ctx.item), "id": str(uuid.uuid4()), "collection": other["id"]}
+    nocoll = {k: v for k, v in deepcopy(ctx.item).items() if k != "collection"}
+    nocoll["id"] = str(uuid.uuid4())
+
+    result = bulk_txn_client.bulk_item_insert(
+        Items(items={"ok": ok, "bad": bad, "nocoll": nocoll}), refresh=True
+    )
+
+    assert result["success"] == 2
+    assert result["errors"] == [
+        {
+            "id": "bad",
+            "msg": f"Item collection '{other['id']}' does not match path collection '{ctx.collection['id']}'",
+        }
+    ]
+    assert "collection" not in nocoll
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert {ok["id"], nocoll["id"]} <= {feature["id"] for feature in fc["features"]}
+    other_fc = await core_client.item_collection(other["id"], request=MockRequest())
+    assert other_fc["features"] == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_item_insert_without_request_ignores_collection_of_entry_without_id(
+    ctx, core_client, bulk_txn_client
+):
+    item = {**deepcopy(ctx.item), "id": str(uuid.uuid4())}
+
+    result = bulk_txn_client.bulk_item_insert(
+        Items(items={"no-id": {"collection": "no-such-collection"}, item["id"]: item}),
+        refresh=True,
+    )
+
+    assert result["success"] == 1
+    assert result["errors"] == [
+        {"id": "no-id", "msg": "Item must have a non-empty string id."}
+    ]
+    fc = await core_client.item_collection(ctx.collection["id"], request=MockRequest())
+    assert item["id"] in {feature["id"] for feature in fc["features"]}
