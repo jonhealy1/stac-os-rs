@@ -63,12 +63,12 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 
 | Method | Path | Supports |
 |---|---|---|
-| GET | `/catalogs` | `?limit=&token=` paging (default 10); `filter` + `filter-lang` (cql2) |
+| GET | `/catalogs` | Flat list of every catalog (incl. nested, with `parent` links); `?limit=&token=` paging (default 10); `filter` + `filter-lang` (cql2) |
 | GET | `/catalogs/{catalog_id}` | Dynamic links (`parent` per parent, `children`, `data`, `search`) |
 | GET | `/catalogs/{catalog_id}/catalogs` | `?limit=&token=` paging; `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/conformance` | Scoped `conformsTo` classes |
 | GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging; `filter` + `filter-lang` |
-| GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging; `filter` + `filter-lang` |
+| GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging; `?sortby=±field` (mapping-driven sortables), `?fields=±field` projection, `?q=` free text, `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}` | Contextual `self`/`parent`, alt parents as `related`/`duplicate` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, scoped item links |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
