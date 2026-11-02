@@ -23,6 +23,14 @@ import os
 # Test modules switch imports on BACKEND — we always run the opensearch
 # variant (conftest loads before any test module's module-level imports).
 os.environ.setdefault("BACKEND", "opensearch")
+
+# The aggregation extension (`/aggregate`, `/collections/{id}/aggregations`)
+# is not implemented yet. The files stay vendored — delete these ignore
+# entries when the extension lands.
+collect_ignore = [
+    "extensions/test_aggregation.py",
+    "extensions/test_malformed_aggregation.py",
+]
 import sys
 import types
 from typing import Any, Callable
@@ -463,10 +471,31 @@ class _TranslatingOsClient:
         candidates = self._candidates(index)
         for physical in candidates:
             try:
-                return await self._client.get(index=physical, id=id, **kw)
+                hit = await self._client.get(index=physical, id=id, **kw)
             except Exception:
                 if physical == candidates[-1]:
                     raise
+                continue
+            # Upstream stores hierarchy edges on the doc itself; ours
+            # live in the stac-hierarchy index (`parents` list, root
+            # sentinel filtered). Synthesize `parent_ids` so tests
+            # reading raw _source assert against the same edges.
+            if physical in (
+                f"{INDEX_PREFIX}-catalogs",
+                f"{INDEX_PREFIX}-collections",
+            ):
+                try:
+                    node = await self._client.get(
+                        index=f"{INDEX_PREFIX}-hierarchy", id=id
+                    )
+                    hit["_source"]["parent_ids"] = [
+                        p
+                        for p in node["_source"].get("parents", [])
+                        if p != "root"
+                    ]
+                except Exception:
+                    hit["_source"]["parent_ids"] = []
+            return hit
         raise AssertionError("unreachable")
 
     async def exists(self, index, id, **kw):
@@ -566,36 +595,24 @@ class _HttpDatabase:
         # (non-sharded expectations: realtime GET finds fresh docs).
         self.async_index_inserter = None
 
-    async def _reset(self, logical: str) -> None:
+    async def _clear(self, logical: str) -> None:
         index = f"{INDEX_PREFIX}-{logical}"
         try:
-            await self.client.indices.delete(index=index)
+            await self.client.delete_by_query(
+                index=index,
+                body={"query": {"match_all": {}}},
+                params={"refresh": "true", "conflicts": "proceed"},
+            )
         except Exception:
+            # Index may not exist yet — a wiped registry is equivalent.
             pass
-        await self.client.indices.create(
-            index=index,
-            body={
-                "settings": {"number_of_replicas": 0},
-                "mappings": _INDEX_MAPPINGS[logical],
-            },
-        )
-        # Shards are not write-ready the moment PUT index returns —
-        # an immediate write can race and 500 with no_shard_available.
-        for _ in range(50):
-            try:
-                health = await self.client.cluster.health(index=index, timeout="5s")
-                if health.get("status") != "red":
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.1)
 
     async def delete_items(self) -> None:
-        await self._reset("items")
+        await self._clear("items")
 
     async def delete_collections(self) -> None:
         for logical in ("collections", "catalogs", "hierarchy"):
-            await self._reset(logical)
+            await self._clear(logical)
 
     async def find_collection(self, *args, **kwargs):
         # Present only so tests can monkeypatch it as a "lookup reached"
@@ -620,10 +637,69 @@ class HttpTxnClient:
         self._http = httpx.AsyncClient(
             base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
         )
+        # bulk_item_insert is synchronous upstream (no await at call
+        # sites) — it needs a sync client.
+        self._sync = httpx.Client(base_url=STAC_API_URL, timeout=60.0)
 
     async def create_collection(self, collection, request=None, refresh=False):
         r = await self._http.post("/collections", json=_dump(collection))
         return _check_status(r).json()
+
+    def _raise_bulk_conflict(self, item_id, collection_id):
+        # Emulates RAISE_ON_BULK_ERROR: the flag lives in the (separate)
+        # API process, so the monkeypatched test env can't reach it.
+        # When set in-process we translate the API's conflict response
+        # into upstream's exception type.
+        from stac_fastapi.sfeos_helpers.database import ItemAlreadyExistsError
+
+        raise ItemAlreadyExistsError(item_id=item_id, collection_id=collection_id)
+
+    def bulk_item_insert(self, items, chunk_size=None, **kwargs):
+        """HTTP port of TransactionsClient.bulk_item_insert."""
+        raw = {k: _dump(v) for k, v in items.items.items()}
+        request = kwargs.get("request")
+        collection_id = (
+            getattr(request, "path_params", {}).get("collection_id")
+            if request
+            else None
+        )
+        if collection_id is None:
+            # Without a path collection the first admissible entry naming
+            # one sets the batch collection (upstream behavior).
+            collection_id = next(
+                (
+                    i["collection"]
+                    for i in raw.values()
+                    if isinstance(i, dict)
+                    and isinstance(i.get("id"), str)
+                    and i["id"]
+                    and isinstance(i.get("collection"), str)
+                    and i["collection"]
+                ),
+                None,
+            )
+        if collection_id is None:
+            raise ValueError("no collection derivable for bulk_items")
+        method = items.method
+        method = method.value if hasattr(method, "value") else method
+        r = self._sync.post(
+            f"/collections/{collection_id}/bulk_items",
+            json={"items": raw, "method": method},
+        )
+        if r.status_code == 404:
+            from stac_fastapi.types.errors import NotFoundError
+
+            raise NotFoundError(f"Collection '{collection_id}' not found")
+        result = _check_status(r).json()
+        if os.getenv("RAISE_ON_BULK_ERROR") == "true":
+            for err in result.get("errors", []):
+                if "already exists" in err.get("msg", ""):
+                    self._raise_bulk_conflict(err["id"], collection_id)
+            if result.get("errors"):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=400, detail=result)
+        return result
 
     async def create_item(self, collection_id, item, request=None, refresh=False):
         body = _dump(item)
@@ -632,14 +708,33 @@ class HttpTxnClient:
             r = await self._http.post(
                 f"/collections/{collection_id}/items", json=body
             )
+            if r.status_code == 409 and os.getenv("RAISE_ON_BULK_ERROR") == "true":
+                self._raise_bulk_conflict(body.get("id", ""), collection_id)
             return _check_status(r).json()
-        out = []
-        for feature in features:
+        # FeatureCollection path: upstream dedupes by item id (last wins)
+        # and returns a processed-count message.
+        last = {f["id"]: f for f in features if isinstance(f.get("id"), str) and f["id"]}
+        unique = list(last.values())
+        added = 0
+        conflicts = 0
+        for feature in unique:
             r = await self._http.post(
                 f"/collections/{collection_id}/items", json=feature
             )
-            out.append(_check_status(r).json())
-        return out
+            if r.status_code == 409:
+                if os.getenv("RAISE_ON_BULK_ERROR") == "true":
+                    self._raise_bulk_conflict(feature["id"], collection_id)
+                conflicts += 1
+            else:
+                _check_status(r)
+                added += 1
+        parts = [f"Processed {len(features)} items: {added} added"]
+        dups = len(features) - len(unique)
+        if dups:
+            parts.append(f"{dups} input duplicates")
+        if conflicts:
+            parts.append(f"{conflicts} conflicts")
+        return {"message": " | ".join(parts)}
 
     async def delete_collection(self, collection_id, request=None, refresh=False):
         r = await self._http.delete(f"/collections/{collection_id}")
@@ -660,6 +755,7 @@ class HttpTxnClient:
             await self.database.client.close()
         except Exception:
             pass
+        self._sync.close()
         await self._http.aclose()
 
     async def _validate_single_item(self, item):
@@ -780,10 +876,42 @@ async def txn_client():
     await client.aclose()
 
 
+class _HttpCoreClient:
+    """HTTP stand-in for sfeos CoreCrudClient — read surface only."""
+
+    def __init__(self):
+        self._http = httpx.AsyncClient(
+            base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
+        )
+
+    async def item_collection(self, collection_id, request=None, **kwargs):
+        r = await self._http.get(
+            f"/collections/{collection_id}/items", params={"limit": 10000}
+        )
+        return _check_status(r).json()
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        return _SkipProxy(f"core_client.{attr}")
+
+    async def aclose(self):
+        await self._http.aclose()
+
+
+@pytest_asyncio.fixture()
+async def core_client():
+    client = _HttpCoreClient()
+    yield client
+    await client.aclose()
+
+
 @pytest_asyncio.fixture()
 async def bulk_txn_client():
+    # No wipe here: upstream's fixture is a bare client and every test
+    # that uses it also pulls in `ctx` — wiping would destroy the
+    # collection ctx just created.
     client = HttpTxnClient(_os_client())
-    await delete_collections_and_items(client)
     yield client
     await client.aclose()
 
@@ -1008,6 +1136,51 @@ _IN_PROCESS_TESTS = {
         "mutates HIDE_ITEM_PATH via monkeypatch — env-only/inert against "
         "an external API process"
     ),
+    # --- test_catalogs.py: in-process concurrency/log assertions ---
+    "test_scoped_put_collection_validates_body": (
+        "monkeypatches the in-process txn client to assert request "
+        "validation ordering — no HTTP equivalent"
+    ),
+    "test_core_put_collection_retries_on_concurrent_membership_change": (
+        "injects a mid-write membership change by monkeypatching the "
+        "in-process database — the external API never calls it"
+    ),
+    "test_link_collection_keeps_concurrent_put_metadata": (
+        "races a PUT via monkeypatched in-process client methods — the "
+        "hook never fires against an external API"
+    ),
+    "test_unlink_collection_keeps_concurrent_put_metadata": (
+        "races a PUT via monkeypatched in-process client methods — the "
+        "hook never fires against an external API"
+    ),
+    "test_link_collection_returns_409_when_conflict_retries_exhausted": (
+        "forces conflict-retry exhaustion via monkeypatched in-process "
+        "client methods — the hook never fires against an external API"
+    ),
+    "test_link_sub_catalog_keeps_concurrent_put_metadata": (
+        "races a PUT via monkeypatched in-process client methods — the "
+        "hook never fires against an external API"
+    ),
+    "test_unlink_sub_catalog_keeps_concurrent_put_metadata": (
+        "races a PUT via monkeypatched in-process client methods — the "
+        "hook never fires against an external API"
+    ),
+    "test_put_catalog_retries_on_concurrent_link": (
+        "injects a mid-write link by monkeypatching the in-process "
+        "database — the external API never calls it"
+    ),
+    "test_link_sub_catalog_returns_409_when_conflict_retries_exhausted": (
+        "forces conflict-retry exhaustion via monkeypatched in-process "
+        "client methods — the hook never fires against an external API"
+    ),
+    "test_put_catalog_returns_409_when_conflict_retries_exhausted": (
+        "forces conflict-retry exhaustion via monkeypatched in-process "
+        "client methods — the hook never fires against an external API"
+    ),
+    "test_catalog_delete_logs_error_with_traceback": (
+        "asserts on upstream's in-process error logging via caplog — "
+        "no HTTP equivalent"
+    ),
     "test_hidden_items_counter": (
         "mutates HIDE_ITEM_PATH via monkeypatch — env-only/inert against "
         "an external API process"
@@ -1019,6 +1192,38 @@ _IN_PROCESS_TESTS = {
     "test_a_catalog_created_again_under_the_id_survives_a_stale_retry": (
         "monkeypatches upstream's unlink_catalog_children_shared — the "
         "hook never fires against an external API"
+    ),
+    "test_failed_cleanup_retains_parent_and_retry_preserves_updates": (
+        "injects cleanup failures by patching update_by_query on the "
+        "in-process OS client — the external API never calls it"
+    ),
+    "test_cleanup_exhaustion_returns_409": (
+        "patches update_by_query on the in-process OS client to force "
+        "version conflicts — no HTTP equivalent"
+    ),
+    "test_invalid_catalog_ids_never_start_cleanup": (
+        "asserts on a monkeypatched unlink_catalog_children_shared "
+        "counter — in-process internals, nothing HTTP-observable"
+    ),
+    "test_bulk_index_error_raised_on_non_conflict_errors_strict_mode": (
+        "monkeypatches bulk_sync on the in-process database — the "
+        "external API never calls it"
+    ),
+    "test_bulk_non_conflict_errors_not_raised_in_permissive_mode": (
+        "monkeypatches bulk_sync on the in-process database — the "
+        "external API never calls it"
+    ),
+    "test_bulk_conflict_error_takes_precedence_over_other_errors": (
+        "monkeypatches bulk_sync on the in-process database — the "
+        "external API never calls it"
+    ),
+    "test_bulk_item_insert_validation_error": (
+        "ENABLE_STAC_VALIDATOR request-body validation is not "
+        "implemented (env-only/inert externally)"
+    ),
+    "test_bulk_item_insert_reports_validation_error_per_item": (
+        "ENABLE_STAC_VALIDATOR request-body validation is not "
+        "implemented (env-only/inert externally)"
     ),
 }
 

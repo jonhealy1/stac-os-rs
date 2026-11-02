@@ -6,7 +6,7 @@ use crate::store::{
     ITEMS_INDEX, MAX_SEARCH_LIMIT, ROOT_CATALOG_ID,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -106,6 +106,8 @@ pub struct ListQuery {
     pub sortby: Option<String>,
     /// Fields extension (features binding): `?fields=+include,-exclude`.
     pub fields: Option<String>,
+    /// Free-text search (collections-search binding): `?q=term`.
+    pub q: Option<String>,
     // Items-listing filters — consumed by `items_page` only; silently
     // ignored on catalog/collection listings. `intersects` is
     // deliberately absent (unaccepted on the items binding).
@@ -267,6 +269,20 @@ fn filter_link_extra(filter: Option<&str>, filter_lang: Option<&str>) -> Option<
         pairs.push(("filter-lang", l));
     }
     (!pairs.is_empty()).then(|| extra_params(&pairs))
+}
+
+/// Raw query string minus `limit`/`token`, returned as a `&k=v…`
+/// suffix — echoed verbatim into `next` hrefs so unrelated params
+/// survive pagination (upstream `_next_query` behavior).
+fn pagination_extra(raw: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = raw?
+        .split('&')
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("");
+            !k.is_empty() && !k.eq_ignore_ascii_case("limit") && !k.eq_ignore_ascii_case("token")
+        })
+        .collect();
+    (!kept.is_empty()).then(|| format!("&{}", kept.join("&")))
 }
 
 /// Rels stripped on write — the API regenerates these on every read, so
@@ -491,14 +507,15 @@ async fn catalog_links(
     real.sort_unstable();
     real.dedup();
     if real.is_empty() {
-        links.push(link_json(base.clone(), "parent"));
+        links.push(link_json(base.clone(), "parent").title("Root Catalog".to_string()));
     } else {
-        links.push(link_json(format!("{base}/catalogs/{}", real[0]), "parent"));
+        links.push(
+            link_json(format!("{base}/catalogs/{}", real[0]), "parent").title(real[0].to_string()),
+        );
         if !state.hide_alternate_parents {
             for p in &real[1..] {
                 links.push(
-                    link_json(format!("{base}/catalogs/{p}"), "related")
-                        .title(format!("Alternate parent: {p}")),
+                    link_json(format!("{base}/catalogs/{p}"), "related").title(p.to_string()),
                 );
             }
         }
@@ -518,9 +535,9 @@ async fn catalog_links(
     Ok(links)
 }
 
-/// `rel=child` links for a catalog's direct children. Catalogs get
-/// canonical `/catalogs/{id}` hrefs, collections get scoped
-/// `/catalogs/{cat}/collections/{id}` hrefs. Nodes without a backing
+/// `rel=child` links for a catalog's direct children, each scoped under
+/// this catalog: `/catalogs/{id}/catalogs/{child}` and
+/// `/catalogs/{id}/collections/{child}`. Nodes without a backing
 /// document are skipped (no dead links); `title` is the doc title,
 /// falling back to the child id.
 async fn child_links(state: &AppState, catalog_id: &str) -> Result<Vec<Link>, ApiError> {
@@ -558,7 +575,9 @@ async fn child_links(state: &AppState, catalog_id: &str) -> Result<Vec<Link>, Ap
             continue;
         };
         let href = match node.kind {
-            NodeKind::Catalog => format!("{base}/catalogs/{}", node.id),
+            NodeKind::Catalog => {
+                format!("{base}/catalogs/{catalog_id}/catalogs/{}", node.id)
+            }
             NodeKind::Collection => {
                 format!("{base}/catalogs/{catalog_id}/collections/{}", node.id)
             }
@@ -618,6 +637,14 @@ fn global_collection_links(state: &AppState, collection_id: &str, parents: &[Str
     );
     q.r#type = Some("application/schema+json".to_string());
     links.push(q);
+    // Upstream spec for global collection reads: exactly one `parent`,
+    // pointing at the landing page; catalog memberships are exposed as
+    // `related` (catalog) + `duplicate` (scoped URI) links instead.
+    links.push(link_json(base.clone(), "parent").title("Root Catalog".to_string()));
+    links.push(link_json(
+        format!("{base}/collections/{collection_id}"),
+        "canonical",
+    ));
     let mut real: Vec<&str> = parents
         .iter()
         .map(String::as_str)
@@ -625,27 +652,16 @@ fn global_collection_links(state: &AppState, collection_id: &str, parents: &[Str
         .collect();
     real.sort_unstable();
     real.dedup();
-    if real.is_empty() {
-        links.push(link_json(base.clone(), "parent"));
-        return links;
-    }
-    let shown: &[&str] = if state.hide_alternate_parents {
-        &real[..1]
-    } else {
-        &real
-    };
-    for p in shown {
-        links.push(link_json(format!("{base}/catalogs/{p}"), "parent"));
-    }
     if !state.hide_alternate_parents {
         for p in &real {
-            let mut related = link_json(format!("{base}/catalogs/{p}"), "related");
-            related.title = Some(format!("Alternate parent: {p}"));
-            links.push(related);
-            links.push(link_json(
-                format!("{base}/catalogs/{p}/collections/{collection_id}"),
-                "duplicate",
-            ));
+            links.push(link_json(format!("{base}/catalogs/{p}"), "related").title(p.to_string()));
+            links.push(
+                link_json(
+                    format!("{base}/catalogs/{p}/collections/{collection_id}"),
+                    "duplicate",
+                )
+                .title(format!("Collection in catalog: {p}")),
+            );
         }
     }
     links
@@ -699,8 +715,7 @@ fn catalog_hierarchy_links(state: &AppState, parents: &[String]) -> Vec<Link> {
         links.push(link_json(base.clone(), "parent").title("Root Catalog".to_string()));
     } else {
         links.push(
-            link_json(format!("{base}/catalogs/{}", real[0]), "parent")
-                .title(real[0].to_string()),
+            link_json(format!("{base}/catalogs/{}", real[0]), "parent").title(real[0].to_string()),
         );
         if !state.hide_alternate_parents {
             for p in &real[1..] {
@@ -793,6 +808,11 @@ fn stored_collection_doc(state: &AppState, collection: &Collection) -> serde_jso
     // User links persist; inferred rels are stripped (upstream
     // `resolve_links`) since reads regenerate them.
     doc["links"] = json!(stored_user_links(&doc, &state.base_url));
+    // `parent_ids` is DAG-managed — the hierarchy index is authoritative;
+    // a client-supplied value is ignored, matching upstream.
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("parent_ids");
+    }
     if state.collections_search_enabled() {
         if let Some(obj) = doc.as_object_mut() {
             collection_search_fields(obj);
@@ -1233,6 +1253,7 @@ pub async fn root_landing_page(
 
 pub async fn list_catalogs(
     State(state): State<Arc<AppState>>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let clause = listing_filter_clause(
@@ -1241,28 +1262,13 @@ pub async fn list_catalogs(
         crate::store::COLLECTION_FIELDS,
     )?;
     let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
-    let ids = state
+    // Upstream `/catalogs` is a flat list of every catalog in the
+    // registry — nested catalogs carry their parent links.
+    let (mut catalogs, matched) = state
         .store
-        .get_children_by_kind(ROOT_CATALOG_ID, NodeKind::Catalog)
+        .search_docs_filtered(&[CATALOGS_INDEX], clause, offset, limit)
         .await?;
-    let (mut catalogs, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
-        let (docs, m) = state
-            .store
-            .search_docs_in_scope(&[CATALOGS_INDEX], &ids, clause, offset, limit)
-            .await?;
-        (docs, m as usize)
-    } else {
-        let page: Vec<String> = ids
-            .iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .cloned()
-            .collect();
-        (
-            state.store.get_documents(CATALOGS_INDEX, &page).await?,
-            ids.len(),
-        )
-    };
+    let matched = matched as usize;
     let page: Vec<String> = catalogs
         .iter()
         .filter_map(|d| d["id"].as_str().map(str::to_owned))
@@ -1284,7 +1290,7 @@ pub async fn list_catalogs(
         { "rel": "parent", "href": state.base_url }
     ]);
     let returned = catalogs.len();
-    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
+    let extra = pagination_extra(raw.as_deref());
     if let Some(next) = list_next_link(
         &state,
         "/catalogs",
@@ -1309,6 +1315,9 @@ pub async fn create_root_catalog(
     StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
     filter_stored_catalog_links(&mut catalog.links, &state.base_url);
+    // Top-level creates are always root-level — a client-supplied
+    // `parent_ids` is ignored (the hierarchy index is authoritative).
+    catalog.additional_fields.remove("parent_ids");
     // 409 on collision with an existing catalog OR collection id
     for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
         if state
@@ -1396,6 +1405,8 @@ pub async fn update_catalog(
         .ok_or_else(|| ApiError::NotFound(catalog_id.clone()))?;
     require_if_match(&headers, &etag_of(&state, CATALOGS_INDEX, &version))?;
     filter_stored_catalog_links(&mut catalog.links, &state.base_url);
+    // Update keeps the stored edges — `parent_ids` in the body is ignored.
+    catalog.additional_fields.remove("parent_ids");
     let applied = if headers.contains_key(header::IF_MATCH) {
         state
             .store
@@ -1428,6 +1439,7 @@ pub async fn update_catalog(
 
 pub async fn get_catalog_children(
     Path(catalog_id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ChildrenQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1540,17 +1552,7 @@ pub async fn get_catalog_children(
         { "rel": "root", "href": state.base_url },
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
-    let mut pairs = Vec::new();
-    if let Some(t) = query.r#type.as_deref() {
-        pairs.push(("type", t));
-    }
-    if let Some(f) = query.filter.as_deref() {
-        pairs.push(("filter", f));
-    }
-    if let Some(l) = query.filter_lang.as_deref() {
-        pairs.push(("filter-lang", l));
-    }
-    let extra = (!pairs.is_empty()).then(|| extra_params(&pairs));
+    let extra = pagination_extra(raw.as_deref());
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/children"),
@@ -1574,6 +1576,7 @@ pub async fn get_catalog_children(
 /// GET /catalogs/{id}/catalogs — the catalog-kind children of a catalog.
 pub async fn list_sub_catalogs(
     Path(catalog_id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1627,7 +1630,7 @@ pub async fn list_sub_catalogs(
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
     let returned = catalogs.len();
-    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
+    let extra = pagination_extra(raw.as_deref());
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/catalogs"),
@@ -2321,6 +2324,8 @@ pub async fn link_or_create_sub_catalog(
         }
         CreateOrLinkPayload::FullResource(mut new_catalog) => {
             filter_stored_catalog_links(&mut new_catalog.links, &state.base_url);
+            // The path parent is the edge — body `parent_ids` is ignored.
+            new_catalog.additional_fields.remove("parent_ids");
             // Mode A: full-body repost of an existing id is a conflict
             for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
                 if state
@@ -2384,6 +2389,7 @@ pub async fn unlink_sub_catalog(
 
 pub async fn list_scoped_collections(
     Path(catalog_id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -2398,28 +2404,47 @@ pub async fn list_scoped_collections(
         state.default_collection_limit,
         state.max_collection_limit,
     )?;
+    // Collections-search param surface on the scoped route — same
+    // semantics as /collections-search, restricted to catalog members.
+    let sortby = parse_get_sortby(query.sortby.as_deref());
+    validate_collection_sortby(&state, &sortby).await?;
+    let fields = parse_get_fields(query.fields.as_deref());
     let ids = state
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Collection)
         .await?;
-    let (mut collections, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
-        let (docs, m) = state
-            .store
-            .search_docs_in_scope(&[COLLECTIONS_INDEX], &ids, clause, offset, limit)
-            .await?;
-        (docs, m as usize)
-    } else {
-        let page: Vec<String> = ids
-            .iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .cloned()
-            .collect();
-        (
-            state.store.get_documents(COLLECTIONS_INDEX, &page).await?,
-            ids.len(),
-        )
-    };
+    let mut filters = Vec::new();
+    if let Some(q) = query.q.as_deref().filter(|s| !s.trim().is_empty()) {
+        filters.push(json!({"multi_match": {
+            "query": q,
+            "fields": ["id", "title^3", "description", "keywords"],
+            "type": "best_fields",
+            "fuzziness": "AUTO"
+        }}));
+    }
+    if let Some(c) = clause {
+        filters.push(c);
+    }
+    let (mut collections, matched): (Vec<serde_json::Value>, usize) =
+        if !filters.is_empty() || !sortby.is_empty() {
+            filters.insert(0, json!({"terms": {"id": ids}}));
+            let (docs, m) = state
+                .store
+                .search_collections(filters, sortby, limit, offset)
+                .await?;
+            (docs, m as usize)
+        } else {
+            let page: Vec<String> = ids
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            (
+                state.store.get_documents(COLLECTIONS_INDEX, &page).await?,
+                ids.len(),
+            )
+        };
     let page: Vec<String> = collections
         .iter()
         .filter_map(|d| d["id"].as_str().map(str::to_owned))
@@ -2435,6 +2460,9 @@ pub async fn list_scoped_collections(
                 &state.base_url,
             );
         }
+        if let (Some(obj), Some((include, exclude))) = (doc.as_object_mut(), &fields) {
+            crate::store::filter_fields(obj, include, exclude);
+        }
     }
     let mut links = json!([
         { "rel": "self", "href": format!("{}/catalogs/{catalog_id}/collections", state.base_url) },
@@ -2442,7 +2470,7 @@ pub async fn list_scoped_collections(
         { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
     ]);
     let returned = collections.len();
-    let extra = filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref());
+    let extra = pagination_extra(raw.as_deref());
     if let Some(next) = list_next_link(
         &state,
         &format!("/catalogs/{catalog_id}/collections"),
@@ -2761,6 +2789,42 @@ fn parse_get_sortby(raw: Option<&str>) -> Vec<(String, String)> {
             ),
         })
         .collect()
+}
+
+/// Reject `sortby` fields the collections sortables schema doesn't
+/// declare — upstream's `validate_sort_fields_shared` + the engine-side
+/// 400 for unmapped text sorts (e.g. `description`, which maps as plain
+/// `text` and has no keyword sub-field). Excluded fields get upstream's
+/// exact message.
+async fn validate_collection_sortby(
+    state: &AppState,
+    sortby: &[(String, String)],
+) -> Result<(), ApiError> {
+    if sortby.is_empty() {
+        return Ok(());
+    }
+    for (field, _) in sortby {
+        if state
+            .excluded_queryables
+            .iter()
+            .any(|p| field == p || field.starts_with(&format!("{p}.")))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "Field '{field}' is not sortable: it is excluded via EXCLUDED_FROM_QUERYABLES."
+            )));
+        }
+    }
+    let mapping = index_mappings(state, COLLECTIONS_INDEX).await?;
+    let allowed = crate::store::sortable_properties(&mapping, &state.excluded_queryables);
+    for (field, _) in sortby {
+        // `datetime` sorts on the temporal extent (upstream remap).
+        if field != "datetime" && !allowed.contains_key(field.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "Field '{field}' is not sortable."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `?fields=a,b,-c` -> (include, exclude).
@@ -3940,6 +4004,39 @@ fn apply_patch(
     }
 }
 
+/// Upstream `patch_addresses_field`: whether any JSON-Patch op reads or
+/// writes a top-level field — `path`/`from` first segment, or a root
+/// (`""`) replacement whose value object contains the field.
+fn patch_addresses_field(patch: &serde_json::Value, field: &str) -> bool {
+    let Some(ops) = patch.as_array() else {
+        return false;
+    };
+    fn first_seg(p: &str) -> &str {
+        p.trim_matches('/').split('/').next().unwrap_or("")
+    }
+    for op in ops {
+        let get = |k: &str| op.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+        let path = get("path");
+        if path.is_empty() {
+            if op
+                .get("value")
+                .and_then(|v| v.as_object())
+                .is_some_and(|o| o.contains_key(field))
+            {
+                return true;
+            }
+            continue;
+        }
+        if first_seg(path) == field
+            || first_seg(get("from")) == field
+            || first_seg(get("from_")) == field
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// RFC 7386 JSON Merge Patch: `null` deletes the member, objects merge
 /// recursively, any other value replaces wholesale.
 fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -3981,6 +4078,14 @@ pub async fn patch_root_collection(
     headers: axum::http::HeaderMap,
     StacJson(patch): StacJson<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Request-level rejection — upstream rejects before the doc lookup:
+    // memberships only change through the catalog link/unlink routes.
+    if patch_addresses_field(&patch, "parent_ids") {
+        return Err(ApiError::BadRequest(
+            "A patch may not address parent_ids; use /catalogs/{catalog_id}/collections."
+                .to_string(),
+        ));
+    }
     let (mut doc, version) = state
         .store
         .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
@@ -3999,6 +4104,10 @@ pub async fn patch_root_collection(
         return Err(ApiError::BadRequest(
             "a patch may not change the collection id or type".to_string(),
         ));
+    }
+    // `parent_ids` is DAG-managed — a patch may not rewrite edges.
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("parent_ids");
     }
     require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
     if state.collections_search_enabled() {
@@ -4134,24 +4243,87 @@ pub async fn bulk_create_items(
         return Err(ApiError::NotFound(collection_id));
     }
     let upsert = body.get("method").and_then(serde_json::Value::as_str) == Some("upsert");
+    if upsert && std::env::var("REQUIRE_IF_MATCH").is_ok_and(|v| v == "true") {
+        return Err(ApiError::PreconditionRequired);
+    }
     let items = body
         .get("items")
         .and_then(serde_json::Value::as_object)
         .cloned()
         .ok_or_else(|| ApiError::BadRequest("body missing 'items' object".into()))?;
+    let raise_on_error = std::env::var("RAISE_ON_BULK_ERROR").is_ok_and(|v| v == "true");
     let received = items.len();
     let (mut success, mut skipped) = (0usize, 0usize);
     let mut errors: Vec<serde_json::Value> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (id, raw) in items {
-        if !seen.insert(id.clone()) {
-            skipped += 1;
+    // Admission on raw entries, keyed by map key, matching upstream's
+    // bulk_item_insert: the path collection is authoritative — absent,
+    // null or "" `collection` is rewritten to it; any other value errors.
+    let mut admitted: Vec<serde_json::Value> = Vec::new();
+    for (key, raw) in &items {
+        if !raw.is_object() {
+            errors.push(json!({"id": key, "msg": "Item must be a JSON object."}));
             continue;
         }
-        let mut item: Item = match serde_json::from_value(raw) {
+        match raw.get("id").and_then(serde_json::Value::as_str) {
+            Some(s) if !s.is_empty() => {}
+            _ => {
+                errors.push(json!({"id": key, "msg": "Item must have a non-empty string id."}));
+                continue;
+            }
+        }
+        match raw.get("collection") {
+            None => {
+                let mut o = raw.clone();
+                o["collection"] = json!(collection_id);
+                admitted.push(o);
+            }
+            Some(v)
+                if v.is_null()
+                    || v.as_str() == Some("")
+                    || v.as_str() == Some(collection_id.as_str()) =>
+            {
+                let mut o = raw.clone();
+                o["collection"] = json!(collection_id);
+                admitted.push(o);
+            }
+            Some(v) => {
+                let shown = v
+                    .as_str()
+                    .map(|s| format!("'{s}'"))
+                    .unwrap_or_else(|| v.to_string());
+                errors.push(json!({"id": key, "msg": format!("Item collection {shown} does not match path collection '{collection_id}'")}));
+            }
+        }
+    }
+    if raise_on_error && !errors.is_empty() {
+        return Err(ApiError::BadRequest(
+            json!({
+                "message": format!("Bulk insertion rejected. {} items are malformed.", errors.len()),
+                "errors": errors,
+            })
+            .to_string(),
+        ));
+    }
+    // Dedupe by item id, last occurrence wins (upstream dict semantics),
+    // preserving first-occurrence order of the ids.
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, raw) in admitted.iter().enumerate() {
+        last.insert(raw["id"].as_str().unwrap().to_string(), i);
+    }
+    let mut unique: Vec<&serde_json::Value> = Vec::new();
+    let mut emitted = std::collections::HashSet::new();
+    for raw in admitted.iter() {
+        let id = raw["id"].as_str().unwrap();
+        if emitted.insert(id.to_string()) {
+            unique.push(&admitted[last[id]]);
+        }
+    }
+    skipped += admitted.len() - unique.len();
+    for raw in unique {
+        let mut item: Item = match serde_json::from_value(raw.clone()) {
             Ok(i) => i,
             Err(e) => {
-                errors.push(json!({"id": id, "msg": format!("invalid item: {e}")}));
+                errors.push(json!({"id": raw["id"], "msg": format!("invalid item: {e}")}));
                 continue;
             }
         };
@@ -4160,7 +4332,7 @@ pub async fn bulk_create_items(
                 ApiError::BadRequest(m) => m,
                 _ => "invalid collection identity".to_string(),
             };
-            errors.push(json!({"id": id, "msg": msg}));
+            errors.push(json!({"id": item.id, "msg": msg}));
             continue;
         }
         let key = item_key(&item.id, &collection_id);
@@ -4175,7 +4347,14 @@ pub async fn bulk_create_items(
         if applied {
             success += 1;
         } else {
-            errors.push(json!({"id": id, "msg": "item already exists or write conflict"}));
+            skipped += 1;
+            if raise_on_error {
+                return Err(ApiError::Conflict(format!(
+                    "Item '{}' already exists in collection '{collection_id}'",
+                    item.id
+                )));
+            }
+            errors.push(json!({"id": item.id, "msg": "item already exists or write conflict"}));
         }
     }
     Ok(Json(json!({

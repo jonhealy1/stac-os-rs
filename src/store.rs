@@ -152,7 +152,8 @@ impl Store {
                     // text+keyword: free-text (`q`) needs analysis; term/
                     // sort on strings needs the keyword sub-field.
                     "title": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-                    "description": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    // upstream maps description as plain text — not sortable.
+                    "description": {"type": "text"},
                     "keywords": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
                     // collections-search: temporal-extent overlap +
                     // `bbox_shape` (injected at write time, upstream
@@ -850,6 +851,40 @@ impl Store {
             .body(json!({
                 "track_total_hits": true,
                 "query": {"bool": {"filter": filter}},
+                "sort": [{"id": "asc"}],
+                "from": offset,
+                "size": limit,
+            }))
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let body = resp.json::<Value>().await?;
+        let matched = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let docs = body["hits"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| h["_source"].clone())
+            .collect();
+        Ok((docs, matched))
+    }
+
+    /// Filtered listing across logical indexes, sorted by `id`.
+    pub async fn search_docs_filtered(
+        &self,
+        logical_indexes: &[&str],
+        clause: Option<Value>,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<Value>, u64), opensearch::Error> {
+        let indexes: Vec<String> = logical_indexes.iter().map(|i| self.idx(i)).collect();
+        let index_refs: Vec<&str> = indexes.iter().map(String::as_str).collect();
+        let resp = self
+            .client
+            .search(SearchParts::Index(&index_refs))
+            .body(json!({
+                "track_total_hits": true,
+                "query": {"bool": {"filter": clause.unwrap_or(json!({"match_all": {}}))}},
                 "sort": [{"id": "asc"}],
                 "from": offset,
                 "size": limit,

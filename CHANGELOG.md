@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/_mgmt/ping` health endpoint returning `{"message":"PONG"}`
 - `filter`/`filter-lang` query params declared in the OpenAPI document
   for the catalog/collection listing routes that accept them
+- `sortby`, `fields`, and `q` on `GET /catalogs/{id}/collections` —
+  same semantics as the collections-search binding, restricted to
+  catalog members; sortable fields come from the collections index
+  mapping (`sortby=description` → 400, excluded fields → 400
+  "not sortable")
+- Catalog write responses emit strong `ETag`s; `If-Match` is honored on
+  catalog PUT/DELETE (412 on mismatch, 428 when `REQUIRE_IF_MATCH` is
+  set and the header is absent)
 - Upstream `sfeos` test coverage: `tests/extensions/test_catalogs*`,
   `test_bulk_transactions`, `test_catalog_parent_cleanup`,
   `test_aggregation`, and the `tests/resources/` batch (item,
@@ -26,6 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `/catalogs`, `/catalogs/{id}/children`, `/catalogs/{id}/catalogs`,
   `/catalogs/{id}/collections`, and `/collections` — listings run a
   scoped OpenSearch query so filtered results paginate correctly
+- `GET /catalogs` is now a flat list of every catalog in the registry
+  (upstream `get_catalogs`); nested catalogs carry their `parent` links
+- Pagination `next` links on listing endpoints now preserve every
+  original query parameter (upstream `_next_query`), not only
+  `filter`/`filter-lang`
+- Generated link titles and rels match upstream
+  `generate_poly_hierarchy_links`: `parent` links are titled
+  `Root Catalog` or the parent id, global collection reads expose
+  catalog memberships as `related`/`duplicate` links with a single
+  `parent` to the landing page, and `rel=child` hrefs are scoped under
+  the listing catalog (`/catalogs/{id}/catalogs/{child}`)
+- JSON-Patch ops addressing `/parent_ids` (including `from` and root
+  replacement) are rejected with 400 before any document lookup —
+  memberships only change via the catalog link/unlink routes
+- The collections index maps `description` as plain `text` (no keyword
+  sub-field), matching upstream: it is full-text searchable via `q`
+  but not sortable
 - Link persistence matches upstream `resolve_links`/`db_to_stac`
   semantics: inferred rels (`self`, `item`, `parent`, `collection`,
   `root`, `items`) are stripped on write and user links are stored;

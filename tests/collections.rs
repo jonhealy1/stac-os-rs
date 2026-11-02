@@ -84,8 +84,9 @@ async fn test_list_collections_pagination() {
 
 #[tokio::test]
 async fn test_get_collection_global_links() {
-    // Poly-hierarchy collection read via canonical route: parent link per
-    // parent catalog, duplicate links to each scoped path.
+    // Poly-hierarchy collection read via canonical route: exactly one
+    // parent link to the landing page, each parent catalog as `related`,
+    // duplicate links to each scoped path.
     let Some((app, _)) = test_app(true).await else {
         return;
     };
@@ -118,7 +119,9 @@ async fn test_get_collection_global_links() {
         .unwrap()
         .ends_with(&format!("/collections/{col}")));
     let parents = links_by_rel(&body, "parent");
-    let hrefs: Vec<&str> = parents.iter().filter_map(|l| l["href"].as_str()).collect();
+    assert_eq!(parents.len(), 1);
+    let related = links_by_rel(&body, "related");
+    let hrefs: Vec<&str> = related.iter().filter_map(|l| l["href"].as_str()).collect();
     assert!(hrefs
         .iter()
         .any(|h| h.ends_with(&format!("/catalogs/{p1}"))));

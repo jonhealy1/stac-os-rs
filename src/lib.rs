@@ -174,12 +174,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // bytes (`minimum_size`) — small single-resource responses stay
         // uncompressed and keep their plain strong ETag.
         .layer(
-            tower_http::compression::CompressionLayer::new().compress_when(
-                {
-                    use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
-                    DefaultPredicate::new().and(SizeAbove::new(400))
-                },
-            ),
+            tower_http::compression::CompressionLayer::new().compress_when({
+                use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
+                DefaultPredicate::new().and(SizeAbove::new(400))
+            }),
         )
         .layer(axum::middleware::from_fn(etag_content_coding))
 }

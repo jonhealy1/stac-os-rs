@@ -893,6 +893,30 @@
                 "cql2-json"
               ]
             }
+          },
+          {
+            "name": "sortby",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Sort extension \u2014 +field/-field comma list"
+          },
+          {
+            "name": "fields",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Fields extension \u2014 +include/-exclude comma list"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Free-text search over id, title, description, keywords"
           }
         ],
         "responses": {
