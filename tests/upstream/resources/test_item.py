@@ -747,8 +747,8 @@ async def test_pagination_post(app_client, ctx, txn_client):
     # Ingest 5 items
     for _ in range(5):
         ctx.item["id"] = str(uuid.uuid4())
-    await create_item(txn_client, ctx.item)
-    ids.append(ctx.item["id"])
+        await create_item(txn_client, ctx.item)
+        ids.append(ctx.item["id"])
 
     # Paginate through all 5 items with a limit of 1 (expecting 5 requests)
     request_body = {"ids": ids, "limit": 1}
@@ -1070,7 +1070,8 @@ async def test_search_datetime_with_null_datetime(
     os.environ.pop("ENABLE_STAC_VALIDATOR", None)
 
     try:
-        """Test datetime filtering when properties.datetime is null or set, ensuring start_datetime and end_datetime are set when datetime is null."""
+        # Test datetime filtering when properties.datetime is null or set,
+        # ensuring start_datetime and end_datetime are set when datetime is null.
         # Setup: Create test collection
         test_collection = load_test_data("test_collection.json")
         try:
@@ -1111,13 +1112,6 @@ async def test_search_datetime_with_null_datetime(
             except Exception as e:
                 logger.error(f"Failed to create item {item['id']}: {e}")
                 pytest.fail(f"Item creation failed: {e}")
-
-        # Refresh indices once
-        try:
-            await refresh_indices(txn_client)
-        except Exception as e:
-            logger.error(f"Failed to refresh indices: {e}")
-            pytest.fail(f"Index refresh failed: {e}")
 
         # Refresh indices once
         try:
