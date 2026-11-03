@@ -56,6 +56,10 @@ pub fn read_router() -> Router<Arc<AppState>> {
             "/catalogs/{catalog_id}/conformance",
             get(catalog_conformance),
         )
+        .route(
+            "/catalogs/{catalog_id}/queryables",
+            get(get_catalog_queryables),
+        )
         // --- Children & Sub-Resources ---
         .route("/catalogs/{catalog_id}/children", get(get_catalog_children))
         // --- Scoped Collections & Items ---

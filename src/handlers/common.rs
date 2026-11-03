@@ -443,6 +443,43 @@ pub(crate) fn merge_doc_links(doc: &mut serde_json::Value, generated: Vec<Link>,
     doc["links"] = json!(out);
 }
 
+/// STAC API - Children v1.0.0 invariants for the `/children` response:
+/// the response `links` must include `root`, `parent`, and `self`, and
+/// every child must carry a `self` link to its canonical location.
+/// Invariant guard — violations are our bug, hence 500 (upstream's
+/// `Children` pydantic model raises the same way on response build).
+pub(crate) fn validate_children_response(
+    children: &[serde_json::Value],
+    links: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let rels: HashSet<&str> = links
+        .as_array()
+        .map(|ls| ls.iter().filter_map(|l| l["rel"].as_str()).collect())
+        .unwrap_or_default();
+    for req in ["root", "parent", "self"] {
+        if !rels.contains(req) {
+            return Err(ApiError::Internal(format!(
+                "children response links missing required rel='{req}'"
+            )));
+        }
+    }
+    if let Some(id) = children
+        .iter()
+        .find(|c| {
+            !c["links"]
+                .as_array()
+                .map(|ls| ls.iter().any(|l| l["rel"].as_str() == Some("self")))
+                .unwrap_or(false)
+        })
+        .and_then(|c| c["id"].as_str())
+    {
+        return Err(ApiError::Internal(format!(
+            "child '{id}' missing required rel='self' link"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_kind(raw: Option<&str>) -> Option<NodeKind> {
     match raw {
         Some("Catalog") => Some(NodeKind::Catalog),
@@ -1168,5 +1205,62 @@ impl IntoResponse for ApiError {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, Json(json!({ "detail": msg }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn children_links(rels: &[&str]) -> serde_json::Value {
+        json!(rels
+            .iter()
+            .map(|r| json!({"rel": r, "href": "http://test/x"}))
+            .collect::<Vec<_>>())
+    }
+
+    fn child_with_self(id: &str) -> serde_json::Value {
+        json!({"id": id, "links": [{"rel": "self", "href": format!("http://test/catalogs/{id}")}]})
+    }
+
+    #[test]
+    fn children_response_valid() {
+        let children = vec![child_with_self("a")];
+        let links = children_links(&["root", "parent", "self"]);
+        assert!(validate_children_response(&children, &links).is_ok());
+    }
+
+    #[test]
+    fn children_response_empty_children_ok() {
+        // An empty children list still needs the response-level rels.
+        let links = children_links(&["root", "parent", "self"]);
+        assert!(validate_children_response(&[], &links).is_ok());
+    }
+
+    #[test]
+    fn children_response_missing_response_rel_fails() {
+        for missing in ["root", "parent", "self"] {
+            let rels: Vec<&str> = ["root", "parent", "self"]
+                .into_iter()
+                .filter(|r| *r != missing)
+                .collect();
+            let err = validate_children_response(&[], &children_links(&rels)).unwrap_err();
+            assert!(matches!(err, ApiError::Internal(msg) if msg.contains(missing)));
+        }
+    }
+
+    #[test]
+    fn children_response_child_missing_self_fails() {
+        let child = json!({"id": "orphan", "links": [{"rel": "root", "href": "http://test"}]});
+        let links = children_links(&["root", "parent", "self"]);
+        let err = validate_children_response(&[child], &links).unwrap_err();
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("orphan")));
+    }
+
+    #[test]
+    fn children_response_child_no_links_fails() {
+        let child = json!({"id": "bare"});
+        let links = children_links(&["root", "parent", "self"]);
+        assert!(validate_children_response(&[child], &links).is_err());
     }
 }
