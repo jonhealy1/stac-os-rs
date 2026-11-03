@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `src/handlers.rs` (~5,200 lines) split into `src/handlers/` modules by
+  resource domain — `catalogs.rs`, `collections.rs`, `items.rs`,
+  `search.rs`, `metadata.rs`, plus `common.rs` for the shared plumbing
+  (state, query structs, link/etag helpers, patch utilities, `ApiError`).
+  No behavior change
 - The `/api` OpenAPI document is now generated at runtime from
   `#[utoipa::path]` annotations on the handlers (`src/docs.rs`),
   replacing the hand-maintained `src/openapi.json`. The generated spec
