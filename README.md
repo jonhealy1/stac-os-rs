@@ -277,7 +277,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 **Core STAC routes**
 - `GET /queryables` (root) serves upstream's core queryables set; per-collection queryables merge that with the items index mapping (`platform.enum` comes from a terms aggregation). True per-collection narrowing would need per-collection indices
 - `service-doc` exists at `/api.html` (Swagger UI) alongside `/api` OpenAPI JSON
-- `src/openapi.json` is hand-maintained and drifts as features land — generate it from the route types instead (`utoipa` or `aide`)
+- The OpenAPI doc is generated at runtime from `#[utoipa::path]` annotations (`src/docs.rs` + per-handler attributes in `src/handlers.rs`) — `info.version` syncs from `Cargo.toml`. New routes need an annotation or they won't appear in the spec
 
 **Hierarchy & data**
 - Children/descendants capped at 10k per level — real pagination needed on the DAG itself

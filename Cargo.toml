@@ -30,6 +30,7 @@ cql2 = "0.4.2"
 json-patch = "4.2.0"
 base64 = "0.22"
 jiff = "0.2.38"
+utoipa = "6"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

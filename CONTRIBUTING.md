@@ -40,8 +40,9 @@ raised to 3000 in `compose.yml` for this reason).
   test can't run in a given context (e.g. it needs in-process hooks an
   external HTTP server doesn't have), skip it with a clear reason
   instead.
-- **Docs**: new routes go in the README route tables *and*
-  `src/openapi.json` (hand-maintained for now). New config knobs go in
+- **Docs**: new routes go in the README route tables *and* get a
+  `#[utoipa::path(...)]` annotation on the handler (the `/api` document
+  is generated from these — see `src/docs.rs`). New config knobs go in
   the README Configuration Reference. New env vars should be read once
   at startup in `src/main.rs`.
 - **Changelog**: add a line under `## [Unreleased]` in
