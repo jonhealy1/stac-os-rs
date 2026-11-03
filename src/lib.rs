@@ -1,4 +1,5 @@
 // src/lib.rs
+pub mod docs;
 pub mod dto;
 pub mod handlers;
 pub mod links;
@@ -27,10 +28,7 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/sortables", get(sortables))
         .route("/queryables", get(get_queryables))
         // --- Core STAC item search (registry-wide; same as /catalogs/search) ---
-        .route(
-            "/search",
-            get(catalogs_search_get).post(catalogs_search_post),
-        )
+        .route("/search", get(search_get).post(search_post))
         // --- Core STAC collections routes (global namespace) ---
         .route("/collections", get(list_collections))
         .route("/collections/{collection_id}", get(get_collection))

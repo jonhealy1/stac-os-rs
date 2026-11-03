@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/docs` — FastAPI-style Swagger UI endpoint (same page as `/api.html`)
 - `STAC_PORT` env var sets the API bind port (was hardcoded `3000`)
 
+### Changed
+
+- The `/api` OpenAPI document is now generated at runtime from
+  `#[utoipa::path]` annotations on the handlers (`src/docs.rs`),
+  replacing the hand-maintained `src/openapi.json`. The generated spec
+  is more accurate than the static file ever was: `info.version` tracks
+  `Cargo.toml`, previously-missing routes (`/collections-search`,
+  `/collections-sortables`, `/api`, `/_mgmt/ping`) are documented, path
+  params and `If-Match` headers are declared everywhere they apply,
+  `token` replaces the stale `offset` param on GET search, and listing
+  routes declare only the params they actually consume
+
 ## [0.3.0] - 2026-11-02
 
 ### Added

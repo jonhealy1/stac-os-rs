@@ -86,7 +86,7 @@ fn geo_json<T: serde::Serialize>(body: T) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/geo+json")], Json(body))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
 pub struct ChildrenQuery {
     pub r#type: Option<String>, // Filter by "Catalog" or "Collection"
     pub limit: Option<u64>,
@@ -98,7 +98,40 @@ pub struct ChildrenQuery {
     pub filter_lang: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+/// Query params for catalog listings — only what `/catalogs` and
+/// `/catalogs/{id}/catalogs` actually consume. Items-only params live on
+/// `ListQuery`.
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+pub struct CatalogsQuery {
+    pub limit: Option<u64>,
+    /// Opaque pagination cursor (offset-encoded).
+    pub token: Option<String>,
+    /// CQL2 filter — parsed and validated like the other listings.
+    pub filter: Option<String>,
+    #[serde(rename = "filter-lang")]
+    pub filter_lang: Option<String>,
+}
+
+/// Query params for the scoped collections listing —
+/// `/catalogs/{id}/collections` shares the collections-search surface.
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+pub struct ScopedCollectionsQuery {
+    pub limit: Option<u64>,
+    /// Opaque pagination cursor (offset-encoded).
+    pub token: Option<String>,
+    /// Sort extension: `?sortby=+field,-field`.
+    pub sortby: Option<String>,
+    /// Fields extension: `?fields=+include,-exclude`.
+    pub fields: Option<String>,
+    /// Free-text search: `?q=term`.
+    pub q: Option<String>,
+    /// CQL2 filter — parsed and validated like the other listings.
+    pub filter: Option<String>,
+    #[serde(rename = "filter-lang")]
+    pub filter_lang: Option<String>,
+}
+
+#[derive(Deserialize, Default, utoipa::IntoParams)]
 pub struct ListQuery {
     pub limit: Option<u64>,
     pub token: Option<String>,
@@ -184,22 +217,18 @@ fn json_map(
 /// caps it (`None` = uncapped). `limit=0` is a 400; an unparseable token
 /// restarts from 0 (matching upstream leniency).
 fn list_window(
-    q: &ListQuery,
+    limit: Option<u64>,
+    token: Option<&str>,
     default_limit: u64,
     max_limit: Option<u64>,
 ) -> Result<(u64, u64), ApiError> {
-    let limit = q
-        .limit
+    let limit = limit
         .unwrap_or(default_limit)
         .min(max_limit.unwrap_or(u64::MAX));
     if limit == 0 {
         return Err(ApiError::BadRequest("limit must be >= 1".to_string()));
     }
-    let offset = q
-        .token
-        .as_deref()
-        .and_then(|t| t.parse::<u64>().ok())
-        .unwrap_or(0);
+    let offset = token.and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
     Ok((limit, offset))
 }
 
@@ -962,6 +991,17 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
 }
 
 /// GET /conformance — OGC API conformance classes for the whole service.
+#[utoipa::path(
+    get,
+    path = "/conformance",
+    tag = "metadata",
+    summary = "Conformance classes",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn conformance(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(json!({ "conformsTo": conformance_classes(&state) }))
 }
@@ -1024,6 +1064,17 @@ fn json_schema(body: serde_json::Value) -> impl IntoResponse {
 
 /// GET /queryables — upstream's default is the static DEFAULT_QUERYABLES
 /// set (the union view is an env-flagged opt-in we don't implement).
+#[utoipa::path(
+    get,
+    path = "/queryables",
+    tag = "schemas",
+    summary = "Item queryables schema",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_queryables(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1039,6 +1090,18 @@ pub async fn get_queryables(
 /// ALL_QUERYABLES base plus every indexed field of the items index under
 /// its un-prefixed name, with `$enum` fields populated by a per-
 /// collection terms aggregation.
+#[utoipa::path(
+    get,
+    path = "/collections/{collection_id}/queryables",
+    tag = "schemas",
+    summary = "Collection queryables schema",
+    params(("collection_id" = String, Path, description = "Collection id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_collection_queryables(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1149,14 +1212,33 @@ pub async fn get_collection_queryables(
 }
 
 /// GET /api — OpenAPI service description (hand-maintained).
-pub async fn api() -> impl IntoResponse {
-    (
+#[utoipa::path(
+    get,
+    path = "/api",
+    tag = "metadata",
+    summary = "OpenAPI service description",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub async fn api(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let doc = crate::docs::openapi(
+        state.enable_transactions,
+        state.enable_collections_search_route,
+        state.enable_collections_search,
+    );
+    let body = doc
+        .to_json()
+        .map_err(|e| ApiError::Internal(format!("OpenAPI serialization failed: {e}")))?;
+    Ok((
         [(
             header::CONTENT_TYPE,
             "application/vnd.oai.openapi+json;version=3.0",
         )],
-        include_str!("openapi.json"),
-    )
+        body,
+    ))
 }
 
 /// `GET /api.html` — human-readable service docs (Swagger UI pointed at
@@ -1174,10 +1256,32 @@ pub async fn api_docs_html() -> impl IntoResponse {
 }
 
 /// `GET /_mgmt/ping` — upstream health-check endpoint.
+#[utoipa::path(
+    get,
+    path = "/_mgmt/ping",
+    tag = "metadata",
+    summary = "Health check",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn mgmt_ping() -> Json<serde_json::Value> {
     Json(json!({"message": "PONG"}))
 }
 
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "metadata",
+    summary = "Landing page",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn root_landing_page(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1251,17 +1355,34 @@ pub async fn root_landing_page(
     })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs",
+    tag = "catalogs",
+    summary = "List all catalogs (flat registry listing)",
+    params(CatalogsQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_catalogs(
     State(state): State<Arc<AppState>>,
     RawQuery(raw): RawQuery,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<CatalogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let clause = listing_filter_clause(
         query.filter.as_deref(),
         query.filter_lang.as_deref(),
         crate::store::COLLECTION_FIELDS,
     )?;
-    let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
+    let (limit, offset) = list_window(
+        query.limit,
+        query.token.as_deref(),
+        DEFAULT_LIST_LIMIT,
+        None,
+    )?;
     // Upstream `/catalogs` is a flat list of every catalog in the
     // registry — nested catalogs carry their parent links.
     let (mut catalogs, matched) = state
@@ -1310,6 +1431,19 @@ pub async fn list_catalogs(
     })))
 }
 
+#[utoipa::path(
+    post,
+    path = "/catalogs",
+    tag = "catalogs",
+    summary = "Create a root catalog",
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn create_root_catalog(
     State(state): State<Arc<AppState>>,
     StacJson(mut catalog): StacJson<Catalog>,
@@ -1359,6 +1493,18 @@ pub async fn create_root_catalog(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}",
+    tag = "catalogs",
+    summary = "Get a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1385,6 +1531,22 @@ pub async fn get_catalog(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/catalogs/{catalog_id}",
+    tag = "catalogs",
+    summary = "Replace a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn update_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1437,6 +1599,18 @@ pub async fn update_catalog(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/children",
+    tag = "catalogs",
+    summary = "List catalog children (catalogs + collections)",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ChildrenQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_catalog_children(
     Path(catalog_id): Path<String>,
     RawQuery(raw): RawQuery,
@@ -1450,11 +1624,8 @@ pub async fn get_catalog_children(
     )?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
-        &ListQuery {
-            limit: query.limit,
-            token: query.token.clone(),
-            ..Default::default()
-        },
+        query.limit,
+        query.token.as_deref(),
         DEFAULT_LIST_LIMIT,
         None,
     )?;
@@ -1574,10 +1745,22 @@ pub async fn get_catalog_children(
 }
 
 /// GET /catalogs/{id}/catalogs — the catalog-kind children of a catalog.
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/catalogs",
+    tag = "catalogs",
+    summary = "List sub-catalogs",
+    params(("catalog_id" = String, Path, description = "Catalog id"), CatalogsQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_sub_catalogs(
     Path(catalog_id): Path<String>,
     RawQuery(raw): RawQuery,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<CatalogsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let clause = listing_filter_clause(
@@ -1586,7 +1769,12 @@ pub async fn list_sub_catalogs(
         crate::store::COLLECTION_FIELDS,
     )?;
     require_catalog(&state, &catalog_id).await?;
-    let (limit, offset) = list_window(&query, DEFAULT_LIST_LIMIT, None)?;
+    let (limit, offset) = list_window(
+        query.limit,
+        query.token.as_deref(),
+        DEFAULT_LIST_LIMIT,
+        None,
+    )?;
     let ids = state
         .store
         .get_children_by_kind(&catalog_id, NodeKind::Catalog)
@@ -1705,6 +1893,17 @@ async fn items_sortable_fields(
 /// GET /sortables — Sortables schema for item search (item-search
 /// binding advertises `additionalProperties: true`: unmapped fields
 /// sort as null rather than erroring).
+#[utoipa::path(
+    get,
+    path = "/sortables",
+    tag = "schemas",
+    summary = "Item sortables schema",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn sortables(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     json_schema(sortables_schema(
         &state.base_url,
@@ -1716,6 +1915,18 @@ pub async fn sortables(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 /// GET /collections/{id}/sortables — features-binding sortables schema
 /// derived from the items index mapping (`additionalProperties: false`).
+#[utoipa::path(
+    get,
+    path = "/collections/{collection_id}/sortables",
+    tag = "schemas",
+    summary = "Collection sortables schema",
+    params(("collection_id" = String, Path, description = "Collection id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn collection_sortables(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1738,6 +1949,17 @@ pub async fn collection_sortables(
 
 /// GET /collections-sortables — collection-search sortables from the
 /// collections index mapping (`additionalProperties: false`).
+#[utoipa::path(
+    get,
+    path = "/collections-sortables",
+    tag = "schemas",
+    summary = "Collections sortables schema",
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn collections_sortables(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1752,6 +1974,18 @@ pub async fn collections_sortables(
 }
 
 /// GET /catalogs/{id}/conformance — catalog-scoped conformance classes.
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/conformance",
+    tag = "catalogs",
+    summary = "Scoped conformance classes",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn catalog_conformance(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -2235,6 +2469,19 @@ impl<'de> serde::Deserialize<'de> for SearchBody {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/catalogs/{catalog_id}/search",
+    tag = "search",
+    summary = "Item search within a catalog (POST)",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn scoped_search_post(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -2247,6 +2494,34 @@ pub async fn scoped_search_post(
     run_scoped_search(&state, &catalog_id, search, Some((uri, false))).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/search",
+    tag = "search",
+    summary = "Item search within a catalog (GET)",
+    params(
+        ("catalog_id" = String, Path, description = "Catalog id"),
+        ("collections" = Option<String>, Query, description = "Comma-separated collection ids to search"),
+        ("ids" = Option<String>, Query, description = "Comma-separated item ids to return"),
+        ("bbox" = Option<String>, Query, description = "Bounding box as minx,miny,maxx,maxy (antimeridian supported)"),
+        ("intersects" = Option<String>, Query, description = "GeoJSON geometry to intersect"),
+        ("datetime" = Option<String>, Query, description = "RFC 3339 datetime or open interval"),
+        ("limit" = Option<u64>, Query, description = "Maximum items per page"),
+        ("token" = Option<String>, Query, description = "Pagination token from a `next` link"),
+        ("sortby" = Option<String>, Query, description = "Sort: +field/-field or field:asc/desc, comma-separated"),
+        ("fields" = Option<String>, Query, description = "Field filtering: +include/-exclude, comma-separated"),
+        ("q" = Option<String>, Query, description = "Free-text search"),
+        ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
+        ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
+        ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+    ),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn scoped_search_get(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -2259,6 +2534,18 @@ pub async fn scoped_search_get(
 
 /// Search across the whole catalogs registry — equivalent to scoping to
 /// `root`, since every orphan is adopted there.
+#[utoipa::path(
+    post,
+    path = "/catalogs/search",
+    tag = "search",
+    summary = "Registry-wide item search (POST)",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn catalogs_search_post(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -2270,6 +2557,33 @@ pub async fn catalogs_search_post(
     run_scoped_search(&state, ROOT_CATALOG_ID, search, Some((uri, false))).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/search",
+    tag = "search",
+    summary = "Registry-wide item search (GET)",
+    params(
+        ("collections" = Option<String>, Query, description = "Comma-separated collection ids to search"),
+        ("ids" = Option<String>, Query, description = "Comma-separated item ids to return"),
+        ("bbox" = Option<String>, Query, description = "Bounding box as minx,miny,maxx,maxy (antimeridian supported)"),
+        ("intersects" = Option<String>, Query, description = "GeoJSON geometry to intersect"),
+        ("datetime" = Option<String>, Query, description = "RFC 3339 datetime or open interval"),
+        ("limit" = Option<u64>, Query, description = "Maximum items per page"),
+        ("token" = Option<String>, Query, description = "Pagination token from a `next` link"),
+        ("sortby" = Option<String>, Query, description = "Sort: +field/-field or field:asc/desc, comma-separated"),
+        ("fields" = Option<String>, Query, description = "Field filtering: +include/-exclude, comma-separated"),
+        ("q" = Option<String>, Query, description = "Free-text search"),
+        ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
+        ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
+        ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+    ),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn catalogs_search_get(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
@@ -2279,8 +2593,83 @@ pub async fn catalogs_search_get(
     run_scoped_search(&state, ROOT_CATALOG_ID, search, Some((uri, true))).await
 }
 
+/// `GET /search` — canonical registry-wide search; same handler surface as
+/// `/catalogs/search`, annotated separately so each path appears once in the
+/// OpenAPI doc.
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "search",
+    summary = "Registry-wide item search (GET)",
+    params(
+        ("collections" = Option<String>, Query, description = "Comma-separated collection ids to search"),
+        ("ids" = Option<String>, Query, description = "Comma-separated item ids to return"),
+        ("bbox" = Option<String>, Query, description = "Bounding box as minx,miny,maxx,maxy (antimeridian supported)"),
+        ("intersects" = Option<String>, Query, description = "GeoJSON geometry to intersect"),
+        ("datetime" = Option<String>, Query, description = "RFC 3339 datetime or open interval"),
+        ("limit" = Option<u64>, Query, description = "Maximum items per page"),
+        ("token" = Option<String>, Query, description = "Pagination token from a `next` link"),
+        ("sortby" = Option<String>, Query, description = "Sort: +field/-field or field:asc/desc, comma-separated"),
+        ("fields" = Option<String>, Query, description = "Field filtering: +include/-exclude, comma-separated"),
+        ("q" = Option<String>, Query, description = "Free-text search"),
+        ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
+        ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
+        ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+    ),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub async fn search_get(
+    state: State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    params: Query<GetSearch>,
+) -> Result<impl IntoResponse, ApiError> {
+    catalogs_search_get(state, uri, params).await
+}
+
+/// `POST /search` — canonical registry-wide search (see [`search_get`]).
+#[utoipa::path(
+    post,
+    path = "/search",
+    tag = "search",
+    summary = "Registry-wide item search (POST)",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub async fn search_post(
+    state: State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    params: Query<HashMap<String, String>>,
+    search: StacJson<SearchBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    catalogs_search_post(state, uri, params, search).await
+}
+
 // --- Transaction Handlers ---
 
+#[utoipa::path(
+    post,
+    path = "/catalogs/{catalog_id}/catalogs",
+    tag = "catalogs",
+    summary = "Create or link a sub-catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn link_or_create_sub_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -2365,6 +2754,18 @@ pub async fn link_or_create_sub_catalog(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/catalogs/{catalog_id}/catalogs/{sub_id}",
+    tag = "catalogs",
+    summary = "Unlink a sub-catalog (removes parent edge only)",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("sub_id" = String, Path, description = "Sub-catalog id")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn unlink_sub_catalog(
     Path((catalog_id, sub_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -2387,10 +2788,22 @@ pub async fn unlink_sub_catalog(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/collections",
+    tag = "collections",
+    summary = "List collections in a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ScopedCollectionsQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_scoped_collections(
     Path(catalog_id): Path<String>,
     RawQuery(raw): RawQuery,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<ScopedCollectionsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let clause = listing_filter_clause(
@@ -2400,7 +2813,8 @@ pub async fn list_scoped_collections(
     )?;
     require_catalog(&state, &catalog_id).await?;
     let (limit, offset) = list_window(
-        &query,
+        query.limit,
+        query.token.as_deref(),
         state.default_collection_limit,
         state.max_collection_limit,
     )?;
@@ -2490,6 +2904,21 @@ pub async fn list_scoped_collections(
     })))
 }
 
+#[utoipa::path(
+    post,
+    path = "/catalogs/{catalog_id}/collections",
+    tag = "collections",
+    summary = "Create or link a collection in a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn link_or_create_scoped_collection(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -2580,6 +3009,18 @@ pub async fn link_or_create_scoped_collection(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}",
+    tag = "collections",
+    summary = "Get a collection in a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_scoped_collection(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -2608,6 +3049,22 @@ pub async fn get_scoped_collection(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}",
+    tag = "collections",
+    summary = "Replace a collection in a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn update_scoped_collection(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -2666,6 +3123,18 @@ pub async fn update_scoped_collection(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}",
+    tag = "collections",
+    summary = "Unlink a collection from a catalog",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn unlink_scoped_collection(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -2696,6 +3165,18 @@ pub async fn unlink_scoped_collection(
 /// `enable_collections_search` off (upstream `ENABLE_COLLECTIONS_SEARCH`,
 /// default on) the search params are ignored: plain `limit`/`token`
 /// listing, mirroring upstream's bare request model.
+#[utoipa::path(
+    get,
+    path = "/collections",
+    tag = "collections",
+    summary = "List collections (collections-search params)",
+    params(CollectionsQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_collections(
     Query(query): Query<CollectionsQuery>,
     State(state): State<Arc<AppState>>,
@@ -2714,6 +3195,18 @@ pub async fn list_collections(
 
 /// GET /collections-search — upstream collections-search route;
 /// same parameter surface as the extended GET /collections.
+#[utoipa::path(
+    get,
+    path = "/collections-search",
+    tag = "collections",
+    summary = "Search collections",
+    params(CollectionsQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn collections_search_get(
     Query(query): Query<CollectionsQuery>,
     State(state): State<Arc<AppState>>,
@@ -2729,6 +3222,18 @@ pub async fn collections_search_get(
 
 /// POST /collections-search — structured body variant
 /// (`sortby: [{field,direction}]`, `fields: {include,exclude}`).
+#[utoipa::path(
+    post,
+    path = "/collections-search",
+    tag = "collections",
+    summary = "Search collections (POST body)",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn collections_search_post(
     State(state): State<Arc<AppState>>,
     StacJson(body): StacJson<serde_json::Value>,
@@ -2743,7 +3248,7 @@ pub async fn collections_search_post(
 }
 
 /// GET-side parameters for /collections and /collections-search.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
 pub struct CollectionsQuery {
     pub limit: Option<u64>,
     pub token: Option<String>,
@@ -3123,6 +3628,18 @@ async fn collections_page(
 }
 
 /// GET /collections/{id} — canonical collection read.
+#[utoipa::path(
+    get,
+    path = "/collections/{collection_id}",
+    tag = "collections",
+    summary = "Get a collection",
+    params(("collection_id" = String, Path, description = "Collection id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -3144,6 +3661,18 @@ pub async fn get_collection(
 
 /// GET /collections/{id}/items — global item listing for a collection.
 /// Upstream-compatible `?limit=&token=` paging only.
+#[utoipa::path(
+    get,
+    path = "/collections/{collection_id}/items",
+    tag = "items",
+    summary = "List collection items",
+    params(("collection_id" = String, Path, description = "Collection id"), ListQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_collection_items(
     Path(collection_id): Path<String>,
     Query(query): Query<ListQuery>,
@@ -3181,6 +3710,18 @@ pub async fn list_collection_items(
 }
 
 /// GET /collections/{id}/items/{item_id} — global item read.
+#[utoipa::path(
+    get,
+    path = "/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Get an item",
+    params(("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_collection_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3217,6 +3758,20 @@ pub async fn get_collection_item(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/catalogs/{catalog_id}",
+    tag = "catalogs",
+    summary = "Disband a catalog (unlink children, keep resources)",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn disband_catalog(
     Path(catalog_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -3290,6 +3845,18 @@ fn validate_item_collection(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}/items",
+    tag = "items",
+    summary = "List items in a scoped collection",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ListQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn list_scoped_items(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
@@ -3337,7 +3904,12 @@ async fn items_page(
     query: &ListQuery,
     scoped_catalog_id: Option<&str>,
 ) -> Result<(ItemCollection, u64), ApiError> {
-    let (limit, _) = list_window(query, state.default_item_limit, state.max_item_limit)?;
+    let (limit, _) = list_window(
+        query.limit,
+        query.token.as_deref(),
+        state.default_item_limit,
+        state.max_item_limit,
+    )?;
     let offset = query
         .token
         .as_deref()
@@ -3495,6 +4067,18 @@ fn items_next_link(
     Some(link)
 }
 
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Get an item in a scoped collection",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
 pub async fn get_scoped_item(
     Path((catalog_id, collection_id, item_id)): Path<(String, String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3524,6 +4108,20 @@ pub async fn get_scoped_item(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}/items",
+    tag = "items",
+    summary = "Create an item in a scoped collection",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn create_scoped_item(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3545,6 +4143,20 @@ pub async fn create_scoped_item(
     ))
 }
 
+#[utoipa::path(
+    put,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Replace an item in a scoped collection",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn update_scoped_item(
     Path((catalog_id, collection_id, item_id)): Path<(String, String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3562,6 +4174,18 @@ pub async fn update_scoped_item(
     Ok(geo_json(item_doc(&state, &item, Some(&catalog_id))))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Delete an item in a scoped collection",
+    params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn delete_scoped_item(
     Path((catalog_id, collection_id, item_id)): Path<(String, String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3586,6 +4210,19 @@ pub async fn delete_scoped_item(
 // --- Core Transaction Handlers (canonical /collections surface) ---
 
 /// POST /collections — create a collection parented under root.
+#[utoipa::path(
+    post,
+    path = "/collections",
+    tag = "collections",
+    summary = "Create a collection",
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn create_root_collection(
     State(state): State<Arc<AppState>>,
     StacJson(collection): StacJson<Collection>,
@@ -3638,6 +4275,22 @@ pub async fn create_root_collection(
 }
 
 /// PUT /collections/{id} — update a collection; DAG memberships preserved.
+#[utoipa::path(
+    put,
+    path = "/collections/{collection_id}",
+    tag = "collections",
+    summary = "Replace a collection",
+    params(("collection_id" = String, Path, description = "Collection id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn update_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -3702,6 +4355,20 @@ pub async fn update_root_collection(
 
 /// DELETE /collections/{id} — removes the collection, its DAG node, and
 /// all of its items (canonical route semantics: a collection owns items).
+#[utoipa::path(
+    delete,
+    path = "/collections/{collection_id}",
+    tag = "collections",
+    summary = "Delete a collection",
+    params(("collection_id" = String, Path, description = "Collection id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn delete_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -3743,6 +4410,20 @@ pub async fn delete_root_collection(
 }
 
 /// POST /collections/{id}/items — create an item in a collection.
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/items",
+    tag = "items",
+    summary = "Create an item",
+    params(("collection_id" = String, Path, description = "Collection id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn create_root_item(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -3845,6 +4526,22 @@ async fn create_root_items_batch(
 }
 
 /// PUT /collections/{id}/items/{item_id} — update an item.
+#[utoipa::path(
+    put,
+    path = "/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Replace an item",
+    params(("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn update_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -3908,6 +4605,20 @@ pub async fn update_root_item(
 }
 
 /// DELETE /collections/{id}/items/{item_id} — delete an item.
+#[utoipa::path(
+    delete,
+    path = "/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Delete an item",
+    params(("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    responses(
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn delete_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -4072,6 +4783,21 @@ fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
 
 /// PATCH /collections/{id} — JSON Merge Patch or JSON-Patch on the
 /// collection document; `id` is immutable (400 if a patch changes it).
+#[utoipa::path(
+    patch,
+    path = "/collections/{collection_id}",
+    tag = "collections",
+    summary = "Patch a collection (JSON Patch / Merge Patch)",
+    params(("collection_id" = String, Path, description = "Collection id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn patch_root_collection(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -4148,6 +4874,21 @@ pub async fn patch_root_collection(
 /// PATCH /collections/{id}/items/{item_id} — JSON Merge Patch or
 /// JSON-Patch on the item document; `id` and `collection` are immutable
 /// (400 if a patch changes them).
+#[utoipa::path(
+    patch,
+    path = "/collections/{collection_id}/items/{item_id}",
+    tag = "items",
+    summary = "Patch an item (JSON Patch / Merge Patch)",
+    params(("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 412, description = "If-Match precondition failed"),
+        (status = 428, description = "If-Match header required")
+    )
+)]
 pub async fn patch_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -4228,6 +4969,20 @@ pub async fn patch_root_item(
 /// `{received, success, skipped, errors[]}`. Per-item processing:
 /// collection populated from the path when absent, per-item error on
 /// mismatch/malformed/conflict — never all-or-nothing.
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/bulk_items",
+    tag = "items",
+    summary = "Bulk item insert (Bulk Transaction extension)",
+    params(("collection_id" = String, Path, description = "Collection id")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
+    )
+)]
 pub async fn bulk_create_items(
     Path(collection_id): Path<String>,
     State(state): State<Arc<AppState>>,
