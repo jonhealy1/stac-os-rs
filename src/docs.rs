@@ -78,14 +78,38 @@ use crate::handlers;
 )]
 pub struct ApiDoc;
 
-/// The rendered OpenAPI document, with `info.version` synced from
-/// `CARGO_PKG_VERSION` (the derive macro can't read env vars).
-pub fn openapi() -> utoipa::openapi::OpenApi {
-    static DOC: std::sync::OnceLock<utoipa::openapi::OpenApi> = std::sync::OnceLock::new();
-    DOC.get_or_init(|| {
-        let mut doc = ApiDoc::openapi();
-        doc.info.version = env!("CARGO_PKG_VERSION").to_string();
-        doc
-    })
-    .clone()
+/// The rendered OpenAPI document for a given deployment configuration,
+/// with `info.version` synced from `CARGO_PKG_VERSION` (the derive macro
+/// can't read env vars). Paths are pruned to match `build_app`: non-GET
+/// operations go away when transactions are off, and the
+/// collections-search routes follow their flags — the spec never
+/// advertises endpoints that aren't mounted.
+pub fn openapi(
+    transactions_enabled: bool,
+    collections_search_route: bool,
+    collections_search: bool,
+) -> utoipa::openapi::OpenApi {
+    let mut doc = ApiDoc::openapi();
+    doc.info.version = env!("CARGO_PKG_VERSION").to_string();
+    if !transactions_enabled {
+        for item in doc.paths.paths.values_mut() {
+            item.put = None;
+            item.post = None;
+            item.delete = None;
+            item.patch = None;
+            item.options = None;
+            item.head = None;
+            item.trace = None;
+            item.query = None;
+            item.additional_operations.clear();
+        }
+        doc.paths.paths.retain(|_, item| item.get.is_some());
+    }
+    if !collections_search_route {
+        doc.paths.paths.remove("/collections-search");
+    }
+    if !collections_search && !collections_search_route {
+        doc.paths.paths.remove("/collections-sortables");
+    }
+    doc
 }

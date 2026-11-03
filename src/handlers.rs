@@ -1223,14 +1223,22 @@ pub async fn get_collection_queryables(
         (status = 404, description = "Not found")
     )
 )]
-pub async fn api() -> impl IntoResponse {
-    (
+pub async fn api(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let doc = crate::docs::openapi(
+        state.enable_transactions,
+        state.enable_collections_search_route,
+        state.enable_collections_search,
+    );
+    let body = doc
+        .to_json()
+        .map_err(|e| ApiError::Internal(format!("OpenAPI serialization failed: {e}")))?;
+    Ok((
         [(
             header::CONTENT_TYPE,
             "application/vnd.oai.openapi+json;version=3.0",
         )],
-        crate::docs::openapi().to_json().unwrap_or_default(),
-    )
+        body,
+    ))
 }
 
 /// `GET /api.html` — human-readable service docs (Swagger UI pointed at
@@ -1430,9 +1438,10 @@ pub async fn list_catalogs(
     summary = "Create a root catalog",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn create_root_catalog(
@@ -1533,6 +1542,7 @@ pub async fn get_catalog(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -2654,8 +2664,10 @@ pub async fn search_post(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn link_or_create_sub_catalog(
@@ -2749,9 +2761,9 @@ pub async fn link_or_create_sub_catalog(
     summary = "Unlink a sub-catalog (removes parent edge only)",
     params(("catalog_id" = String, Path, description = "Catalog id"), ("sub_id" = String, Path, description = "Sub-catalog id")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn unlink_sub_catalog(
@@ -2901,8 +2913,10 @@ pub async fn list_scoped_collections(
     request_body = serde_json::Value,
     responses(
         (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn link_or_create_scoped_collection(
@@ -3046,6 +3060,7 @@ pub async fn get_scoped_collection(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -3115,9 +3130,9 @@ pub async fn update_scoped_collection(
     summary = "Unlink a collection from a catalog",
     params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn unlink_scoped_collection(
@@ -3750,9 +3765,9 @@ pub async fn get_collection_item(
     summary = "Disband a catalog (unlink children, keep resources)",
     params(("catalog_id" = String, Path, description = "Catalog id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
+        (status = 204, description = "No content"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -4101,9 +4116,10 @@ pub async fn get_scoped_item(
     params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id")),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn create_scoped_item(
@@ -4137,7 +4153,8 @@ pub async fn create_scoped_item(
     responses(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn update_scoped_item(
@@ -4164,9 +4181,9 @@ pub async fn update_scoped_item(
     summary = "Delete an item in a scoped collection",
     params(("catalog_id" = String, Path, description = "Catalog id"), ("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 204, description = "No content"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn delete_scoped_item(
@@ -4200,9 +4217,10 @@ pub async fn delete_scoped_item(
     summary = "Create a collection",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn create_root_collection(
@@ -4268,6 +4286,7 @@ pub async fn create_root_collection(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -4343,9 +4362,9 @@ pub async fn update_root_collection(
     summary = "Delete a collection",
     params(("collection_id" = String, Path, description = "Collection id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
+        (status = 204, description = "No content"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -4399,9 +4418,10 @@ pub async fn delete_root_collection(
     params(("collection_id" = String, Path, description = "Collection id")),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Successful response"),
+        (status = 201, description = "Created"),
         (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn create_root_item(
@@ -4517,6 +4537,7 @@ async fn create_root_items_batch(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -4591,9 +4612,9 @@ pub async fn update_root_item(
     summary = "Delete an item",
     params(("collection_id" = String, Path, description = "Collection id"), ("item_id" = String, Path, description = "Item id"), ("If-Match" = Option<String>, Header, description = "Conditional write: apply only if the resource ETag matches")),
     responses(
-        (status = 200, description = "Successful response"),
-        (status = 400, description = "Invalid request"),
+        (status = 204, description = "No content"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Resource id already exists or write conflict"),
         (status = 412, description = "If-Match precondition failed"),
         (status = 428, description = "If-Match header required")
     )
@@ -4959,7 +4980,7 @@ pub async fn patch_root_item(
         (status = 200, description = "Successful response"),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Not found"),
-        (status = 409, description = "Duplicate item id")
+        (status = 409, description = "Resource id already exists or write conflict")
     )
 )]
 pub async fn bulk_create_items(
