@@ -26,6 +26,7 @@ use crate::handlers;
         handlers::metadata::collection_sortables,
         handlers::metadata::collections_sortables,
         handlers::metadata::catalog_conformance,
+        handlers::metadata::get_catalog_queryables,
         handlers::collections::list_collections,
         handlers::collections::create_root_collection,
         handlers::collections::get_collection,

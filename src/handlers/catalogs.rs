@@ -394,6 +394,8 @@ pub async fn get_catalog_children(
         links.as_array_mut().unwrap().push(next);
     }
 
+    validate_children_response(&children, &links)?;
+
     Ok(Json(json!({
         "children": children,
         "numberReturned": children.len(),

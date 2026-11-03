@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `/docs` — FastAPI-style Swagger UI endpoint (same page as `/api.html`)
 - `STAC_PORT` env var sets the API bind port (was hardcoded `3000`)
+- `GET /catalogs/{catalog_id}/queryables` — catalog-scoped queryables
+  JSON Schema (404 for missing catalogs), matching the upstream
+  catalogs-extension route surface
+- Invariant validation on `/catalogs/{catalog_id}/children` responses:
+  response links must carry `root`/`parent`/`self` and every child must
+  have a `self` link (violations surface as 500, matching the upstream
+  `Children` model contract)
 
 ### Changed
 

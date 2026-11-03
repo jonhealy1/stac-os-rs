@@ -85,7 +85,7 @@ fn default_queryables() -> serde_json::Map<String, serde_json::Value> {
 
 /// Upstream ALL_QUERYABLES — DEFAULT plus OPTIONAL (enum-marked fields
 /// populated per-collection at read time).
-fn all_queryables() -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn all_queryables() -> serde_json::Map<String, serde_json::Value> {
     let mut q = default_queryables();
     q.insert(
         "platform".to_string(),
@@ -95,7 +95,7 @@ fn all_queryables() -> serde_json::Map<String, serde_json::Value> {
 }
 
 /// JSON Schema document served by the queryables endpoints.
-fn queryables_schema(
+pub(crate) fn queryables_schema(
     state: &AppState,
     id: String,
     title: &str,
@@ -116,7 +116,7 @@ fn queryables_schema(
     })
 }
 
-fn json_schema(body: serde_json::Value) -> impl IntoResponse {
+pub(crate) fn json_schema(body: serde_json::Value) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/schema+json")],
         Json(body),
@@ -573,4 +573,33 @@ pub async fn catalog_conformance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_catalog(&state, &catalog_id).await?;
     Ok(Json(json!({ "conformsTo": conformance_classes(&state) })))
+}
+
+/// GET /catalogs/{catalog_id}/queryables — upstream's catalog-scoped
+/// queryables. Catalog scope shares the single items index, so the
+/// schema matches the root queryables base (no per-collection enum
+/// fill — catalog scope can't narrow the terms aggregation).
+#[utoipa::path(
+    get,
+    path = "/catalogs/{catalog_id}/queryables",
+    tag = "schemas",
+    summary = "Catalog queryables schema",
+    params(("catalog_id" = String, Path, description = "Catalog id")),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub async fn get_catalog_queryables(
+    Path(catalog_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_catalog(&state, &catalog_id).await?;
+    Ok(json_schema(queryables_schema(
+        &state,
+        format!("/catalogs/{catalog_id}/queryables"),
+        "Catalog Queryables",
+        all_queryables(),
+    )))
 }

@@ -75,6 +75,18 @@ pub async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    let (status, _, json) = call_headers(app, method, uri, body).await;
+    (status, json)
+}
+
+/// `call` variant that also returns response headers — for content-type
+/// assertions (e.g. `application/schema+json` on queryables).
+pub async fn call_headers(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -83,9 +95,10 @@ pub async fn call(
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, json)
+    (status, headers, json)
 }
 
 /// Owned-URI variant of `call` — use for futures held across `join!`s

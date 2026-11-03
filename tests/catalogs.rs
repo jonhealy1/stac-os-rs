@@ -2278,6 +2278,116 @@ async fn test_catalog_conformance_endpoint() {
     }
 }
 
+// --- Catalog-scoped queryables ---
+
+#[tokio::test]
+async fn test_get_catalog_queryables() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("cat-queryables");
+    post_catalog(&app, &cat).await;
+    let (s, headers, body) =
+        call_headers(&app, "GET", &format!("/catalogs/{cat}/queryables"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        headers["content-type"].to_str().unwrap(),
+        "application/schema+json"
+    );
+    assert_eq!(
+        body["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert!(
+        body["$id"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/catalogs/{cat}/queryables")),
+        "$id: {}",
+        body["$id"]
+    );
+    assert!(body["properties"].is_object(), "missing properties");
+    assert_no_double_slashes(&body);
+}
+
+#[tokio::test]
+async fn test_get_catalog_queryables_nonexistent_catalog() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{}/queryables", uniq("no-such-cat")),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Handler's 404 carries a detail body — an unmatched route wouldn't,
+    // so this proves the route exists and require_catalog rejected it.
+    assert!(
+        body["detail"].as_str().unwrap_or("").contains("not found"),
+        "expected handler 404 body, got: {body}"
+    );
+}
+
+// --- Children response invariants (STAC API - Children v1.0.0) ---
+
+/// The upstream `Children` pydantic model requires response-level
+/// root/parent/self links — assert ours carries them, plus the
+/// pagination fields.
+#[tokio::test]
+async fn test_children_endpoint_response_level_links() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let parent = uniq("kids-rels");
+    post_catalog(&app, &parent).await;
+    post_sub_catalog(&app, &parent, catalog(&uniq("kr-sub"))).await;
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{parent}/children"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let rels = link_rels(&body);
+    for rel in ["self", "root", "parent"] {
+        assert!(
+            rels.contains(&rel.to_string()),
+            "missing rel {rel}: {rels:?}"
+        );
+    }
+    let self_links = links_by_rel(&body, "self");
+    let self_href = self_links[0]["href"].as_str().unwrap();
+    assert!(
+        self_href.ends_with(&format!("/catalogs/{parent}/children")),
+        "self href: {self_href}"
+    );
+    assert!(body["children"].is_array());
+    assert!(body["numberReturned"].is_number());
+    assert!(body["numberMatched"].is_number());
+    assert_no_double_slashes(&body);
+}
+
+/// Every child in the response must carry a `self` link (upstream
+/// `Children` model requirement).
+#[tokio::test]
+async fn test_children_endpoint_every_child_has_self_link() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let parent = uniq("kids-self");
+    post_catalog(&app, &parent).await;
+    post_sub_catalog(&app, &parent, catalog(&uniq("ks-sub"))).await;
+    post_collection(&app, &parent, collection(&uniq("ks-col"))).await;
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{parent}/children"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    for child in body["children"].as_array().unwrap() {
+        let selfs = links_by_rel(child, "self");
+        assert_eq!(selfs.len(), 1, "{} missing rel=self", child["id"]);
+        assert!(selfs[0]["href"]
+            .as_str()
+            .unwrap()
+            .contains(child["id"].as_str().unwrap()));
+    }
+}
+
 // --- hide_alternate_parents flag (CATALOGS_HIDE_ALTERNATE_PARENTS) ---
 
 #[tokio::test]
