@@ -46,6 +46,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/conformance` | OGC conformance class URIs |
 | GET | `/api` | OpenAPI service description (`service-desc` link target) |
 | GET | `/api.html` | Swagger UI service documentation (`service-doc` link target) |
+| GET | `/docs` | Alias for `/api.html` (FastAPI-style Swagger UI) |
 | GET | `/_mgmt/ping` | Health check — `{"message":"PONG"}` |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
 | GET | `/queryables` | OGC Queryables JSON Schema — core item fields (`application/schema+json`) |
@@ -169,6 +170,7 @@ All variables are read once at startup — changing them requires a restart.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `OPENSEARCH_URL` | OpenSearch endpoint the store connects to. | `http://localhost:9200` | Optional |
+| `STAC_PORT` | TCP port the API binds to (`0.0.0.0:{port}`). | `3000` | Optional |
 | `STAC_BASE_URL` | External base URL used for advertised links (`self`, `root`, `next`, queryables/sortables `$id`s) — set this behind a reverse proxy so links point at the public origin rather than the bind address. | `http://localhost:{port}` | Optional |
 
 **Feature Flags**

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `/docs` — FastAPI-style Swagger UI endpoint (same page as `/api.html`)
+- `STAC_PORT` env var sets the API bind port (was hardcoded `3000`)
+
 ## [0.3.0] - 2026-11-02
 
 ### Added

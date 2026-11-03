@@ -70,8 +70,14 @@ async fn main() {
     });
     let app = build_app(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("stac-os-rs API running on http://localhost:3000");
+    let port: u16 = std::env::var("STAC_PORT")
+        .ok()
+        .map(|v| v.parse().expect("STAC_PORT must be a valid TCP port"))
+        .unwrap_or(3000);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .unwrap();
+    println!("stac-os-rs API running on http://localhost:{port}");
     if enable_transactions {
         println!("Transaction extension ENABLED (ENABLE_TRANSACTIONS_EXTENSIONS)");
     }

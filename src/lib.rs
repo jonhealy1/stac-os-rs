@@ -22,6 +22,7 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/conformance", get(conformance))
         .route("/api", get(api))
         .route("/api.html", get(api_docs_html))
+        .route("/docs", get(api_docs_html))
         .route("/_mgmt/ping", get(mgmt_ping))
         .route("/sortables", get(sortables))
         .route("/queryables", get(get_queryables))
