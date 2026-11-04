@@ -203,8 +203,9 @@ All variables are read once at startup — changing them requires a restart.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `USE_DATETIME` | `false` = items carrying `start_datetime`/`end_datetime` are datetime-filtered on the range alone, ignoring `properties.datetime` (matches upstream `USE_DATETIME=false` query semantics). | `true` | Optional |
+| `DATABASE_REFRESH` | Refresh policy on every write: `true` refreshes inline before responding (read-after-write without the `wait_for` park-until-tick cost on serial writes), `wait_for` suits sustained concurrent write load, `false` is fastest but gives no immediate read visibility — ingest pipelines only. | `true` | Optional |
 
-Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, `DATABASE_REFRESH`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
+Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 

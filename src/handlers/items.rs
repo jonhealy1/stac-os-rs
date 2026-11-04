@@ -413,9 +413,16 @@ pub async fn get_scoped_item(
 pub async fn create_scoped_item(
     Path((catalog_id, collection_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    StacJson(mut item): StacJson<Item>,
-) -> Result<impl IntoResponse, ApiError> {
+    StacJson(body): StacJson<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
+    if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
+        return create_items_batch(&state, &collection_id, Some(&catalog_id), &body)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    let mut item: Item = serde_json::from_value(body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     // Atomic create — 409 on repost, no get-then-write race
     if !state
@@ -428,7 +435,8 @@ pub async fn create_scoped_item(
     Ok((
         StatusCode::CREATED,
         geo_json(item_doc(&state, &item, Some(&catalog_id))),
-    ))
+    )
+        .into_response())
 }
 
 #[utoipa::path(
@@ -524,7 +532,7 @@ pub async fn create_root_item(
         return Err(ApiError::NotFound(collection_id));
     }
     if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
-        return create_root_items_batch(&state, &collection_id, &body)
+        return create_items_batch(&state, &collection_id, None, &body)
             .await
             .map(IntoResponse::into_response);
     }
@@ -563,9 +571,17 @@ pub async fn create_root_item(
 /// collection identity is preflighted (URI-populated when absent) and any
 /// mismatch or existing-id conflict rejects the whole batch before a
 /// single write. In-batch duplicate ids collapse to one write (last wins).
-async fn create_root_items_batch(
+/// `scope` is the catalog context for response link rendering.
+///
+/// Storage: one mget existence preflight + one `_bulk` create — a single
+/// refresh for the whole batch. The old per-doc loop made 2N round-trips,
+/// each waiting for an index refresh. A raced create between preflight
+/// and bulk still reports 409 (docs already written in that request stay,
+/// same partial-write exposure the sequential loop had).
+async fn create_items_batch(
     state: &AppState,
     collection_id: &str,
+    scope: Option<&str>,
     body: &serde_json::Value,
 ) -> Result<(StatusCode, impl IntoResponse), ApiError> {
     let features = body
@@ -583,28 +599,37 @@ async fn create_root_items_batch(
         }
         by_id.insert(item.id.clone(), item);
     }
-    for id in &order {
-        if state
-            .store
-            .get_document(ITEMS_INDEX, &item_key(id, collection_id))
-            .await?
-            .is_some()
-        {
-            return Err(ApiError::Conflict(id.clone()));
+    let keys: Vec<String> = order.iter().map(|id| item_key(id, collection_id)).collect();
+    let existing = state.store.existing_ids(ITEMS_INDEX, &keys).await?;
+    if let Some(id) = order
+        .iter()
+        .find(|id| existing.contains(&item_key(id, collection_id)))
+    {
+        return Err(ApiError::Conflict(id.clone()));
+    }
+    let mut ops = Vec::with_capacity(order.len());
+    for (id, key) in order.iter().zip(&keys) {
+        let doc =
+            serde_json::to_value(&by_id[id]).map_err(|e| ApiError::Internal(e.to_string()))?;
+        ops.push((key.clone(), doc, true));
+    }
+    let results = state.store.bulk_write(ITEMS_INDEX, &ops).await?;
+    for (id, res) in order.iter().zip(&results) {
+        match res.status {
+            s if (200..300).contains(&s) => {}
+            409 => return Err(ApiError::Conflict(id.clone())),
+            _ => {
+                return Err(ApiError::Internal(format!(
+                    "bulk create failed for '{id}': {}",
+                    res.error.as_deref().unwrap_or("unknown error")
+                )));
+            }
         }
     }
-    let mut docs = Vec::with_capacity(order.len());
-    for id in &order {
-        let item = &by_id[id];
-        if !state
-            .store
-            .create_document(ITEMS_INDEX, &item_key(id, collection_id), item)
-            .await?
-        {
-            return Err(ApiError::Conflict(id.clone()));
-        }
-        docs.push(item_doc(state, item, None));
-    }
+    let docs: Vec<serde_json::Value> = order
+        .iter()
+        .map(|id| item_doc(state, &by_id[id], scope))
+        .collect();
     Ok((
         StatusCode::CREATED,
         geo_json(serde_json::json!({"type": "FeatureCollection", "features": docs})),
@@ -950,6 +975,10 @@ pub async fn bulk_create_items(
         }
     }
     skipped += admitted.len() - unique.len();
+    // Deserialize + validate per item first (per-item errors, as before),
+    // then one `_bulk` request — a single round-trip and one refresh for
+    // the whole batch vs N sequential writes each waiting on refresh.
+    let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
     for raw in unique {
         let mut item: Item = match serde_json::from_value(raw.clone()) {
             Ok(i) => i,
@@ -966,26 +995,33 @@ pub async fn bulk_create_items(
             errors.push(json!({"id": item.id, "msg": msg}));
             continue;
         }
-        let key = item_key(&item.id, &collection_id);
-        let applied = if upsert {
-            state.store.put_document(ITEMS_INDEX, &key, &item).await?
-        } else {
-            state
-                .store
-                .create_document(ITEMS_INDEX, &key, &item)
-                .await?
-        };
-        if applied {
-            success += 1;
-        } else {
-            skipped += 1;
-            if raise_on_error {
-                return Err(ApiError::Conflict(format!(
-                    "Item '{}' already exists in collection '{collection_id}'",
-                    item.id
-                )));
+        let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+        prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
+    }
+    let ops: Vec<(String, serde_json::Value, bool)> = prepared
+        .iter()
+        .map(|(key, _, doc)| (key.clone(), doc.clone(), !upsert))
+        .collect();
+    let results = state.store.bulk_write(ITEMS_INDEX, &ops).await?;
+    for ((_, id, _), res) in prepared.iter().zip(&results) {
+        match res.status {
+            s if (200..300).contains(&s) => success += 1,
+            409 => {
+                skipped += 1;
+                if raise_on_error {
+                    return Err(ApiError::Conflict(format!(
+                        "Item '{id}' already exists in collection '{collection_id}'"
+                    )));
+                }
+                errors.push(json!({"id": id, "msg": "item already exists or write conflict"}));
             }
-            errors.push(json!({"id": item.id, "msg": "item already exists or write conflict"}));
+            _ => {
+                skipped += 1;
+                errors.push(json!({
+                    "id": id,
+                    "msg": format!("bulk write failed: {}", res.error.as_deref().unwrap_or("unknown error"))
+                }));
+            }
         }
     }
     Ok(Json(json!({

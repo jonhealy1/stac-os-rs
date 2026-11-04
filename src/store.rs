@@ -8,8 +8,8 @@ use opensearch::{
         IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts, IndicesGetMappingParts,
         IndicesPutMappingParts,
     },
-    CreateParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts, MgetParts, OpenSearch,
-    SearchParts,
+    BulkParts, CreateParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts, MgetParts,
+    OpenSearch, SearchParts,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -22,6 +22,13 @@ pub const ROOT_CATALOG_ID: &str = "root";
 /// Retries on optimistic-concurrency conflicts before giving up
 /// (callers map `false` to HTTP 409).
 const MAX_WRITE_RETRIES: usize = 5;
+
+/// Outcome of one op in a `bulk_write` request, in submission order.
+pub struct BulkOpResult {
+    /// Item-level status: 200 indexed / 201 created / 409 conflict / other.
+    pub status: u16,
+    pub error: Option<String>,
+}
 
 /// OpenSearch `_seq_no`/`_primary_term` stamp for conditional writes.
 #[derive(Clone, Copy)]
@@ -87,6 +94,12 @@ pub struct Store {
     /// `properties.datetime` and `start_datetime`/`end_datetime` is
     /// filtered on the range only — upstream's ranged-item semantics.
     use_datetime: bool,
+    /// `DATABASE_REFRESH` (default `true`): refresh policy applied to
+    /// every write. `true` refreshes inline before responding — same
+    /// read-after-write guarantee as `wait_for` but without parking the
+    /// request until the index's next refresh tick. `wait_for` only pays
+    /// off under sustained concurrent writes; `false` is ingest-only.
+    refresh: opensearch::params::Refresh,
 }
 
 impl Store {
@@ -98,6 +111,7 @@ impl Store {
             client: OpenSearch::new(transport),
             prefix: "stac".to_string(),
             use_datetime: true,
+            refresh: opensearch::params::Refresh::True,
         })
     }
 
@@ -112,6 +126,12 @@ impl Store {
     /// `datetime` whenever both are present on an item.
     pub fn with_use_datetime(mut self, use_datetime: bool) -> Self {
         self.use_datetime = use_datetime;
+        self
+    }
+
+    /// `DATABASE_REFRESH` — refresh policy for all write requests.
+    pub fn with_refresh(mut self, refresh: opensearch::params::Refresh) -> Self {
+        self.refresh = refresh;
         self
     }
 
@@ -222,7 +242,12 @@ impl Store {
                         "mappings": mappings
                     }))
                     .send()
-                    .await?;
+                    .await?
+                    // Status must be checked: a rejected create (e.g.
+                    // conflicting cluster index template) would otherwise
+                    // pass silently, and the first doc write would
+                    // auto-create the index with dynamic mappings.
+                    .error_for_status_code()?;
             } else {
                 // Index exists: apply additive mapping updates. Type
                 // changes to already-mapped fields (e.g. a legacy index
@@ -393,7 +418,7 @@ impl Store {
         let resp = self
             .client
             .delete(DeleteParts::IndexId(&index, node_id))
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?;
         // 404 on an absent node is fine; anything worse is not
@@ -580,7 +605,7 @@ impl Store {
         self.client
             .index(IndexParts::IndexId(&index, id))
             .body(doc)
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?
             .error_for_status_code()?;
@@ -647,7 +672,7 @@ impl Store {
             .if_seq_no(version.seq_no)
             .if_primary_term(version.primary_term)
             .body(doc)
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?;
         Ok(match resp.status_code() {
@@ -722,7 +747,7 @@ impl Store {
             .client
             .create(CreateParts::IndexId(&index, id))
             .body(doc)
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?;
         Ok(match resp.status_code() {
@@ -749,7 +774,7 @@ impl Store {
             .delete(DeleteParts::IndexId(&index, id))
             .if_seq_no(version.seq_no)
             .if_primary_term(version.primary_term)
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?;
         Ok(match resp.status_code() {
@@ -768,7 +793,7 @@ impl Store {
         let resp = self
             .client
             .delete(DeleteParts::IndexId(&index, id))
-            .refresh(opensearch::params::Refresh::WaitFor)
+            .refresh(self.refresh)
             .send()
             .await?;
         Ok(match resp.status_code() {
@@ -821,6 +846,86 @@ impl Store {
             .flatten()
             .filter(|d| d["found"] == true)
             .map(|d| d["_source"].clone())
+            .collect())
+    }
+
+    /// `_id`s from `ids` that already exist — one mget round-trip.
+    /// Batch-write preflight: replace N `get_document` existence checks.
+    pub async fn existing_ids(
+        &self,
+        index: &str,
+        ids: &[String],
+    ) -> Result<HashSet<String>, opensearch::Error> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let index = self.idx(index);
+        let resp = self
+            .client
+            .mget(MgetParts::Index(&index))
+            .body(json!({"ids": ids}))
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let body = resp.json::<Value>().await?;
+        Ok(body["docs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|d| d["found"] == true)
+            .filter_map(|d| d["_id"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// One `_bulk` request for many docs — a single round-trip and a
+    /// single refresh for the whole batch, vs N sequential writes each
+    /// waiting on `refresh=WaitFor`. `create` ops are `op_type=create`
+    /// (409 if the id exists); `index` ops are unconditional upserts.
+    /// Per-item results come back in submission order.
+    pub async fn bulk_write(
+        &self,
+        index: &str,
+        ops: &[(String, Value, bool)],
+    ) -> Result<Vec<BulkOpResult>, opensearch::Error> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let index = self.idx(index);
+        let mut body: Vec<opensearch::http::request::JsonBody<Value>> =
+            Vec::with_capacity(ops.len() * 2);
+        for (id, doc, create) in ops {
+            let action = if *create { "create" } else { "index" };
+            body.push(json!({action: {"_id": id}}).into());
+            body.push(doc.clone().into());
+        }
+        let resp = self
+            .client
+            .bulk(BulkParts::Index(&index))
+            .body(body)
+            .refresh(self.refresh)
+            .send()
+            .await?;
+        resp.error_for_status_code_ref()?;
+        let resp_body = resp.json::<Value>().await?;
+        Ok(resp_body["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                // Each entry is {"create"|"index": {"_id":..,"status":..,"error":{..}?}}
+                let op = item
+                    .as_object()
+                    .and_then(|m| m.values().next())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                BulkOpResult {
+                    status: op["status"].as_u64().unwrap_or(500) as u16,
+                    error: op["error"]["reason"]
+                        .as_str()
+                        .or_else(|| op["error"]["type"].as_str())
+                        .map(str::to_string),
+                }
+            })
             .collect())
     }
 
@@ -1103,7 +1208,7 @@ impl Store {
                     .if_seq_no(v.seq_no)
                     .if_primary_term(v.primary_term)
                     .body(node)
-                    .refresh(opensearch::params::Refresh::WaitFor)
+                    .refresh(self.refresh)
                     .send()
                     .await?
             }
@@ -1111,7 +1216,7 @@ impl Store {
                 self.client
                     .create(CreateParts::IndexId(&index, node_id))
                     .body(node)
-                    .refresh(opensearch::params::Refresh::WaitFor)
+                    .refresh(self.refresh)
                     .send()
                     .await?
             }

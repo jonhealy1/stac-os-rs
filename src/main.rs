@@ -35,7 +35,19 @@ async fn main() {
     let use_datetime = std::env::var("USE_DATETIME")
         .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "no"))
         .unwrap_or(true);
-    let store = store.with_use_datetime(use_datetime);
+    // `DATABASE_REFRESH` (default `true`): `true` refreshes inline —
+    // read-after-write without the `wait_for` park-until-tick cost on
+    // serial writes; `wait_for` for sustained concurrent write load;
+    // `false` for pure ingest (no read visibility guarantee).
+    let refresh = match std::env::var("DATABASE_REFRESH")
+        .map(|v| v.to_lowercase())
+        .as_deref()
+    {
+        Ok("wait_for") => opensearch::params::Refresh::WaitFor,
+        Ok("false") | Ok("0") | Ok("no") => opensearch::params::Refresh::False,
+        _ => opensearch::params::Refresh::True,
+    };
+    let store = store.with_use_datetime(use_datetime).with_refresh(refresh);
 
     let state = Arc::new(AppState {
         base_url: base_url.clone(),
