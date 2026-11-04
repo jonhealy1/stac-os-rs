@@ -5,19 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-11-03
+## [Unreleased]
 
 ### Added
 
-- `/docs` — FastAPI-style Swagger UI endpoint (same page as `/api.html`)
-- `STAC_PORT` env var sets the API bind port (was hardcoded `3000`)
-- `GET /catalogs/{catalog_id}/queryables` — catalog-scoped queryables
-  JSON Schema (404 for missing catalogs), matching the upstream
-  catalogs-extension route surface
-- Invariant validation on `/catalogs/{catalog_id}/children` responses:
-  response links must carry `root`/`parent`/`self` and every child must
-  have a `self` link (violations surface as 500, matching the upstream
-  `Children` model contract)
 - `DATABASE_REFRESH` env var controls the write refresh policy
   (`true`/`false`/`wait_for`), replacing the hardcoded `wait_for` that
   parked every write until the index's next refresh tick. Default is
@@ -37,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POST /collections/{id}/bulk_items`) now issues a single OpenSearch
   `_bulk` request plus one `mget` existence preflight — was N sequential
   `get`+`create` round-trips each waiting for an index refresh
+
+## [0.4.0] - 2026-11-03
+
+### Added
+
+- `/docs` — FastAPI-style Swagger UI endpoint (same page as `/api.html`)
+- `STAC_PORT` env var sets the API bind port (was hardcoded `3000`)
+- `GET /catalogs/{catalog_id}/queryables` — catalog-scoped queryables
+  JSON Schema (404 for missing catalogs), matching the upstream
+  catalogs-extension route surface
+- Invariant validation on `/catalogs/{catalog_id}/children` responses:
+  response links must carry `root`/`parent`/`self` and every child must
+  have a `self` link (violations surface as 500, matching the upstream
+  `Children` model contract)
+
+### Changed
+
 - `src/handlers.rs` (~5,200 lines) split into `src/handlers/` modules by
   resource domain — `catalogs.rs`, `collections.rs`, `items.rs`,
   `search.rs`, `metadata.rs`, plus `common.rs` for the shared plumbing
