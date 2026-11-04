@@ -35,17 +35,17 @@ async fn main() {
     let use_datetime = std::env::var("USE_DATETIME")
         .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "no"))
         .unwrap_or(true);
-    // `DATABASE_REFRESH` (default `true`): `true` refreshes inline —
-    // read-after-write without the `wait_for` park-until-tick cost on
-    // serial writes; `wait_for` for sustained concurrent write load;
-    // `false` for pure ingest (no read visibility guarantee).
+    // `DATABASE_REFRESH` (default `false`, matching upstream sfeos):
+    // `false` accepts ~refresh_interval search lag on writes (GET-by-id
+    // stays real-time) — the fast ingest setting. `true` refreshes
+    // inline before responding; `wait_for` parks until the next tick.
     let refresh = match std::env::var("DATABASE_REFRESH")
         .map(|v| v.to_lowercase())
         .as_deref()
     {
+        Ok("true") | Ok("1") | Ok("yes") => opensearch::params::Refresh::True,
         Ok("wait_for") => opensearch::params::Refresh::WaitFor,
-        Ok("false") | Ok("0") | Ok("no") => opensearch::params::Refresh::False,
-        _ => opensearch::params::Refresh::True,
+        _ => opensearch::params::Refresh::False,
     };
     let store = store.with_use_datetime(use_datetime).with_refresh(refresh);
 

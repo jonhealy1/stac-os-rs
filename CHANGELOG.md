@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response links must carry `root`/`parent`/`self` and every child must
   have a `self` link (violations surface as 500, matching the upstream
   `Children` model contract)
-- `DATABASE_REFRESH` env var controls the refresh policy on every write
-  (`true`/`wait_for`/`false`, default `true`). `wait_for` was previously
-  hardcoded — it parked each write until the index's next scheduled
-  refresh, dominating serial ingest latency
+- `DATABASE_REFRESH` env var controls the write refresh policy
+  (`true`/`false`/`wait_for`), replacing the hardcoded `wait_for` that
+  parked every write until the index's next refresh tick. Default is
+  `false`, matching upstream sfeos — hierarchy link/unlink and PATCH
+  writes force `true` like upstream's `patch_item`; `compose.yml` sets
+  `true` mirroring sfeos's own compose override
 - FeatureCollection batch POST on the catalog-scoped items route
   (`POST /catalogs/{id}/collections/{col}/items`), matching the root
   route's existing behavior

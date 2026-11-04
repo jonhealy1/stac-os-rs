@@ -827,15 +827,28 @@ pub async fn patch_root_item(
             }
             require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
+            // Upstream `patch_item` forces refresh=True — a patched item
+            // must be searchable immediately regardless of DATABASE_REFRESH.
             let applied = if headers.contains_key(header::IF_MATCH) {
                 state
                     .store
-                    .index_document_versioned(ITEMS_INDEX, &key, &doc, version)
+                    .index_document_versioned_with(
+                        ITEMS_INDEX,
+                        &key,
+                        &doc,
+                        version,
+                        opensearch::params::Refresh::True,
+                    )
                     .await?
             } else {
                 state
                     .store
-                    .replace_document(ITEMS_INDEX, &key, &doc)
+                    .replace_document_with(
+                        ITEMS_INDEX,
+                        &key,
+                        &doc,
+                        opensearch::params::Refresh::True,
+                    )
                     .await?
             };
             if !applied {

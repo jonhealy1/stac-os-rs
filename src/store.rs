@@ -94,11 +94,14 @@ pub struct Store {
     /// `properties.datetime` and `start_datetime`/`end_datetime` is
     /// filtered on the range only — upstream's ranged-item semantics.
     use_datetime: bool,
-    /// `DATABASE_REFRESH` (default `true`): refresh policy applied to
-    /// every write. `true` refreshes inline before responding — same
-    /// read-after-write guarantee as `wait_for` but without parking the
-    /// request until the index's next refresh tick. `wait_for` only pays
-    /// off under sustained concurrent writes; `false` is ingest-only.
+    /// `DATABASE_REFRESH` (default `false`, matching upstream sfeos):
+    /// refresh policy applied to doc writes. `false` gives up-to-`refresh_
+    /// interval` search lag — GET-by-id is still real-time — which is
+    /// why upstream accepts it as the default. `true` refreshes inline
+    /// before responding; `wait_for` parks until the next tick and only
+    /// pays off under sustained concurrent writes. Sites needing
+    /// same-flow read-after-write (hierarchy edges, PATCH) force `True`
+    /// regardless — see `put_node_versioned`/`replace_document_with`.
     refresh: opensearch::params::Refresh,
 }
 
@@ -111,7 +114,7 @@ impl Store {
             client: OpenSearch::new(transport),
             prefix: "stac".to_string(),
             use_datetime: true,
-            refresh: opensearch::params::Refresh::True,
+            refresh: opensearch::params::Refresh::False,
         })
     }
 
@@ -665,6 +668,21 @@ impl Store {
         doc: impl Serialize,
         version: DocVersion,
     ) -> Result<bool, opensearch::Error> {
+        self.index_document_versioned_with(index, id, doc, version, self.refresh)
+            .await
+    }
+
+    /// Explicit refresh — mirrors upstream's per-call `refresh` kwarg
+    /// (their `patch_item` forces `refresh=True`; PATCH paths here do
+    /// the same so a patched doc is searchable immediately).
+    pub async fn index_document_versioned_with(
+        &self,
+        index: &str,
+        id: &str,
+        doc: impl Serialize,
+        version: DocVersion,
+        refresh: opensearch::params::Refresh,
+    ) -> Result<bool, opensearch::Error> {
         let index = self.idx(index);
         let resp = self
             .client
@@ -672,7 +690,7 @@ impl Store {
             .if_seq_no(version.seq_no)
             .if_primary_term(version.primary_term)
             .body(doc)
-            .refresh(self.refresh)
+            .refresh(refresh)
             .send()
             .await?;
         Ok(match resp.status_code() {
@@ -695,13 +713,25 @@ impl Store {
         id: &str,
         doc: &(impl Serialize + Sync),
     ) -> Result<bool, opensearch::Error> {
+        self.replace_document_with(index, id, doc, self.refresh)
+            .await
+    }
+
+    /// Explicit-refresh variant — PATCH paths pass `Refresh::True`.
+    pub async fn replace_document_with(
+        &self,
+        index: &str,
+        id: &str,
+        doc: &(impl Serialize + Sync),
+        refresh: opensearch::params::Refresh,
+    ) -> Result<bool, opensearch::Error> {
         for _ in 0..MAX_WRITE_RETRIES {
             let Some((_, version)) = self.get_document_versioned(index, id).await? else {
                 // Deleted between the caller's 404 check and now.
                 return Ok(false);
             };
             if self
-                .index_document_versioned(index, id, doc, version)
+                .index_document_versioned_with(index, id, doc, version, refresh)
                 .await?
             {
                 return Ok(true);
@@ -1194,6 +1224,11 @@ impl Store {
     /// Optimistic-concurrency write. `None` version = create-if-absent
     /// (`op_type=create`, conflicts if a node appeared meanwhile).
     /// Returns `false` on a version conflict — retry with a fresh read.
+    ///
+    /// Always `refresh=True`: link/unlink writes are low-volume, and the
+    /// edge must be visible to the `terms` searches that render scoped
+    /// listings and children in immediate follow-up reads regardless of
+    /// `DATABASE_REFRESH`.
     async fn put_node_versioned(
         &self,
         node_id: &str,
@@ -1201,6 +1236,7 @@ impl Store {
         version: Option<DocVersion>,
     ) -> Result<bool, opensearch::Error> {
         let index = self.idx(HIERARCHY_INDEX);
+        let refresh = opensearch::params::Refresh::True;
         let resp = match version {
             Some(v) => {
                 self.client
@@ -1208,7 +1244,7 @@ impl Store {
                     .if_seq_no(v.seq_no)
                     .if_primary_term(v.primary_term)
                     .body(node)
-                    .refresh(self.refresh)
+                    .refresh(refresh)
                     .send()
                     .await?
             }
@@ -1216,7 +1252,7 @@ impl Store {
                 self.client
                     .create(CreateParts::IndexId(&index, node_id))
                     .body(node)
-                    .refresh(self.refresh)
+                    .refresh(refresh)
                     .send()
                     .await?
             }

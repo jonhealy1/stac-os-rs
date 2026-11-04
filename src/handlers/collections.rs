@@ -1135,15 +1135,27 @@ pub async fn patch_root_collection(
             collection_search_fields(obj);
         }
     }
+    // Upstream `patch_item` forces refresh=True — same rationale here.
     let applied = if headers.contains_key(header::IF_MATCH) {
         state
             .store
-            .index_document_versioned(COLLECTIONS_INDEX, &collection_id, &doc, version)
+            .index_document_versioned_with(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &doc,
+                version,
+                opensearch::params::Refresh::True,
+            )
             .await?
     } else {
         state
             .store
-            .replace_document(COLLECTIONS_INDEX, &collection_id, &doc)
+            .replace_document_with(
+                COLLECTIONS_INDEX,
+                &collection_id,
+                &doc,
+                opensearch::params::Refresh::True,
+            )
             .await?
     };
     if !applied {
