@@ -203,7 +203,7 @@ All variables are read once at startup — changing them requires a restart.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `USE_DATETIME` | `false` = items carrying `start_datetime`/`end_datetime` are datetime-filtered on the range alone, ignoring `properties.datetime` (matches upstream `USE_DATETIME=false` query semantics). | `true` | Optional |
-| `DATABASE_REFRESH` | Refresh policy on every write: `true` refreshes inline before responding (read-after-write without the `wait_for` park-until-tick cost on serial writes), `wait_for` suits sustained concurrent write load, `false` is fastest but gives no immediate read visibility — ingest pipelines only. | `true` | Optional |
+| `DATABASE_REFRESH` | Refresh policy on writes: `false` accepts up-to-`refresh_interval` search lag (GET-by-id stays real-time) — the fast ingest setting; `true` refreshes inline before responding; `wait_for` parks until the next refresh tick. Hierarchy link/unlink and PATCH writes force `true` regardless — they need same-flow read-after-write (upstream `patch_item` forces it too). `compose.yml` sets `true`, mirroring sfeos's own compose override. | `false` | Optional |
 
 Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
 

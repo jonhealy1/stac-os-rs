@@ -40,7 +40,13 @@ pub async fn test_state_full(
 ) -> Option<Arc<AppState>> {
     let url =
         std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
-    let store = Store::connect(&url).ok()?.with_index_prefix(uniq("it"));
+    // Tests write-then-search constantly — pin inline refresh so reads
+    // never race the index's refresh interval (production default is
+    // `DATABASE_REFRESH=false`, which this deliberately overrides).
+    let store = Store::connect(&url)
+        .ok()?
+        .with_index_prefix(uniq("it"))
+        .with_refresh(opensearch::params::Refresh::True);
     store.ensure_indices().await.ok()?;
     Some(Arc::new(AppState {
         base_url: "http://test".to_string(),

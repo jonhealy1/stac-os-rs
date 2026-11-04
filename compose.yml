@@ -8,6 +8,9 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       ENABLE_TRANSACTIONS_EXTENSIONS: "true"
       ENABLE_COLLECTIONS_SEARCH_ROUTE: "true"
+      # Upstream's docker-compose sets the same: dev parity over raw
+      # ingest speed (the sfeos default is `false`).
+      DATABASE_REFRESH: "true"
     depends_on:
       opensearch:
         condition: service_healthy

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `DATABASE_REFRESH` env var controls the write refresh policy
+  (`true`/`false`/`wait_for`), replacing the hardcoded `wait_for` that
+  parked every write until the index's next refresh tick. Default is
+  `false`, matching upstream sfeos — hierarchy link/unlink and PATCH
+  writes force `true` like upstream's `patch_item`; `compose.yml` sets
+  `true` mirroring sfeos's own compose override
+- FeatureCollection batch POST on the catalog-scoped items route
+  (`POST /catalogs/{id}/collections/{col}/items`), matching the root
+  route's existing behavior
+
+### Changed
+
+- `/search` default page size now honors `STAC_DEFAULT_ITEM_LIMIT`
+  (default 10) instead of a hardcoded 100 — the env var already
+  documented as covering `/search` and used by the items listing
+- Batch item ingest (`POST .../items` with a FeatureCollection body, and
+  `POST /collections/{id}/bulk_items`) now issues a single OpenSearch
+  `_bulk` request plus one `mget` existence preflight — was N sequential
+  `get`+`create` round-trips each waiting for an index refresh
+
 ## [0.4.0] - 2026-11-03
 
 ### Added
@@ -18,20 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response links must carry `root`/`parent`/`self` and every child must
   have a `self` link (violations surface as 500, matching the upstream
   `Children` model contract)
-- `DATABASE_REFRESH` env var controls the refresh policy on every write
-  (`true`/`wait_for`/`false`, default `true`). `wait_for` was previously
-  hardcoded — it parked each write until the index's next scheduled
-  refresh, dominating serial ingest latency
-- FeatureCollection batch POST on the catalog-scoped items route
-  (`POST /catalogs/{id}/collections/{col}/items`), matching the root
-  route's existing behavior
 
 ### Changed
 
-- Batch item ingest (`POST .../items` with a FeatureCollection body, and
-  `POST /collections/{id}/bulk_items`) now issues a single OpenSearch
-  `_bulk` request plus one `mget` existence preflight — was N sequential
-  `get`+`create` round-trips each waiting for an index refresh
 - `src/handlers.rs` (~5,200 lines) split into `src/handlers/` modules by
   resource domain — `catalogs.rs`, `collections.rs`, `items.rs`,
   `search.rs`, `metadata.rs`, plus `common.rs` for the shared plumbing
