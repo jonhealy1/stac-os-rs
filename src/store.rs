@@ -57,8 +57,8 @@ pub const ITEMS_INDEX: &str = "items";
 const MAX_DESCENDANT_DEPTH: usize = 25;
 /// Cap on children fetched per query (proper pagination is future work).
 const MAX_CHILDREN: usize = 10_000;
-/// Default / max page size for item search.
-pub const DEFAULT_SEARCH_LIMIT: u64 = 100;
+/// Max page size for item search. The default comes from the caller —
+/// `AppState::default_item_limit` (`STAC_DEFAULT_ITEM_LIMIT`).
 pub const MAX_SEARCH_LIMIT: u64 = 10_000;
 
 /// STAC node type tracked in the hierarchy DAG.
@@ -1051,11 +1051,12 @@ impl Store {
         collections: &[String],
         search: &Search,
         extra_filters: Vec<Value>,
+        default_limit: u64,
     ) -> Result<(Vec<Map<String, Value>>, u64), opensearch::Error> {
         let limit = search
             .items
             .limit
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .unwrap_or(default_limit)
             .min(MAX_SEARCH_LIMIT);
         let offset = search_offset(search);
 

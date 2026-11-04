@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `/search` default page size now honors `STAC_DEFAULT_ITEM_LIMIT`
+  (default 10) instead of a hardcoded 100 — the env var already
+  documented as covering `/search` and used by the items listing
 - Batch item ingest (`POST .../items` with a FeatureCollection body, and
   `POST /collections/{id}/bulk_items`) now issues a single OpenSearch
   `_bulk` request plus one `mget` existence preflight — was N sequential

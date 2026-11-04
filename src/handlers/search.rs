@@ -1,8 +1,6 @@
 // src/handlers/search.rs
 use super::common::*;
-use crate::store::{
-    search_offset, CATALOGS_INDEX, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, ROOT_CATALOG_ID,
-};
+use crate::store::{search_offset, CATALOGS_INDEX, MAX_SEARCH_LIMIT, ROOT_CATALOG_ID};
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
@@ -242,7 +240,12 @@ async fn run_scoped_search(
 
     let (mut items, matched) = state
         .store
-        .search_items(&search.collections, &search, extra_filters)
+        .search_items(
+            &search.collections,
+            &search,
+            extra_filters,
+            state.default_item_limit,
+        )
         .await?;
     let base = &state.base_url;
     let link_scope = (scope_id != ROOT_CATALOG_ID).then_some(scope_id);
@@ -280,7 +283,7 @@ async fn run_scoped_search(
     let limit = search
         .items
         .limit
-        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .unwrap_or(state.default_item_limit)
         .min(MAX_SEARCH_LIMIT);
     let offset = search_offset(&search);
     let get_uri = req.as_ref().filter(|(_, is_get)| *is_get).map(|(u, _)| u);

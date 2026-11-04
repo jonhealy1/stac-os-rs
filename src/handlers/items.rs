@@ -299,7 +299,12 @@ async fn items_page(
     }
     let (mut items, matched) = state
         .store
-        .search_items(collections, &search, extra_filters)
+        .search_items(
+            collections,
+            &search,
+            extra_filters,
+            state.default_item_limit,
+        )
         .await?;
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
