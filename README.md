@@ -15,6 +15,7 @@ A STAC API Opensearch server built with Rust
   - [Configuration Reference](#configuration-reference)
 - [Extending (custom routes)](#extending-custom-routes)
 - [Sample Data](#sample-data)
+- [Load Testing](#load-testing)
 - [TODO](#todo)
 - [Changelog](CHANGELOG.md)
 
@@ -262,6 +263,26 @@ python3 scripts/ingest_sample_data.py        # STAC_API_URL to override :3000
 ```
 
 Then try scoped search: `POST /catalogs/earth-observation/search` returns its 4 satellite items; `POST /catalogs/search` searches the whole registry.
+
+## Load Testing
+
+Benchmarked against [stac-fastapi-os](https://github.com/stac-utils/stac-fastapi-elasticsearch-opensearch) (the Python sfeos upstream) and [stac-fastapi-pgstac](https://github.com/stac-utils/stac-fastapi-pgstac) using [`staclabs/stac-api-load-testing`](https://github.com/staclabs/stac-api-load-testing) — same Locust workload against all three, 1,000 items each, `DATABASE_REFRESH=true` on both OpenSearch backends.
+
+**v0.5.0, 0 failures across all runs:**
+
+| backend | users | reqs | fails | med (ms) | p95 | p99 | rps |
+|---|---|---|---|---|---|---|---|
+| stac-fastapi-pgstac | 10 | 14,188 | 0 | 16 | 130 | 160 | 236 |
+| stac-fastapi-pgstac | 50 | 16,351 | 0 | 33 | 670 | 2,200 | 272 |
+| stac-fastapi-pgstac | 100 | 16,450 | 0 | 62 | 1,300 | 4,600 | 274 |
+| stac-fastapi-os | 10 | 57,608 | 0 | 6 | 22 | 36 | 960 |
+| stac-fastapi-os | 50 | 70,668 | 0 | 37 | 81 | 120 | 1,177 |
+| stac-fastapi-os | 100 | 72,076 | 0 | 72 | 140 | 180 | 1,200 |
+| **stac-os-rs** | 10 | 123,832 | 0 | 3 | 9 | 11 | **2,063** |
+| **stac-os-rs** | 50 | 168,329 | 0 | 15 | 31 | 39 | **2,803** |
+| **stac-os-rs** | 100 | 166,015 | 0 | 31 | 55 | 68 | **2,765** |
+
+~2.3× the upstream Python backend's throughput and ~10× stac-fastapi-pgstac's, with the worst p99 (68ms at 100 users) still below stac-fastapi-os's median at the same concurrency. Numbers are from a single-node dev cluster — treat as relative, not absolute.
 
 ## TODO
 
