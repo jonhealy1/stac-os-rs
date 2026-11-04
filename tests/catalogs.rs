@@ -3009,6 +3009,93 @@ async fn test_catalog_transaction_routes_present_by_default() {
     assert_eq!(s, StatusCode::CREATED);
 }
 
+// --- Scoped FeatureCollection batch POST ---
+
+#[tokio::test]
+async fn test_scoped_items_feature_collection() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("sfc-cat");
+    let col = uniq("sfc-col");
+    post_catalog(&app, &cat).await;
+    post_collection(&app, &cat, collection(&col)).await;
+    let (a, b) = (uniq("sfc-a"), uniq("sfc-b"));
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(json!({
+            "type": "FeatureCollection",
+            "features": [item(&a, &col), item(&b, &col)]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(body["type"], "FeatureCollection");
+    assert_eq!(body["features"].as_array().unwrap().len(), 2);
+    for id in [&a, &b] {
+        let (s, body) = call(
+            &app,
+            "GET",
+            &format!("/catalogs/{cat}/collections/{col}/items/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["id"], *id);
+    }
+
+    // second batch with an existing id -> 409, nothing new written
+    let new_id = uniq("sfc-new");
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(json!({
+            "type": "FeatureCollection",
+            "features": [item(&new_id, &col), item(&a, &col)]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/collections/{col}/items/{new_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// FeatureCollection POST to a collection outside the catalog scope.
+#[tokio::test]
+async fn test_scoped_items_feature_collection_wrong_catalog() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("sfx-cat");
+    let other = uniq("sfx-other");
+    let col = uniq("sfx-col");
+    post_catalog(&app, &cat).await;
+    post_catalog(&app, &other).await;
+    post_collection(&app, &other, collection(&col)).await;
+
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(json!({
+            "type": "FeatureCollection",
+            "features": [item(&uniq("sfx-i"), &col)]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
 // Not portable (Python-internal mocks): test_catalog_create_logs_error_with_traceback,
 // test_catalog_delete_logs_error_with_traceback, test_collection_index_logs_error_with_traceback,
 // test_catalog_conformance_omits_transaction_uri_from_client (mock client),

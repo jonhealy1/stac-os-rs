@@ -18,9 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response links must carry `root`/`parent`/`self` and every child must
   have a `self` link (violations surface as 500, matching the upstream
   `Children` model contract)
+- `DATABASE_REFRESH` env var controls the refresh policy on every write
+  (`true`/`wait_for`/`false`, default `true`). `wait_for` was previously
+  hardcoded — it parked each write until the index's next scheduled
+  refresh, dominating serial ingest latency
+- FeatureCollection batch POST on the catalog-scoped items route
+  (`POST /catalogs/{id}/collections/{col}/items`), matching the root
+  route's existing behavior
 
 ### Changed
 
+- Batch item ingest (`POST .../items` with a FeatureCollection body, and
+  `POST /collections/{id}/bulk_items`) now issues a single OpenSearch
+  `_bulk` request plus one `mget` existence preflight — was N sequential
+  `get`+`create` round-trips each waiting for an index refresh
 - `src/handlers.rs` (~5,200 lines) split into `src/handlers/` modules by
   resource domain — `catalogs.rs`, `collections.rs`, `items.rs`,
   `search.rs`, `metadata.rs`, plus `common.rs` for the shared plumbing

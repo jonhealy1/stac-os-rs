@@ -3,7 +3,7 @@ mod common;
 
 use axum::http::StatusCode;
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[tokio::test]
 async fn test_list_collections() {
@@ -560,4 +560,272 @@ async fn test_collection_sortables() {
     // 404 for a missing collection
     let (s, _) = call(&app, "GET", "/collections/nope/sortables", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+// --- FeatureCollection batch POST (single _bulk write) ---
+
+fn feature_collection(items: Vec<Value>) -> Value {
+    json!({"type": "FeatureCollection", "features": items})
+}
+
+#[tokio::test]
+async fn test_post_items_feature_collection() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("fc-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let (a, b) = (uniq("fc-a"), uniq("fc-b"));
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![item(&a, &col), item(&b, &col)])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(body["type"], "FeatureCollection");
+    let returned: Vec<&str> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert_eq!(returned.len(), 2);
+    for id in [&a, &b] {
+        assert!(returned.contains(&id.as_str()));
+        let (s, body) = call(&app, "GET", &format!("/collections/{col}/items/{id}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["collection"], col);
+    }
+}
+
+/// All-or-nothing: a batch containing an existing id 409s and writes
+/// nothing new.
+#[tokio::test]
+async fn test_post_items_feature_collection_conflict_rolls_back() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("fcx-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let existing = uniq("fcx-old");
+    call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(item(&existing, &col)),
+    )
+    .await;
+
+    let new_id = uniq("fcx-new");
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![
+            item(&new_id, &col),
+            item(&existing, &col),
+        ])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // The new id must not have been written.
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items/{new_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// Duplicate ids inside one batch collapse to a single write (last wins).
+#[tokio::test]
+async fn test_post_items_feature_collection_in_batch_dedup() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("fcd-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let id = uniq("fcd-item");
+    let mut first = item(&id, &col);
+    first["properties"]["datetime"] = json!("2020-01-01T00:00:00Z");
+    let mut second = item(&id, &col);
+    second["properties"]["datetime"] = json!("2021-01-01T00:00:00Z");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![first, second])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(body["features"].as_array().unwrap().len(), 1);
+    let (_, doc) = call(&app, "GET", &format!("/collections/{col}/items/{id}"), None).await;
+    assert_eq!(doc["properties"]["datetime"], "2021-01-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn test_post_items_feature_collection_missing_collection() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("fc-none");
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![item(&uniq("fc-o"), &col)])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// A malformed feature in the batch 400s and writes nothing.
+#[tokio::test]
+async fn test_post_items_feature_collection_bad_feature() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("fcb-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let good = uniq("fcb-good");
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![
+            item(&good, &col),
+            // valid Feature shape, but bound to another collection —
+            // validate_item_collection rejects the identity mismatch
+            item(&uniq("fcb-bad"), "not-this-collection"),
+        ])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items/{good}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+// --- /collections/{id}/bulk_items (single _bulk write) ---
+
+#[tokio::test]
+async fn test_bulk_items_insert_and_skip() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("bi-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let (a, b) = (uniq("bi-a"), uniq("bi-b"));
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/bulk_items"),
+        Some(json!({"items": {a.clone(): item(&a, &col), b.clone(): item(&b, &col)}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["success"], 2);
+    assert_eq!(body["received"], 2);
+    assert_eq!(body["skipped"], 0);
+    for id in [&a, &b] {
+        let (s, _) = call(&app, "GET", &format!("/collections/{col}/items/{id}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Re-post same batch -> skipped, not errors.
+    let c = uniq("bi-c");
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/bulk_items"),
+        Some(json!({"items": {a.clone(): item(&a, &col), c.clone(): item(&c, &col)}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["success"], 1);
+    assert_eq!(body["skipped"], 1);
+    let (s, _) = call(&app, "GET", &format!("/collections/{col}/items/{c}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_bulk_items_upsert() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("bu-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let id = uniq("bu-item");
+    call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/bulk_items"),
+        Some(json!({"items": {id.clone(): item(&id, &col)}})),
+    )
+    .await;
+
+    // upsert overwrites instead of skipping
+    let mut upd = item(&id, &col);
+    upd["properties"]["datetime"] = json!("2024-06-01T00:00:00Z");
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/bulk_items"),
+        Some(json!({"method": "upsert", "items": {id.clone(): upd}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["success"], 1);
+    assert_eq!(body["skipped"], 0);
+    let (_, doc) = call(&app, "GET", &format!("/collections/{col}/items/{id}"), None).await;
+    assert_eq!(doc["properties"]["datetime"], "2024-06-01T00:00:00Z");
+}
+
+/// Malformed admission errors land in `errors` without blocking the
+/// valid items in the same payload.
+#[tokio::test]
+async fn test_bulk_items_partial_errors() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let col = uniq("bpe-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let good = uniq("bpe-good");
+    let bad_col = uniq("bpe-other");
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/bulk_items"),
+        Some(json!({"items": {
+            good.clone(): item(&good, &col),
+            "wrong-col": item(&uniq("bpe-w"), &bad_col),
+            "no-id": {"type": "Feature", "geometry": {"type": "Point", "coordinates": [0.0, 0.0]}, "properties": {"datetime": "2020-01-01T00:00:00Z"}},
+        }})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["success"], 1);
+    assert_eq!(body["received"], 3);
+    assert_eq!(body["errors"].as_array().unwrap().len(), 2);
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items/{good}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
 }
