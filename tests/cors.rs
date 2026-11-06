@@ -39,10 +39,7 @@ async fn preflight_allows_cross_origin_spa() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-        "*"
-    );
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
     let methods = resp.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
         .to_str()
         .unwrap();
