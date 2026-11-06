@@ -183,6 +183,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             }),
         )
         .layer(axum::middleware::from_fn(etag_content_coding))
+        // Permissive CORS — matches upstream's CORSMiddleware defaults and
+        // lets browser SPAs (STAC Browser) hit the API cross-origin.
+        // Outermost layer so it answers OPTIONS preflights itself.
+        .layer(tower_http::cors::CorsLayer::permissive())
 }
 
 /// Response-side ETag finishing: when the body is content-encoded

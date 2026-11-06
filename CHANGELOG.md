@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Permissive CORS middleware (`tower_http::cors::CorsLayer::permissive()`)
+  applied outermost in `build_app` — OPTIONS preflights and cross-origin
+  requests from browser SPAs (e.g. STAC Browser) now succeed; matches
+  upstream sfeos's default `CORSMiddleware` configuration
+- `tests/cors.rs` — OpenSearch-free smoke test asserting preflight
+  `Access-Control-Allow-*` headers
+
 ## [0.5.0] - 2026-11-04
 
 ### Added
