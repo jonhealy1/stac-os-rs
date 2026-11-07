@@ -79,14 +79,21 @@ async fn main() {
                     .collect()
             })
             .unwrap_or_default(),
-        validator: match env_flag("ENABLE_STAC_VALIDATOR") {
-            true => Some(tokio::sync::Mutex::new(
-                stac_validate::Validator::new()
-                    .await
-                    .expect("ENABLE_STAC_VALIDATOR is set but the validator failed to initialize"),
-            )),
-            false => None,
+        validators: match env_flag("ENABLE_STAC_VALIDATOR") {
+            true => {
+                let mut pool = Vec::with_capacity(stac_os_rs::handlers::VALIDATOR_POOL_SIZE);
+                for _ in 0..pool.capacity() {
+                    pool.push(tokio::sync::Mutex::new(
+                        stac_validate::Validator::new().await.expect(
+                            "ENABLE_STAC_VALIDATOR is set but the validator failed to initialize",
+                        ),
+                    ));
+                }
+                pool
+            }
+            false => Vec::new(),
         },
+        require_if_match: env_flag("REQUIRE_IF_MATCH"),
     });
     let app = build_app(state);
 

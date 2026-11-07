@@ -219,13 +219,13 @@ pub async fn update_catalog(
             catalog.id
         )));
     }
-    validate_stac_doc(&state, &catalog).await?;
     let (_, version) = state
         .store
         .get_document_versioned(CATALOGS_INDEX, &catalog_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(catalog_id.clone()))?;
-    require_if_match(&headers, &etag_of(&state, CATALOGS_INDEX, &version))?;
+    require_if_match(&state, &headers, &etag_of(&state, CATALOGS_INDEX, &version))?;
+    validate_stac_doc(&state, &catalog).await?;
     filter_stored_catalog_links(&mut catalog.links, &state.base_url);
     // Update keeps the stored edges — `parent_ids` in the body is ignored.
     catalog.additional_fields.remove("parent_ids");
@@ -660,7 +660,7 @@ pub async fn disband_catalog(
         .get_document_versioned(CATALOGS_INDEX, &catalog_id)
         .await?;
     if let Some((_, version)) = &current {
-        require_if_match(&headers, &etag_of(&state, CATALOGS_INDEX, version))?;
+        require_if_match(&state, &headers, &etag_of(&state, CATALOGS_INDEX, version))?;
         // Atomic check-and-delete — a raced write between our read
         // and the delete surfaces as 412 *before* any child edges
         // are touched.

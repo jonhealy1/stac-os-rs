@@ -305,13 +305,17 @@ pub async fn update_scoped_collection(
             collection.id
         )));
     }
-    validate_stac_doc(&state, &collection).await?;
     let (_, version) = state
         .store
         .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
-    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    require_if_match(
+        &state,
+        &headers,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+    )?;
+    validate_stac_doc(&state, &collection).await?;
     let applied = if headers.contains_key(header::IF_MATCH) {
         state
             .store
@@ -972,7 +976,6 @@ pub async fn update_root_collection(
             collection.id
         )));
     }
-    validate_stac_doc(&state, &collection).await?;
     let Some((_, version)) = state
         .store
         .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
@@ -981,7 +984,12 @@ pub async fn update_root_collection(
     else {
         return Err(ApiError::NotFound(collection_id));
     };
-    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    require_if_match(
+        &state,
+        &headers,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+    )?;
+    validate_stac_doc(&state, &collection).await?;
     // With If-Match the write is conditioned on the version that
     // satisfied the check — check and write are one atomic step.
     let applied = if headers.contains_key(header::IF_MATCH) {
@@ -1052,7 +1060,11 @@ pub async fn delete_root_collection(
     else {
         return Err(ApiError::NotFound(collection_id));
     };
-    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
+    require_if_match(
+        &state,
+        &headers,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+    )?;
     state
         .store
         .delete_items_by_collection(&collection_id)
@@ -1116,6 +1128,11 @@ pub async fn patch_root_collection(
         .await?
         .filter(|t| is_collection_doc(&t.0))
         .ok_or_else(|| ApiError::NotFound(collection_id.clone()))?;
+    require_if_match(
+        &state,
+        &headers,
+        &etag_of(&state, COLLECTIONS_INDEX, &version),
+    )?;
     apply_patch(
         &mut doc,
         headers
@@ -1136,7 +1153,6 @@ pub async fn patch_root_collection(
     // Schema-validate the merged result before our derived fields
     // (bbox_shape) are injected.
     validate_stac_doc(&state, &doc).await?;
-    require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
     if state.collections_search_enabled() {
         if let Some(obj) = doc.as_object_mut() {
             collection_search_fields(obj);

@@ -38,18 +38,25 @@ pub async fn test_state_full(
     enable_transactions: bool,
     hide_alternate_parents: bool,
 ) -> Option<Arc<AppState>> {
-    test_state_opts(enable_transactions, hide_alternate_parents, false).await
+    test_state_opts(enable_transactions, hide_alternate_parents, false, false).await
 }
 
 /// `ENABLE_STAC_VALIDATOR=true` variant — write bodies are schema-validated.
 pub async fn test_state_validated() -> Option<Arc<AppState>> {
-    test_state_opts(true, false, true).await
+    test_state_opts(true, false, true, false).await
+}
+
+/// `ENABLE_STAC_VALIDATOR` + `REQUIRE_IF_MATCH` variant.
+pub async fn test_app_validated_if_match() -> Option<(Router, Arc<AppState>)> {
+    let state = test_state_opts(true, false, true, true).await?;
+    Some((build_app(state.clone()), state))
 }
 
 async fn test_state_opts(
     enable_transactions: bool,
     hide_alternate_parents: bool,
     enable_validator: bool,
+    require_if_match: bool,
 ) -> Option<Arc<AppState>> {
     let url =
         std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
@@ -75,14 +82,16 @@ async fn test_state_opts(
         max_item_limit: None,
         excluded_item_fields: Vec::new(),
         excluded_queryables: Vec::new(),
-        validator: if enable_validator {
-            stac_validate::Validator::new()
-                .await
-                .ok()
-                .map(tokio::sync::Mutex::new)
+        validators: if enable_validator {
+            vec![tokio::sync::Mutex::new(
+                stac_validate::Validator::new()
+                    .await
+                    .expect("validator init failed"),
+            )]
         } else {
-            None
+            Vec::new()
         },
+        require_if_match,
     }))
 }
 
