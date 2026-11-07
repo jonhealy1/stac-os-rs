@@ -133,6 +133,36 @@ fn validate_item_collection(
     }
 }
 
+/// Schema-validation shape for an item write: the doc with the path
+/// collection injected (when absent), generated links merged in, and
+/// `assets` defaulted — the item schema requires `links`/`assets` and a
+/// `rel=collection` link whenever `collection` is set, all of which
+/// this API serves but never stores (inferred rels are stripped on
+/// write, `Item` serializes no `assets` key when empty).
+fn item_validation_doc(
+    state: &AppState,
+    doc: &serde_json::Value,
+    collection_id: &str,
+    scope: Option<&str>,
+) -> serde_json::Value {
+    let mut doc = doc.clone();
+    let Some(obj) = doc.as_object_mut() else {
+        // Non-object bodies get no injection — the validator reports
+        // them as scalar JSON on its own.
+        return doc;
+    };
+    obj.entry("collection")
+        .or_insert_with(|| json!(collection_id));
+    obj.entry("assets").or_insert_with(|| json!({}));
+    let id = doc["id"].as_str().unwrap_or_default().to_string();
+    merge_doc_links(
+        &mut doc,
+        item_links(state, &id, collection_id, scope),
+        &state.base_url,
+    );
+    doc
+}
+
 #[utoipa::path(
     get,
     path = "/catalogs/{catalog_id}/collections/{collection_id}/items",
@@ -421,11 +451,18 @@ pub async fn create_scoped_item(
     StacJson(body): StacJson<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
+    // Scope check precedes body validation (upstream order). A
+    // FeatureCollection body validates each member in the batch.
     if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
         return create_items_batch(&state, &collection_id, Some(&catalog_id), &body)
             .await
             .map(IntoResponse::into_response);
     }
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &body, &collection_id, Some(&catalog_id)),
+    )
+    .await?;
     let mut item: Item = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
@@ -465,6 +502,12 @@ pub async fn update_scoped_item(
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
+    let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &doc, &collection_id, Some(&catalog_id)),
+    )
+    .await?;
     if !state
         .store
         .put_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
@@ -541,6 +584,11 @@ pub async fn create_root_item(
             .await
             .map(IntoResponse::into_response);
     }
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &body, &collection_id, None),
+    )
+    .await?;
     let mut item: Item = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
@@ -596,6 +644,7 @@ async fn create_items_batch(
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, Item> = std::collections::HashMap::new();
     for f in features {
+        validate_stac_doc(state, &item_validation_doc(state, f, collection_id, scope)).await?;
         let mut item: Item = serde_json::from_value(f.clone())
             .map_err(|e| ApiError::BadRequest(format!("invalid feature: {e}")))?;
         validate_item_collection(&mut item, collection_id, &state.base_url)?;
@@ -684,8 +733,15 @@ pub async fn update_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             validate_item_collection(&mut item, &collection_id, &state.base_url)?;
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            let value =
+                serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+            validate_stac_doc(
+                &state,
+                &item_validation_doc(&state, &value, &collection_id, None),
+            )
+            .await?;
             let key = item_key(&item_id, &collection_id);
             let applied = if headers.contains_key(header::IF_MATCH) {
                 state
@@ -754,7 +810,7 @@ pub async fn delete_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
             let deleted = if headers.contains_key(header::IF_MATCH) {
                 state
@@ -815,6 +871,7 @@ pub async fn patch_root_item(
         .await?
     {
         Some((mut doc, version)) if doc["collection"] == collection_id => {
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             apply_patch(
                 &mut doc,
                 headers
@@ -830,7 +887,14 @@ pub async fn patch_root_item(
                     "a patch may not change the item id or collection".to_string(),
                 ));
             }
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            // Schema-validate the merged result in read shape — stored
+            // docs strip inferred links and the item schema keys
+            // `collection` on a `rel=collection` link.
+            validate_stac_doc(
+                &state,
+                &item_validation_doc(&state, &doc, &collection_id, None),
+            )
+            .await?;
             let key = item_key(&item_id, &collection_id);
             // Upstream `patch_item` forces refresh=True — a patched item
             // must be searchable immediately regardless of DATABASE_REFRESH.
@@ -917,7 +981,7 @@ pub async fn bulk_create_items(
         return Err(ApiError::NotFound(collection_id));
     }
     let upsert = body.get("method").and_then(serde_json::Value::as_str) == Some("upsert");
-    if upsert && std::env::var("REQUIRE_IF_MATCH").is_ok_and(|v| v == "true") {
+    if upsert && state.require_if_match {
         return Err(ApiError::PreconditionRequired);
     }
     let items = body
@@ -1012,6 +1076,22 @@ pub async fn bulk_create_items(
             };
             errors.push(json!({"id": item.id, "msg": msg}));
             continue;
+        }
+        // Schema failures are per-item errors like the other malformed
+        // admissions; a fetch failure is environmental — abort.
+        if let Err(e) = validate_stac_doc(
+            &state,
+            &item_validation_doc(&state, raw, &collection_id, None),
+        )
+        .await
+        {
+            match e {
+                ApiError::BadRequest(msg) => {
+                    errors.push(json!({"id": raw["id"], "msg": msg}));
+                    continue;
+                }
+                _ => return Err(e),
+            }
         }
         let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
         prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));

@@ -25,7 +25,7 @@ test: opensearch ## Unit + integration tests (starts OpenSearch first)
 	exit $$status
 
 test-integration: opensearch ## Integration tests only
-	@OPENSEARCH_URL=$(OPENSEARCH_URL) cargo test --test integration --test catalogs --test collections; status=$$?; \
+	@OPENSEARCH_URL=$(OPENSEARCH_URL) cargo test --test integration --test catalogs --test collections --test validation; status=$$?; \
 	curl -sf -XDELETE '$(OPENSEARCH_URL)/it-*' > /dev/null 2>&1 || true; \
 	exit $$status
 
