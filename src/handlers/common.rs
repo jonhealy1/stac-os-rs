@@ -180,13 +180,15 @@ pub(crate) fn listing_filter_clause(
     // Keep the text path as Cql2Text — `cql2_clause_with` uses it to
     // permit a single-element `IN ('x')` list, which the parser reports
     // as a scalar.
-    let cql2: stac_api::Filter = if filter_lang == Some("cql2-json") {
-        stac_api::Filter::Cql2Json(json_map(raw, invalid)?)
+    let cql2: crate::api_types::Filter = if filter_lang == Some("cql2-json") {
+        crate::api_types::Filter::Cql2Json(json_map(raw, invalid)?)
     } else {
         match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(v) if v.is_object() => stac_api::Filter::Cql2Json(v.as_object().cloned().unwrap()),
+            Ok(v) if v.is_object() => {
+                crate::api_types::Filter::Cql2Json(v.as_object().cloned().unwrap())
+            }
             Ok(_) => return Err(invalid("expected a CQL2 expression with an operator")),
-            Err(_) => stac_api::Filter::Cql2Text(crate::store::rewrite_between(raw)),
+            Err(_) => crate::api_types::Filter::Cql2Text(crate::store::rewrite_between(raw)),
         }
     };
     crate::store::cql2_clause_with(&cql2, spec)

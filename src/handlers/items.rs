@@ -1,6 +1,7 @@
 // src/handlers/items.rs
 use super::common::*;
 use super::metadata::items_sortable_fields;
+use crate::api_types::{ItemCollection, Search};
 use crate::store::{COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
     extract::{Path, Query, State},
@@ -10,7 +11,6 @@ use axum::{
 };
 use serde_json::json;
 use stac::{Bbox, Item, Link};
-use stac_api::{ItemCollection, Search};
 use std::sync::Arc;
 
 /// GET /collections/{id}/items — global item listing for a collection.
@@ -282,7 +282,7 @@ async fn items_page(
         // or an absent filter-lang tries JSON first, then CQL2 text.
         let filter = if query.filter_lang.as_deref() == Some("cql2-json") {
             match serde_json::from_str::<serde_json::Value>(expr) {
-                Ok(serde_json::Value::Object(map)) => stac_api::Filter::Cql2Json(map),
+                Ok(serde_json::Value::Object(map)) => crate::api_types::Filter::Cql2Json(map),
                 _ => {
                     return Err(ApiError::BadRequest(
                         "Invalid filter parameter: expected valid CQL2 JSON.".to_string(),
@@ -291,8 +291,8 @@ async fn items_page(
             }
         } else {
             match serde_json::from_str::<serde_json::Value>(expr) {
-                Ok(serde_json::Value::Object(map)) => stac_api::Filter::Cql2Json(map),
-                _ => stac_api::Filter::Cql2Text(crate::store::rewrite_between(expr)),
+                Ok(serde_json::Value::Object(map)) => crate::api_types::Filter::Cql2Json(map),
+                _ => crate::api_types::Filter::Cql2Text(crate::store::rewrite_between(expr)),
             }
         };
         extra_filters.push(crate::store::cql2_clause(&filter).map_err(bad_filter)?);

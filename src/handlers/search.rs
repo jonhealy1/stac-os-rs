@@ -1,5 +1,6 @@
 // src/handlers/search.rs
 use super::common::*;
+use crate::api_types::{GetSearch, ItemCollection, Search};
 use crate::store::{search_offset, CATALOGS_INDEX, MAX_SEARCH_LIMIT, ROOT_CATALOG_ID};
 use axum::{
     extract::{Path, Query, State},
@@ -7,7 +8,6 @@ use axum::{
 };
 use serde_json::json;
 use stac::{Bbox, Link};
-use stac_api::{GetSearch, ItemCollection, Search};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -156,7 +156,7 @@ async fn run_scoped_search(
         })?;
     }
     if let Some(filter) = &mut search.items.filter {
-        if let stac_api::Filter::Cql2Text(raw) = filter {
+        if let crate::api_types::Filter::Cql2Text(raw) = filter {
             if search
                 .items
                 .additional_fields
@@ -175,7 +175,7 @@ async fn run_scoped_search(
                             .to_string(),
                     )
                 })?;
-                *filter = stac_api::Filter::Cql2Json(map);
+                *filter = crate::api_types::Filter::Cql2Json(map);
             } else {
                 *raw = crate::store::rewrite_between(raw);
             }
@@ -189,22 +189,26 @@ async fn run_scoped_search(
     // ±180 before validation — same semantics, no crate fight.
     if let Some(Bbox::TwoDimensional([xmin, ymin, xmax, ymax])) = search.items.bbox {
         if xmin > xmax && ymin <= ymax && search.intersects.is_none() {
-            search.intersects = Some(geojson::Geometry::new(geojson::Value::MultiPolygon(vec![
-                vec![vec![
-                    vec![xmin, ymin],
-                    vec![180.0, ymin],
-                    vec![180.0, ymax],
-                    vec![xmin, ymax],
-                    vec![xmin, ymin],
-                ]],
-                vec![vec![
-                    vec![-180.0, ymin],
-                    vec![xmax, ymin],
-                    vec![xmax, ymax],
-                    vec![-180.0, ymax],
-                    vec![-180.0, ymin],
-                ]],
-            ])));
+            search.intersects = Some(geojson::Geometry::new(
+                geojson::GeometryValue::MultiPolygon {
+                    coordinates: vec![
+                        vec![vec![
+                            vec![xmin, ymin].into(),
+                            vec![180.0, ymin].into(),
+                            vec![180.0, ymax].into(),
+                            vec![xmin, ymax].into(),
+                            vec![xmin, ymin].into(),
+                        ]],
+                        vec![vec![
+                            vec![-180.0, ymin].into(),
+                            vec![xmax, ymin].into(),
+                            vec![xmax, ymax].into(),
+                            vec![-180.0, ymax].into(),
+                            vec![-180.0, ymin].into(),
+                        ]],
+                    ],
+                },
+            ));
             search.items.bbox = None;
         }
     }

@@ -499,7 +499,7 @@ struct CollectionsSearchParams {
     /// (include, exclude) field paths.
     fields: Option<(Vec<String>, Vec<String>)>,
     q: Vec<String>,
-    filter: Option<stac_api::Filter>,
+    filter: Option<crate::api_types::Filter>,
     query: Option<serde_json::Map<String, serde_json::Value>>,
     datetime: Option<String>,
     /// 2D bbox [minx, miny, maxx, maxy].
@@ -594,18 +594,18 @@ fn datetime_bounds(datetime: &str) -> (String, String) {
     }
 }
 
-fn parse_cql2_filter(raw: &str, lang: Option<&str>) -> Result<stac_api::Filter, ApiError> {
+fn parse_cql2_filter(raw: &str, lang: Option<&str>) -> Result<crate::api_types::Filter, ApiError> {
     if lang == Some("cql2-json") {
         match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(serde_json::Value::Object(map)) => Ok(stac_api::Filter::Cql2Json(map)),
+            Ok(serde_json::Value::Object(map)) => Ok(crate::api_types::Filter::Cql2Json(map)),
             _ => Err(ApiError::BadRequest(
                 "Invalid filter parameter: expected valid CQL2 JSON.".to_string(),
             )),
         }
     } else {
-        Ok(stac_api::Filter::Cql2Text(crate::store::rewrite_between(
-            raw,
-        )))
+        Ok(crate::api_types::Filter::Cql2Text(
+            crate::store::rewrite_between(raw),
+        ))
     }
 }
 
@@ -691,7 +691,7 @@ fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchP
         .and_then(|v| v.as_str());
     if let Some(v) = get("filter") {
         p.filter = Some(match v {
-            serde_json::Value::Object(m) => stac_api::Filter::Cql2Json(m.clone()),
+            serde_json::Value::Object(m) => crate::api_types::Filter::Cql2Json(m.clone()),
             serde_json::Value::String(s) => parse_cql2_filter(s, lang)?,
             _ => return Err(bad("filter")),
         });

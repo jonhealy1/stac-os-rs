@@ -1,4 +1,5 @@
 // src/lib.rs
+pub mod api_types;
 pub mod docs;
 pub mod dto;
 pub mod handlers;

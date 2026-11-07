@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/cors.rs` — OpenSearch-free smoke test asserting preflight
   `Access-Control-Allow-*` headers
 
+### Changed
+
+- `stac` 0.14 → 0.17.7 (`geojson` 1.0, `cql2` 0.5.5 along with it). The
+  `stac-api` crate is replaced by an in-tree `api_types` module vendoring
+  the types we used (`Search`/`GetSearch`, `Items`/`GetItems`,
+  `Filter`, `Fields`, `Sortby`, `ItemCollection`/`Context`) — `stac-api`
+  0.8.2 is unmaintained upstream and pins `stac` 0.14, which blocked the
+  upgrade and `stac-validate` adoption
+
 ## [0.5.0] - 2026-11-04
 
 ### Added
