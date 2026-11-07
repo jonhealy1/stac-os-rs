@@ -1,4 +1,5 @@
 // src/store.rs
+use crate::api_types::Search;
 use opensearch::{
     http::{
         transport::{SingleNodeConnectionPool, TransportBuilder},
@@ -14,7 +15,6 @@ use opensearch::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use stac::Bbox;
-use stac_api::Search;
 use std::collections::{HashMap, HashSet};
 
 pub const ROOT_CATALOG_ID: &str = "root";
@@ -1897,22 +1897,25 @@ fn stacql_clause(field: &str, op: &str, value: &Value, spec: FieldSpec) -> Resul
 /// Covers basic-cql2 (comparisons, and/or/not, IS NULL), advanced
 /// comparisons (LIKE, BETWEEN, IN) and the basic spatial predicates;
 /// anything else is a 400 via the caller.
-pub fn cql2_clause(filter: &stac_api::Filter) -> Result<Value, String> {
+pub fn cql2_clause(filter: &crate::api_types::Filter) -> Result<Value, String> {
     cql2_clause_with(filter, ITEM_FIELDS)
 }
 
-pub fn cql2_clause_with(filter: &stac_api::Filter, spec: FieldSpec) -> Result<Value, String> {
+pub fn cql2_clause_with(
+    filter: &crate::api_types::Filter,
+    spec: FieldSpec,
+) -> Result<Value, String> {
     match filter {
-        stac_api::Filter::Cql2Json(map) => {
+        crate::api_types::Filter::Cql2Json(map) => {
             check_cql2_literals(&Value::Object(map.clone()))?;
         }
-        stac_api::Filter::Cql2Text(raw) => {
+        crate::api_types::Filter::Cql2Text(raw) => {
             check_cql2_text_args(raw)?;
         }
     }
     let expr = cql2::Expr::try_from(filter.clone()).map_err(|e| match filter {
         // upstream cql2_text_to_json maps every text parse failure
-        stac_api::Filter::Cql2Text(_) => "expected valid CQL2 text".to_string(),
+        crate::api_types::Filter::Cql2Text(_) => "expected valid CQL2 text".to_string(),
         _ => e.to_string(),
     })?;
     // The parser rewrites temporal literals it can read (e.g. a +25:00
@@ -1924,8 +1927,12 @@ pub fn cql2_clause_with(filter: &stac_api::Filter, spec: FieldSpec) -> Result<Va
     // to_es translation errors — upstream surfaces them verbatim under
     // `Error with cql2 filter:`; parse/validation failures above keep
     // the `Invalid filter parameter:` framing.
-    expr_clause(&expr, spec, matches!(filter, stac_api::Filter::Cql2Text(_)))
-        .map_err(|e| format!("Error with cql2 filter: {e}"))
+    expr_clause(
+        &expr,
+        spec,
+        matches!(filter, crate::api_types::Filter::Cql2Text(_)),
+    )
+    .map_err(|e| format!("Error with cql2 filter: {e}"))
 }
 
 /// Upstream `check_cql2_literals`: walks a CQL2 JSON expression and
@@ -2816,7 +2823,7 @@ mod tests {
 
     #[test]
     fn test_cql2_comparisons_and_logic() {
-        use stac_api::Filter;
+        use crate::api_types::Filter;
         let filter = Filter::Cql2Json(
             serde_json::json!({
                 "op": "and", "args": [
@@ -2844,7 +2851,7 @@ mod tests {
 
     #[test]
     fn test_cql2_between_in_like_isnull() {
-        use stac_api::Filter;
+        use crate::api_types::Filter;
         let clause = |v: serde_json::Value| {
             cql2_clause(&Filter::Cql2Json(v.as_object().unwrap().clone())).unwrap()
         };
@@ -2868,7 +2875,7 @@ mod tests {
 
     #[test]
     fn test_cql2_text_and_spatial() {
-        use stac_api::Filter;
+        use crate::api_types::Filter;
         // cql2-text form (GET ?filter=) parses through the same path
         let filter = Filter::Cql2Text("properties.eo:cloud_cover <= 10".to_string());
         assert_eq!(
