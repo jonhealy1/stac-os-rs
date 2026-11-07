@@ -79,6 +79,14 @@ async fn main() {
                     .collect()
             })
             .unwrap_or_default(),
+        validator: match env_flag("ENABLE_STAC_VALIDATOR") {
+            true => Some(tokio::sync::Mutex::new(
+                stac_validate::Validator::new()
+                    .await
+                    .expect("ENABLE_STAC_VALIDATOR is set but the validator failed to initialize"),
+            )),
+            false => None,
+        },
     });
     let app = build_app(state);
 

@@ -421,6 +421,10 @@ pub async fn create_scoped_item(
     StacJson(body): StacJson<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
+    // Scope check precedes body validation (upstream order). A
+    // FeatureCollection body validates each member via the validator's
+    // ItemCollection recursion.
+    validate_stac_doc(&state, &body).await?;
     if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
         return create_items_batch(&state, &collection_id, Some(&catalog_id), &body)
             .await
@@ -464,6 +468,7 @@ pub async fn update_scoped_item(
     StacJson(mut item): StacJson<Item>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
+    validate_stac_doc(&state, &item).await?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     if !state
         .store
@@ -536,6 +541,7 @@ pub async fn create_root_item(
     {
         return Err(ApiError::NotFound(collection_id));
     }
+    validate_stac_doc(&state, &body).await?;
     if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
         return create_items_batch(&state, &collection_id, None, &body)
             .await
@@ -684,6 +690,7 @@ pub async fn update_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
+            validate_stac_doc(&state, &item).await?;
             validate_item_collection(&mut item, &collection_id, &state.base_url)?;
             require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
@@ -830,6 +837,9 @@ pub async fn patch_root_item(
                     "a patch may not change the item id or collection".to_string(),
                 ));
             }
+            // Schema-validate the merged result — upstream validates the
+            // patched document the same way.
+            validate_stac_doc(&state, &doc).await?;
             require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
             // Upstream `patch_item` forces refresh=True — a patched item

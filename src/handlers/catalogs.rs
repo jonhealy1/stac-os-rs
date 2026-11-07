@@ -106,6 +106,7 @@ pub async fn create_root_catalog(
     State(state): State<Arc<AppState>>,
     StacJson(mut catalog): StacJson<Catalog>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_stac_doc(&state, &catalog).await?;
     filter_stored_catalog_links(&mut catalog.links, &state.base_url);
     // Top-level creates are always root-level — a client-supplied
     // `parent_ids` is ignored (the hierarchy index is authoritative).
@@ -218,6 +219,7 @@ pub async fn update_catalog(
             catalog.id
         )));
     }
+    validate_stac_doc(&state, &catalog).await?;
     let (_, version) = state
         .store
         .get_document_versioned(CATALOGS_INDEX, &catalog_id)
@@ -557,6 +559,7 @@ pub async fn link_or_create_sub_catalog(
             ))
         }
         CreateOrLinkPayload::FullResource(mut new_catalog) => {
+            validate_stac_doc(&state, &new_catalog).await?;
             filter_stored_catalog_links(&mut new_catalog.links, &state.base_url);
             // The path parent is the edge — body `parent_ids` is ignored.
             new_catalog.additional_fields.remove("parent_ids");

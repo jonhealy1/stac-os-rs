@@ -24,6 +24,7 @@ fn state() -> Arc<AppState> {
         max_item_limit: None,
         excluded_item_fields: Vec::new(),
         excluded_queryables: Vec::new(),
+        validator: None,
     })
 }
 

@@ -2534,8 +2534,66 @@ async fn test_scoped_put_collection_rejects_mismatched_body_id() {
 }
 
 #[tokio::test]
-#[ignore = "needs stac-validate wiring"]
-async fn test_scoped_put_collection_validates_body() {}
+async fn test_scoped_put_collection_validates_body() {
+    let Some((app, _)) = test_app_validated().await else {
+        return;
+    };
+    let cat = uniq("val-cat");
+    post_catalog(&app, &cat).await;
+    let col = uniq("val-col");
+    let (s, _) = post_collection(&app, &cat, collection(&col)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // Valid body still writes — the validator must not reject good docs.
+    let (s, _) = call(
+        &app,
+        "PUT",
+        &format!("/catalogs/{cat}/collections/{col}"),
+        Some(collection(&col)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // `stac_extensions` deserializes as Vec<String>, so a malformed URI
+    // reaches the validator — a schema-level rejection serde can't see.
+    let mut bad = collection(&col);
+    bad["stac_extensions"] = json!(["not a uri"]);
+    let (s, body) = call(
+        &app,
+        "PUT",
+        &format!("/catalogs/{cat}/collections/{col}"),
+        Some(bad),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("STAC validation failed"));
+}
+
+#[tokio::test]
+async fn test_scoped_post_item_validates_body() {
+    let Some((app, _)) = test_app_validated().await else {
+        return;
+    };
+    let cat = uniq("val-cat");
+    post_catalog(&app, &cat).await;
+    let col = uniq("val-col");
+    let (s, _) = post_collection(&app, &cat, collection(&col)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // No `type` field — serde can't model-check it, the schema validator
+    // reports it as a missing required member.
+    let mut bad = item(&uniq("val-item"), &col);
+    bad.as_object_mut().unwrap().remove("type");
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(bad),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("STAC validation failed"));
+}
 
 #[tokio::test]
 async fn test_scoped_put_collection_updates_and_keeps_memberships() {

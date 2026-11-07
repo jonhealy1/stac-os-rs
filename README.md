@@ -182,6 +182,7 @@ All variables are read once at startup — changing them requires a restart.
 | `CATALOGS_HIDE_ALTERNATE_PARENTS` | Suppresses `related`/`duplicate` links and extra `parent` links for alternate parents in poly-hierarchy — only the contextual `parent` is advertised. Useful for multi-tenant deployments. (Upstream calls this `HIDE_ALTERNATE_PARENTS`.) | `false` | Optional |
 | `ENABLE_COLLECTIONS_SEARCH` | Enables the collection search extensions (`sortby`, `fields`, `q`, `filter`, `query`, `datetime`, `bbox`) on `GET /collections`. `false` = plain `limit`/`token` listing, params ignored. | `true` | Optional |
 | `ENABLE_COLLECTIONS_SEARCH_ROUTE` | Mounts the `GET`/`POST /collections-search` route. Set to `true` in `compose.yml` (upstream default is off). | `false` | Optional |
+| `ENABLE_STAC_VALIDATOR` | Validates write bodies against STAC JSON schemas before they reach OpenSearch — item/collection/catalog POST and PUT bodies, each member of a FeatureCollection batch, and the merged result of PATCH. Invalid docs return `400` with `STAC validation failed: ...`. Core schemas are bundled; schemas for `stac_extensions` entries are fetched and cached on first use. | `false` | Optional |
 
 **Limits & Performance**
 
@@ -206,7 +207,7 @@ All variables are read once at startup — changing them requires a restart.
 | `USE_DATETIME` | `false` = items carrying `start_datetime`/`end_datetime` are datetime-filtered on the range alone, ignoring `properties.datetime` (matches upstream `USE_DATETIME=false` query semantics). | `true` | Optional |
 | `DATABASE_REFRESH` | Refresh policy on writes: `false` accepts up-to-`refresh_interval` search lag (GET-by-id stays real-time) — the fast ingest setting; `true` refreshes inline before responding; `wait_for` parks until the next refresh tick. Hierarchy link/unlink and PATCH writes force `true` regardless — they need same-flow read-after-write (upstream `patch_item` forces it too). `compose.yml` sets `true`, mirroring sfeos's own compose override. | `false` | Optional |
 
-Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_STAC_VALIDATOR`, `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
+Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `REQUIRE_IF_MATCH` (428 enforcement), `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `ENABLE_CATALOGS_ROUTE` (our `/catalogs` surface is core, always on), `ENABLE_TOPOLOGY_VALIDATION`, custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 

@@ -188,6 +188,7 @@ pub async fn link_or_create_scoped_collection(
             ))
         }
         CreateOrLinkPayload::FullResource(collection) => {
+            validate_stac_doc(&state, &collection).await?;
             // Mode A: full-body repost of an existing id is a conflict
             for index in [COLLECTIONS_INDEX, CATALOGS_INDEX] {
                 if state
@@ -304,6 +305,7 @@ pub async fn update_scoped_collection(
             collection.id
         )));
     }
+    validate_stac_doc(&state, &collection).await?;
     let (_, version) = state
         .store
         .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
@@ -893,6 +895,7 @@ pub async fn create_root_collection(
     State(state): State<Arc<AppState>>,
     StacJson(collection): StacJson<Collection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_stac_doc(&state, &collection).await?;
     if state
         .store
         .get_document(CATALOGS_INDEX, &collection.id)
@@ -969,6 +972,7 @@ pub async fn update_root_collection(
             collection.id
         )));
     }
+    validate_stac_doc(&state, &collection).await?;
     let Some((_, version)) = state
         .store
         .get_document_versioned(COLLECTIONS_INDEX, &collection_id)
@@ -1129,6 +1133,9 @@ pub async fn patch_root_collection(
     if let Some(obj) = doc.as_object_mut() {
         obj.remove("parent_ids");
     }
+    // Schema-validate the merged result before our derived fields
+    // (bbox_shape) are injected.
+    validate_stac_doc(&state, &doc).await?;
     require_if_match(&headers, &etag_of(&state, COLLECTIONS_INDEX, &version))?;
     if state.collections_search_enabled() {
         if let Some(obj) = doc.as_object_mut() {

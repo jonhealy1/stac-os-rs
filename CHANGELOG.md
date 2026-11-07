@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream sfeos's default `CORSMiddleware` configuration
 - `tests/cors.rs` — OpenSearch-free smoke test asserting preflight
   `Access-Control-Allow-*` headers
+- `ENABLE_STAC_VALIDATOR` — write bodies validated against STAC JSON
+  schemas via `stac-validate` before reaching OpenSearch: item,
+  collection, and catalog POST/PUT bodies, every member of a
+  FeatureCollection batch, and the merged result of PATCH. Off by
+  default (upstream parity); invalid docs return 400 with the
+  `STAC validation failed:` detail
 
 ### Changed
 

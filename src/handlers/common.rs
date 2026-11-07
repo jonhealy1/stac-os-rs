@@ -61,6 +61,12 @@ pub struct AppState {
     /// `EXCLUDED_FROM_QUERYABLES` — field prefixes omitted from the
     /// `/queryables` schema.
     pub excluded_queryables: Vec<String>,
+    /// `ENABLE_STAC_VALIDATOR` — when `Some`, write bodies (POST/PUT, and
+    /// the merged result of PATCH) are validated against STAC JSON
+    /// schemas before they reach the store. `None` = validation off
+    /// (upstream default). `Mutex` because `Validator::validate` takes
+    /// `&mut self` — schema caching is per-validator.
+    pub validator: Option<tokio::sync::Mutex<stac_validate::Validator>>,
 }
 
 impl AppState {
@@ -69,6 +75,23 @@ impl AppState {
     pub fn collections_search_enabled(&self) -> bool {
         self.enable_collections_search || self.enable_collections_search_route
     }
+}
+
+/// `ENABLE_STAC_VALIDATOR` — validate a write body against the STAC JSON
+/// schemas. No-op when validation is disabled.
+pub(crate) async fn validate_stac_doc(
+    state: &AppState,
+    doc: &impl serde::Serialize,
+) -> Result<(), ApiError> {
+    if let Some(validator) = &state.validator {
+        validator
+            .lock()
+            .await
+            .validate(doc)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("STAC validation failed: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Default page size for catalog/collection/children list endpoints.
