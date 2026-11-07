@@ -3040,6 +3040,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cql2 0.5.7",
+ "futures-util",
  "geojson 1.0.0",
  "indexmap 2.14.2",
  "jiff",

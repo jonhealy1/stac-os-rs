@@ -91,6 +91,7 @@ async fn test_state_opts(
         } else {
             Vec::new()
         },
+        validator_cursor: std::sync::atomic::AtomicUsize::new(0),
         require_if_match,
     }))
 }

@@ -93,6 +93,7 @@ async fn main() {
             }
             false => Vec::new(),
         },
+        validator_cursor: std::sync::atomic::AtomicUsize::new(0),
         require_if_match: env_flag("REQUIRE_IF_MATCH"),
     });
     let app = build_app(state);

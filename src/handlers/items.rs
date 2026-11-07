@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use futures_util::{StreamExt, TryStreamExt};
 use serde_json::json;
 use stac::{Bbox, Item, Link};
 use std::sync::Arc;
@@ -161,6 +162,13 @@ fn item_validation_doc(
         &state.base_url,
     );
     doc
+}
+
+/// `validate_stac_doc` over an owned doc — the named-fn boundary lets
+/// batch code hand owned futures to `buffered` (an `async` block inside
+/// a closure can't satisfy the handler's `FnOnce` bounds).
+async fn validate_member_doc(state: &AppState, doc: serde_json::Value) -> Result<(), ApiError> {
+    validate_stac_doc(state, &doc).await
 }
 
 #[utoipa::path(
@@ -641,10 +649,22 @@ async fn create_items_batch(
         .get("features")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ApiError::BadRequest("FeatureCollection missing features".into()))?;
+    // Schema-validate members in parallel across the validator pool —
+    // sequential per-member awaits would pin a single validator for the
+    // whole batch. `buffered` keeps POOL_SIZE validations in flight and
+    // preserves doc order, so the first error is deterministic.
+    let docs: Vec<serde_json::Value> = features
+        .iter()
+        .map(|f| item_validation_doc(state, f, collection_id, scope))
+        .collect();
+    futures_util::stream::iter(docs)
+        .map(|doc| validate_member_doc(state, doc))
+        .buffered(VALIDATOR_POOL_SIZE)
+        .try_collect::<()>()
+        .await?;
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, Item> = std::collections::HashMap::new();
     for f in features {
-        validate_stac_doc(state, &item_validation_doc(state, f, collection_id, scope)).await?;
         let mut item: Item = serde_json::from_value(f.clone())
             .map_err(|e| ApiError::BadRequest(format!("invalid feature: {e}")))?;
         validate_item_collection(&mut item, collection_id, &state.base_url)?;
@@ -1057,10 +1077,11 @@ pub async fn bulk_create_items(
         }
     }
     skipped += admitted.len() - unique.len();
-    // Deserialize + validate per item first (per-item errors, as before),
-    // then one `_bulk` request — a single round-trip and one refresh for
-    // the whole batch vs N sequential writes each waiting on refresh.
-    let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
+    // Deserialize + identity-check per item first (cheap, sequential),
+    // then schema-validate the survivors in parallel across the
+    // validator pool, and finally one `_bulk` request — a single
+    // round-trip and one refresh for the whole batch.
+    let mut candidates: Vec<(&serde_json::Value, Item)> = Vec::new();
     for raw in unique {
         let mut item: Item = match serde_json::from_value(raw.clone()) {
             Ok(i) => i,
@@ -1077,24 +1098,33 @@ pub async fn bulk_create_items(
             errors.push(json!({"id": item.id, "msg": msg}));
             continue;
         }
-        // Schema failures are per-item errors like the other malformed
-        // admissions; a fetch failure is environmental — abort.
-        if let Err(e) = validate_stac_doc(
-            &state,
-            &item_validation_doc(&state, raw, &collection_id, None),
-        )
-        .await
-        {
-            match e {
-                ApiError::BadRequest(msg) => {
-                    errors.push(json!({"id": raw["id"], "msg": msg}));
-                    continue;
-                }
-                _ => return Err(e),
+        candidates.push((raw, item));
+    }
+    // `buffered` keeps POOL_SIZE validations in flight, results in
+    // order. Schema failures are per-item errors like the other
+    // malformed admissions; a fetch failure is environmental — abort.
+    let docs: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|(raw, _)| item_validation_doc(&state, raw, &collection_id, None))
+        .collect();
+    let validations = futures_util::stream::iter(docs)
+        .map(|doc| validate_member_doc(&state, doc))
+        .buffered(VALIDATOR_POOL_SIZE)
+        .collect::<Vec<_>>()
+        .await;
+    let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
+    for ((raw, item), result) in candidates.into_iter().zip(validations) {
+        match result {
+            Ok(()) => {
+                let doc =
+                    serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+                prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
             }
+            Err(ApiError::BadRequest(msg)) => {
+                errors.push(json!({"id": raw["id"], "msg": msg}));
+            }
+            Err(e) => return Err(e),
         }
-        let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
-        prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
     }
     let ops: Vec<(String, serde_json::Value, bool)> = prepared
         .iter()

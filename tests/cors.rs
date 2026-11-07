@@ -25,6 +25,7 @@ fn state() -> Arc<AppState> {
         excluded_item_fields: Vec::new(),
         excluded_queryables: Vec::new(),
         validators: Vec::new(),
+        validator_cursor: std::sync::atomic::AtomicUsize::new(0),
         require_if_match: false,
     })
 }

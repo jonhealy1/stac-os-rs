@@ -69,6 +69,10 @@ pub struct AppState {
     /// validated write through one lock; `validate_stac_doc` grabs any
     /// free member and only waits when all are busy.
     pub validators: Vec<tokio::sync::Mutex<stac_validate::Validator>>,
+    /// Round-robin cursor for `validate_stac_doc`'s all-busy fallback —
+    /// queued waiters spread across the pool instead of piling onto
+    /// `validators[0]`.
+    pub validator_cursor: std::sync::atomic::AtomicUsize,
     /// `REQUIRE_IF_MATCH` — writes that accept `If-Match` require the
     /// header when true (428 when absent).
     pub require_if_match: bool,
@@ -97,12 +101,18 @@ pub(crate) async fn validate_stac_doc(
     // `stac-validate` fetches `stac_extensions` schemas over the network
     // with no timeout — bound the whole call so one slow URI can't
     // stall the write. Grab any free pool member; only when all are
-    // busy do we queue on the first lock.
+    // busy do we queue, round-robin across the pool.
     match tokio::time::timeout(VALIDATION_TIMEOUT, async {
         let mut free = state.validators.iter().find_map(|v| v.try_lock().ok());
         match free.take() {
             Some(mut guard) => guard.validate_value(value).await,
-            None => state.validators[0].lock().await.validate_value(value).await,
+            None => {
+                let i = state
+                    .validator_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % state.validators.len();
+                state.validators[i].lock().await.validate_value(value).await
+            }
         }
     })
     .await
