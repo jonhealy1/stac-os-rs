@@ -61,6 +61,21 @@ pub struct AppState {
     /// `EXCLUDED_FROM_QUERYABLES` — field prefixes omitted from the
     /// `/queryables` schema.
     pub excluded_queryables: Vec<String>,
+    /// `ENABLE_STAC_VALIDATOR` — when non-empty, write bodies
+    /// (POST/PUT, and the merged result of PATCH) are validated against
+    /// STAC JSON schemas before they reach the store. Empty = validation
+    /// off (upstream default). Pooled because `Validator::validate`
+    /// takes `&mut self` — a single instance would serialize every
+    /// validated write through one lock; `validate_stac_doc` grabs any
+    /// free member and only waits when all are busy.
+    pub validators: Vec<tokio::sync::Mutex<stac_validate::Validator>>,
+    /// Round-robin cursor for `validate_stac_doc`'s all-busy fallback —
+    /// queued waiters spread across the pool instead of piling onto
+    /// `validators[0]`.
+    pub validator_cursor: std::sync::atomic::AtomicUsize,
+    /// `REQUIRE_IF_MATCH` — writes that accept `If-Match` require the
+    /// header when true (428 when absent).
+    pub require_if_match: bool,
 }
 
 impl AppState {
@@ -68,6 +83,95 @@ impl AppState {
     /// at write time (upstream does the same check).
     pub fn collections_search_enabled(&self) -> bool {
         self.enable_collections_search || self.enable_collections_search_route
+    }
+}
+
+/// `ENABLE_STAC_VALIDATOR` — validate a write body against the STAC JSON
+/// schemas. No-op when validation is disabled.
+pub(crate) async fn validate_stac_doc(
+    state: &AppState,
+    doc: &impl serde::Serialize,
+) -> Result<(), ApiError> {
+    if state.validators.is_empty() {
+        return Ok(());
+    }
+    let value = serde_json::to_value(doc)
+        .map_err(|e| ApiError::BadRequest(format!("STAC validation failed: {e}")))?;
+    guard_stac_version(&value)?;
+    // `stac-validate` fetches `stac_extensions` schemas over the network
+    // with no timeout — bound the whole call so one slow URI can't
+    // stall the write. Grab any free pool member; only when all are
+    // busy do we queue, round-robin across the pool.
+    match tokio::time::timeout(VALIDATION_TIMEOUT, async {
+        let mut free = state.validators.iter().find_map(|v| v.try_lock().ok());
+        match free.take() {
+            Some(mut guard) => guard.validate_value(value).await,
+            None => {
+                let i = state
+                    .validator_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % state.validators.len();
+                state.validators[i].lock().await.validate_value(value).await
+            }
+        }
+    })
+    .await
+    {
+        Err(_) => Err(ApiError::BadGateway(format!(
+            "STAC validation timed out after {}s",
+            VALIDATION_TIMEOUT.as_secs()
+        ))),
+        Ok(Err(e)) => Err(validation_error(e)),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+/// `ENABLE_STAC_VALIDATOR` pool size — one `Validator` per mutex;
+/// concurrent validated writes parallelize up to this many.
+pub const VALIDATOR_POOL_SIZE: usize = 4;
+
+/// Bound on a single `validate` call — covers the validator lock plus
+/// any extension-schema fetches performed underneath it.
+const VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `stac-validate` builds its schema URI from `stac_version` and
+/// `.unwrap()`s `Uri::parse` — an unknown version panics on URI-invalid
+/// chars, or triggers a live fetch to schemas.stacspec.org. Mirror the
+/// validator's type dispatch and reject unknown versions up front.
+fn guard_stac_version(value: &serde_json::Value) -> Result<(), ApiError> {
+    match value {
+        serde_json::Value::Object(map) => match map.get("type").and_then(|v| v.as_str()) {
+            Some("Feature" | "Catalog" | "Collection") => {
+                if let Some(version) = map.get("stac_version").and_then(|v| v.as_str()) {
+                    if matches!(
+                        version.parse::<stac::Version>(),
+                        Ok(stac::Version::Unknown(_))
+                    ) {
+                        return Err(ApiError::BadRequest(format!(
+                            "unsupported stac_version '{version}'"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            Some("FeatureCollection") => {
+                guard_stac_version(map.get("features").unwrap_or(&serde_json::Value::Null))
+            }
+            _ => guard_stac_version(map.get("collections").unwrap_or(&serde_json::Value::Null)),
+        },
+        serde_json::Value::Array(items) => items.iter().try_for_each(guard_stac_version),
+        _ => Ok(()),
+    }
+}
+
+/// Schema fetch/compile failures are upstream-service problems (502);
+/// everything else is a bad document (400).
+fn validation_error(e: stac_validate::Error) -> ApiError {
+    match e {
+        stac_validate::Error::Reqwest(_) | stac_validate::Error::JsonschemaValidation(_) => {
+            ApiError::BadGateway(format!("STAC schema fetch failed: {e}"))
+        }
+        other => ApiError::BadRequest(format!("STAC validation failed: {other}")),
     }
 }
 
@@ -949,6 +1053,7 @@ pub(crate) fn if_match_holds(header_value: &str, current_etag: &str) -> bool {
 /// With `REQUIRE_IF_MATCH=true` the header is mandatory (428 when
 /// absent), matching upstream's conditional-write toggle.
 pub(crate) fn require_if_match(
+    state: &AppState,
     headers: &axum::http::HeaderMap,
     current_etag: &str,
 ) -> Result<(), ApiError> {
@@ -956,9 +1061,7 @@ pub(crate) fn require_if_match(
         Some(v) if !if_match_holds(v.to_str().unwrap_or_default(), current_etag) => {
             Err(ApiError::PreconditionFailed)
         }
-        None if std::env::var("REQUIRE_IF_MATCH").is_ok_and(|v| v == "true") => {
-            Err(ApiError::PreconditionRequired)
-        }
+        None if state.require_if_match => Err(ApiError::PreconditionRequired),
         _ => Ok(()),
     }
 }
@@ -1173,6 +1276,9 @@ pub enum ApiError {
     PreconditionRequired,
     /// Optimistic-concurrency retries exhausted — retry the request.
     WriteConflict(String),
+    /// An upstream-service dependency failed — e.g. a STAC extension
+    /// schema could not be fetched or compiled (502).
+    BadGateway(String),
     Internal(String),
 }
 
@@ -1204,6 +1310,7 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT,
                 format!("Resource '{id}' was modified concurrently — retry the request"),
             ),
+            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, Json(json!({ "detail": msg }))).into_response()
@@ -1264,5 +1371,48 @@ mod tests {
         let child = json!({"id": "bare"});
         let links = children_links(&["root", "parent", "self"]);
         assert!(validate_children_response(&[child], &links).is_err());
+    }
+
+    #[test]
+    fn stac_version_guard_allows_known_versions() {
+        for version in ["1.0.0", "1.1.0", "1.1.0-beta.1"] {
+            let doc = json!({"type": "Feature", "stac_version": version});
+            assert!(guard_stac_version(&doc).is_ok(), "{version}");
+        }
+    }
+
+    #[test]
+    fn stac_version_guard_rejects_unknown_versions() {
+        // URI-invalid chars would panic `Uri::parse().unwrap()` upstream;
+        // plausible-looking versions would trigger a live schema fetch.
+        for version in ["a b", "2.0.0", "1.0", "{}"] {
+            let doc = json!({"type": "Feature", "stac_version": version});
+            assert!(guard_stac_version(&doc).is_err(), "{version}");
+        }
+    }
+
+    #[test]
+    fn stac_version_guard_recurses_members() {
+        let fc = json!({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "stac_version": "1.0.0"},
+                {"type": "Feature", "stac_version": "bogus version"},
+            ]
+        });
+        assert!(guard_stac_version(&fc).is_err());
+        let listing = json!({"collections": [{"type": "Collection", "stac_version": "9.9"}]});
+        assert!(guard_stac_version(&listing).is_err());
+    }
+
+    #[test]
+    fn stac_version_guard_ignores_non_stac_objects() {
+        // `stac_version` on objects the validator never dispatches on
+        // (no `type` member) is not our business.
+        let doc = json!({"properties": {"stac_version": "not a version"}});
+        assert!(guard_stac_version(&doc).is_ok());
+        // Non-string stac_version values fail inside the validator, not here.
+        let doc = json!({"type": "Feature", "stac_version": 42});
+        assert!(guard_stac_version(&doc).is_ok());
     }
 }

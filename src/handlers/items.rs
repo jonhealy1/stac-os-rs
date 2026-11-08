@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use futures_util::{StreamExt, TryStreamExt};
 use serde_json::json;
 use stac::{Bbox, Item, Link};
 use std::sync::Arc;
@@ -131,6 +132,43 @@ fn validate_item_collection(
             Ok(())
         }
     }
+}
+
+/// Schema-validation shape for an item write: the doc with the path
+/// collection injected (when absent), generated links merged in, and
+/// `assets` defaulted — the item schema requires `links`/`assets` and a
+/// `rel=collection` link whenever `collection` is set, all of which
+/// this API serves but never stores (inferred rels are stripped on
+/// write, `Item` serializes no `assets` key when empty).
+fn item_validation_doc(
+    state: &AppState,
+    doc: &serde_json::Value,
+    collection_id: &str,
+    scope: Option<&str>,
+) -> serde_json::Value {
+    let mut doc = doc.clone();
+    let Some(obj) = doc.as_object_mut() else {
+        // Non-object bodies get no injection — the validator reports
+        // them as scalar JSON on its own.
+        return doc;
+    };
+    obj.entry("collection")
+        .or_insert_with(|| json!(collection_id));
+    obj.entry("assets").or_insert_with(|| json!({}));
+    let id = doc["id"].as_str().unwrap_or_default().to_string();
+    merge_doc_links(
+        &mut doc,
+        item_links(state, &id, collection_id, scope),
+        &state.base_url,
+    );
+    doc
+}
+
+/// `validate_stac_doc` over an owned doc — the named-fn boundary lets
+/// batch code hand owned futures to `buffered` (an `async` block inside
+/// a closure can't satisfy the handler's `FnOnce` bounds).
+async fn validate_member_doc(state: &AppState, doc: serde_json::Value) -> Result<(), ApiError> {
+    validate_stac_doc(state, &doc).await
 }
 
 #[utoipa::path(
@@ -421,11 +459,18 @@ pub async fn create_scoped_item(
     StacJson(body): StacJson<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
+    // Scope check precedes body validation (upstream order). A
+    // FeatureCollection body validates each member in the batch.
     if body.get("type").and_then(serde_json::Value::as_str) == Some("FeatureCollection") {
         return create_items_batch(&state, &collection_id, Some(&catalog_id), &body)
             .await
             .map(IntoResponse::into_response);
     }
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &body, &collection_id, Some(&catalog_id)),
+    )
+    .await?;
     let mut item: Item = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
@@ -465,6 +510,12 @@ pub async fn update_scoped_item(
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
+    let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &doc, &collection_id, Some(&catalog_id)),
+    )
+    .await?;
     if !state
         .store
         .put_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
@@ -541,6 +592,11 @@ pub async fn create_root_item(
             .await
             .map(IntoResponse::into_response);
     }
+    validate_stac_doc(
+        &state,
+        &item_validation_doc(&state, &body, &collection_id, None),
+    )
+    .await?;
     let mut item: Item = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
@@ -593,6 +649,19 @@ async fn create_items_batch(
         .get("features")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ApiError::BadRequest("FeatureCollection missing features".into()))?;
+    // Schema-validate members in parallel across the validator pool —
+    // sequential per-member awaits would pin a single validator for the
+    // whole batch. `buffered` keeps POOL_SIZE validations in flight and
+    // preserves doc order, so the first error is deterministic.
+    let docs: Vec<serde_json::Value> = features
+        .iter()
+        .map(|f| item_validation_doc(state, f, collection_id, scope))
+        .collect();
+    futures_util::stream::iter(docs)
+        .map(|doc| validate_member_doc(state, doc))
+        .buffered(VALIDATOR_POOL_SIZE)
+        .try_collect::<()>()
+        .await?;
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, Item> = std::collections::HashMap::new();
     for f in features {
@@ -684,8 +753,15 @@ pub async fn update_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             validate_item_collection(&mut item, &collection_id, &state.base_url)?;
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            let value =
+                serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+            validate_stac_doc(
+                &state,
+                &item_validation_doc(&state, &value, &collection_id, None),
+            )
+            .await?;
             let key = item_key(&item_id, &collection_id);
             let applied = if headers.contains_key(header::IF_MATCH) {
                 state
@@ -754,7 +830,7 @@ pub async fn delete_root_item(
         .await?
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             let key = item_key(&item_id, &collection_id);
             let deleted = if headers.contains_key(header::IF_MATCH) {
                 state
@@ -815,6 +891,7 @@ pub async fn patch_root_item(
         .await?
     {
         Some((mut doc, version)) if doc["collection"] == collection_id => {
+            require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
             apply_patch(
                 &mut doc,
                 headers
@@ -830,7 +907,14 @@ pub async fn patch_root_item(
                     "a patch may not change the item id or collection".to_string(),
                 ));
             }
-            require_if_match(&headers, &etag_of(&state, ITEMS_INDEX, &version))?;
+            // Schema-validate the merged result in read shape — stored
+            // docs strip inferred links and the item schema keys
+            // `collection` on a `rel=collection` link.
+            validate_stac_doc(
+                &state,
+                &item_validation_doc(&state, &doc, &collection_id, None),
+            )
+            .await?;
             let key = item_key(&item_id, &collection_id);
             // Upstream `patch_item` forces refresh=True — a patched item
             // must be searchable immediately regardless of DATABASE_REFRESH.
@@ -917,7 +1001,7 @@ pub async fn bulk_create_items(
         return Err(ApiError::NotFound(collection_id));
     }
     let upsert = body.get("method").and_then(serde_json::Value::as_str) == Some("upsert");
-    if upsert && std::env::var("REQUIRE_IF_MATCH").is_ok_and(|v| v == "true") {
+    if upsert && state.require_if_match {
         return Err(ApiError::PreconditionRequired);
     }
     let items = body
@@ -993,10 +1077,11 @@ pub async fn bulk_create_items(
         }
     }
     skipped += admitted.len() - unique.len();
-    // Deserialize + validate per item first (per-item errors, as before),
-    // then one `_bulk` request — a single round-trip and one refresh for
-    // the whole batch vs N sequential writes each waiting on refresh.
-    let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
+    // Deserialize + identity-check per item first (cheap, sequential),
+    // then schema-validate the survivors in parallel across the
+    // validator pool, and finally one `_bulk` request — a single
+    // round-trip and one refresh for the whole batch.
+    let mut candidates: Vec<(&serde_json::Value, Item)> = Vec::new();
     for raw in unique {
         let mut item: Item = match serde_json::from_value(raw.clone()) {
             Ok(i) => i,
@@ -1013,8 +1098,33 @@ pub async fn bulk_create_items(
             errors.push(json!({"id": item.id, "msg": msg}));
             continue;
         }
-        let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
-        prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
+        candidates.push((raw, item));
+    }
+    // `buffered` keeps POOL_SIZE validations in flight, results in
+    // order. Schema failures are per-item errors like the other
+    // malformed admissions; a fetch failure is environmental — abort.
+    let docs: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|(raw, _)| item_validation_doc(&state, raw, &collection_id, None))
+        .collect();
+    let validations = futures_util::stream::iter(docs)
+        .map(|doc| validate_member_doc(&state, doc))
+        .buffered(VALIDATOR_POOL_SIZE)
+        .collect::<Vec<_>>()
+        .await;
+    let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
+    for ((raw, item), result) in candidates.into_iter().zip(validations) {
+        match result {
+            Ok(()) => {
+                let doc =
+                    serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+                prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
+            }
+            Err(ApiError::BadRequest(msg)) => {
+                errors.push(json!({"id": raw["id"], "msg": msg}));
+            }
+            Err(e) => return Err(e),
+        }
     }
     let ops: Vec<(String, serde_json::Value, bool)> = prepared
         .iter()
