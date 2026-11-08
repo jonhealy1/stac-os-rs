@@ -601,10 +601,11 @@ async fn test_post_items_feature_collection() {
     }
 }
 
-/// All-or-nothing: a batch containing an existing id 409s and writes
-/// nothing new.
+/// Non-strict (default): a batch containing an existing id inserts the
+/// new member, reports the conflict in `conflict_errors`, and still
+/// returns 201 — upstream `bulk_item_insert` partial semantics.
 #[tokio::test]
-async fn test_post_items_feature_collection_conflict_rolls_back() {
+async fn test_post_items_feature_collection_conflict_partial() {
     let Some((app, _)) = test_app(true).await else {
         return;
     };
@@ -620,6 +621,52 @@ async fn test_post_items_feature_collection_conflict_rolls_back() {
     .await;
 
     let new_id = uniq("fcx-new");
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(feature_collection(vec![
+            item(&new_id, &col),
+            item(&existing, &col),
+        ])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    assert!(body["conflict_errors"].get(&existing).is_some(), "{body}");
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items/{new_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+/// Strict (`RAISE_ON_BULK_ERROR=true`): the same conflict 409s and
+/// writes nothing.
+#[tokio::test]
+async fn test_post_items_feature_collection_conflict_strict() {
+    let Some((app, _)) = test_app_flags(TestFlags {
+        raise_on_bulk_error: true,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let col = uniq("fcxs-col");
+    call(&app, "POST", "/collections", Some(collection(&col))).await;
+    let existing = uniq("fcxs-old");
+    call(
+        &app,
+        "POST",
+        &format!("/collections/{col}/items"),
+        Some(item(&existing, &col)),
+    )
+    .await;
+
+    let new_id = uniq("fcxs-new");
     let (s, _) = call(
         &app,
         "POST",
@@ -631,7 +678,6 @@ async fn test_post_items_feature_collection_conflict_rolls_back() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT);
-    // The new id must not have been written.
     let (s, _) = call(
         &app,
         "GET",
@@ -685,7 +731,8 @@ async fn test_post_items_feature_collection_missing_collection() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
-/// A malformed feature in the batch 400s and writes nothing.
+/// A malformed member is reported in `errors` while the valid member
+/// still lands (non-strict upstream semantics).
 #[tokio::test]
 async fn test_post_items_feature_collection_bad_feature() {
     let Some((app, _)) = test_app(true).await else {
@@ -694,7 +741,8 @@ async fn test_post_items_feature_collection_bad_feature() {
     let col = uniq("fcb-col");
     call(&app, "POST", "/collections", Some(collection(&col))).await;
     let good = uniq("fcb-good");
-    let (s, _) = call(
+    let bad = uniq("fcb-bad");
+    let (s, body) = call(
         &app,
         "POST",
         &format!("/collections/{col}/items"),
@@ -702,11 +750,14 @@ async fn test_post_items_feature_collection_bad_feature() {
             item(&good, &col),
             // valid Feature shape, but bound to another collection —
             // validate_item_collection rejects the identity mismatch
-            item(&uniq("fcb-bad"), "not-this-collection"),
+            item(&bad, "not-this-collection"),
         ])),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{body}");
+    assert_eq!(errors[0]["id"], bad, "{body}");
     let (s, _) = call(
         &app,
         "GET",
@@ -714,7 +765,7 @@ async fn test_post_items_feature_collection_bad_feature() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(s, StatusCode::OK);
 }
 
 // --- /collections/{id}/bulk_items (single _bulk write) ---

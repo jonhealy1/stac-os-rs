@@ -3105,9 +3105,10 @@ async fn test_scoped_items_feature_collection() {
         assert_eq!(body["id"], *id);
     }
 
-    // second batch with an existing id -> 409, nothing new written
+    // second batch with an existing id -> 201 partial: the new member
+    // is written and the existing id lands in `conflict_errors`.
     let new_id = uniq("sfc-new");
-    let (s, _) = call(
+    let (s, body) = call(
         &app,
         "POST",
         &format!("/catalogs/{cat}/collections/{col}/items"),
@@ -3117,7 +3118,8 @@ async fn test_scoped_items_feature_collection() {
         })),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    assert!(body["conflict_errors"].get(&a).is_some(), "{body}");
     let (s, _) = call(
         &app,
         "GET",
@@ -3125,7 +3127,7 @@ async fn test_scoped_items_feature_collection() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(s, StatusCode::OK);
 }
 
 /// FeatureCollection POST to a collection outside the catalog scope.

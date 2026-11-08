@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde_json::json;
 use stac::{Bbox, Item, Link};
 use std::sync::Arc;
@@ -164,11 +164,227 @@ fn item_validation_doc(
     doc
 }
 
-/// `validate_stac_doc` over an owned doc — the named-fn boundary lets
-/// batch code hand owned futures to `buffered` (an `async` block inside
-/// a closure can't satisfy the handler's `FnOnce` bounds).
+/// Upstream `validate_datetime_range` (sfeos `validate.py`), gated like
+/// upstream on the schema-validation flag: when `properties.datetime`
+/// is null both start/end are required, they come in pairs, and
+/// `start <= datetime <= end` must hold. Returns the rule text.
+fn validate_item_datetime(doc: &serde_json::Value) -> Result<(), String> {
+    let props = doc.get("properties");
+    let raw = |k: &str| -> Option<String> {
+        props
+            .and_then(|p| p.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let parse = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|_| format!("Invalid ISO 8601 format for '{k}': {s}"))
+    };
+    let opt = |k: &str| -> Result<Option<chrono::DateTime<chrono::FixedOffset>>, String> {
+        raw(k).map(|s| parse(k, &s)).transpose()
+    };
+    let (start, dt, end) = (
+        opt("start_datetime")?,
+        opt("datetime")?,
+        opt("end_datetime")?,
+    );
+    if dt.is_none() && (start.is_none() || end.is_none()) {
+        return Err(
+            "If 'datetime' is null, both 'start_datetime' and 'end_datetime' must be set".into(),
+        );
+    }
+    if start.is_some() != end.is_some() {
+        return Err(
+            "Both 'start_datetime' and 'end_datetime' must be set together, or both must be null"
+                .into(),
+        );
+    }
+    if let (Some(s), Some(e)) = (start, end) {
+        if s > e {
+            return Err(format!(
+                "'start_datetime' ({}) must be <= 'end_datetime' ({})",
+                raw("start_datetime").unwrap_or_default(),
+                raw("end_datetime").unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(d) = dt {
+        if let Some(s) = start {
+            if d < s {
+                return Err(format!(
+                    "'datetime' ({}) must be >= 'start_datetime' ({})",
+                    raw("datetime").unwrap_or_default(),
+                    raw("start_datetime").unwrap_or_default()
+                ));
+            }
+        }
+        if let Some(e) = end {
+            if d > e {
+                return Err(format!(
+                    "'datetime' ({}) must be <= 'end_datetime' ({})",
+                    raw("datetime").unwrap_or_default(),
+                    raw("end_datetime").unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Upstream `validate_item_topology_lightweight`, gated on
+/// `ENABLE_TOPOLOGY_VALIDATION`: WGS84 bounds on every coordinate, then
+/// for Polygon/MultiPolygon ring minimum size, the
+/// `MAX_TOPOLOGY_VERTICES` ceiling, and antimeridian longitude jumps.
+fn validate_item_topology(state: &AppState, doc: &serde_json::Value) -> Result<(), String> {
+    if !state.enable_topology_validation {
+        return Ok(());
+    }
+    let Some(geometry) = doc.get("geometry") else {
+        return Ok(());
+    };
+    if geometry.is_null() {
+        return Ok(());
+    }
+    let Some(coords) = geometry.get("coordinates") else {
+        return Ok(());
+    };
+    if coords.is_null() {
+        return Ok(());
+    }
+    validate_geometry_bounds(coords)?;
+    match geometry.get("type").and_then(|t| t.as_str()) {
+        Some("Polygon") => check_antimeridian_rings(state, coords),
+        Some("MultiPolygon") => {
+            for polygon in coords.as_array().into_iter().flatten() {
+                check_antimeridian_rings(state, polygon)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Recursive WGS84 bounds check — mirrors upstream: any nested list
+/// whose first element is numeric is treated as a [lon, lat] pair.
+fn validate_geometry_bounds(coords: &serde_json::Value) -> Result<(), String> {
+    let Some(arr) = coords.as_array() else {
+        return Ok(());
+    };
+    if arr.is_empty() {
+        return Ok(());
+    }
+    if arr[0].is_number() {
+        if arr.len() < 2 {
+            return Err("Coordinate pair must have at least 2 elements [lon, lat]".into());
+        }
+        let lon = arr[0].as_f64().unwrap_or(f64::NAN);
+        let lat = arr[1].as_f64().unwrap_or(f64::NAN);
+        if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+            return Err(format!(
+                "Coordinates out of global WGS84 bounds: [{lon}, {lat}]"
+            ));
+        }
+        return Ok(());
+    }
+    for sub in arr {
+        validate_geometry_bounds(sub)?;
+    }
+    Ok(())
+}
+
+/// Polygon/MultiPolygon ring checks — `rings` is the `coordinates`
+/// array of a Polygon (or one polygon inside a MultiPolygon).
+fn check_antimeridian_rings(state: &AppState, rings: &serde_json::Value) -> Result<(), String> {
+    let Some(rings) = rings.as_array() else {
+        return Ok(());
+    };
+    for ring in rings {
+        let Some(ring) = ring.as_array() else {
+            continue;
+        };
+        if ring.len() < 4 {
+            return Err("Polygon ring must have at least 4 coordinates (closed loop).".into());
+        }
+        if ring.len() > state.max_topology_vertices {
+            return Err(format!(
+                "Geometry has too many vertices ({}). Maximum allowed is {}.",
+                ring.len(),
+                state.max_topology_vertices
+            ));
+        }
+        let lon_at = |p: &serde_json::Value| {
+            p.as_array()
+                .and_then(|c| c.first())
+                .and_then(|v| v.as_f64())
+        };
+        for pair in ring.windows(2) {
+            if let (Some(lon1), Some(lon2)) = (lon_at(&pair[0]), lon_at(&pair[1])) {
+                if (lon1 - lon2).abs() > 180.0 {
+                    return Err(format!(
+                        "Geometry crosses the antimeridian without proper truncation/splitting between longitude {lon1} and {lon2}."
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Single-item write validation — mirrors upstream `_validate_single_item`:
+/// schema → `Invalid item: STAC validation failed for '{id}': {e}`, then
+/// datetime range → `Invalid item datetime: {e}` (gated on the validator
+/// like upstream), then topology → `Invalid item geometry: {e}`.
+async fn validate_item_write(
+    state: &AppState,
+    doc: &serde_json::Value,
+    item_id: &str,
+) -> Result<(), ApiError> {
+    validate_stac_doc(state, doc).await.map_err(|e| match e {
+        ApiError::BadRequest(msg) => ApiError::BadRequest(format!(
+            "Invalid item: STAC validation failed for '{item_id}': {}",
+            msg.strip_prefix("STAC validation failed: ").unwrap_or(&msg)
+        )),
+        other => other,
+    })?;
+    if !state.validators.is_empty() {
+        if let Err(msg) = validate_item_datetime(doc) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid item datetime: {msg}"
+            )));
+        }
+    }
+    if let Err(msg) = validate_item_topology(state, doc) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid item geometry: {msg}"
+        )));
+    }
+    Ok(())
+}
+
+/// Batch-member validation — the same checks as `validate_item_write`
+/// but in upstream's per-item batch formats (they land in `errors[]`
+/// entries and `conflict_errors`): schema → `STAC validation failed for
+/// '{id}': {e}`, datetime → the bare rule text, topology → `Topology
+/// Error: {e}`. The named-fn boundary also lets `buffered` hold owned
+/// futures (an `async` block in a closure can't satisfy `FnOnce`).
 async fn validate_member_doc(state: &AppState, doc: serde_json::Value) -> Result<(), ApiError> {
-    validate_stac_doc(state, &doc).await
+    let id = doc["id"].as_str().unwrap_or_default().to_string();
+    validate_stac_doc(state, &doc).await.map_err(|e| match e {
+        ApiError::BadRequest(msg) => ApiError::BadRequest(format!(
+            "STAC validation failed for '{id}': {}",
+            msg.strip_prefix("STAC validation failed: ").unwrap_or(&msg)
+        )),
+        other => other,
+    })?;
+    if !state.validators.is_empty() {
+        if let Err(msg) = validate_item_datetime(&doc) {
+            return Err(ApiError::BadRequest(msg));
+        }
+    }
+    if let Err(msg) = validate_item_topology(state, &doc) {
+        return Err(ApiError::BadRequest(format!("Topology Error: {msg}")));
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -466,9 +682,11 @@ pub async fn create_scoped_item(
             .await
             .map(IntoResponse::into_response);
     }
-    validate_stac_doc(
+    let item_id = body["id"].as_str().unwrap_or_default().to_string();
+    validate_item_write(
         &state,
         &item_validation_doc(&state, &body, &collection_id, Some(&catalog_id)),
+        &item_id,
     )
     .await?;
     let mut item: Item = serde_json::from_value(body)
@@ -511,9 +729,10 @@ pub async fn update_scoped_item(
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
     validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
-    validate_stac_doc(
+    validate_item_write(
         &state,
         &item_validation_doc(&state, &doc, &collection_id, Some(&catalog_id)),
+        &item.id,
     )
     .await?;
     if !state
@@ -592,9 +811,11 @@ pub async fn create_root_item(
             .await
             .map(IntoResponse::into_response);
     }
-    validate_stac_doc(
+    let item_id = body["id"].as_str().unwrap_or_default().to_string();
+    validate_item_write(
         &state,
         &item_validation_doc(&state, &body, &collection_id, None),
+        &item_id,
     )
     .await?;
     let mut item: Item = serde_json::from_value(body)
@@ -628,17 +849,18 @@ pub async fn create_root_item(
     .into_response())
 }
 
-/// FeatureCollection batch POST — all-or-nothing. Every feature's
-/// collection identity is preflighted (URI-populated when absent) and any
-/// mismatch or existing-id conflict rejects the whole batch before a
-/// single write. In-batch duplicate ids collapse to one write (last wins).
-/// `scope` is the catalog context for response link rendering.
+/// FeatureCollection batch POST — upstream `RAISE_ON_BULK_ERROR`
+/// semantics. When false (upstream default), failed members are
+/// skipped and reported: malformed/collection-mismatch members and
+/// schema failures land in `errors[]`, existing-id conflicts in
+/// `conflict_errors`; valid members still insert. When true, the
+/// first failure class aborts the whole batch — `400 Batch rejected.
+/// N items are malformed.` / `N items failed validation.`, `409` on
+/// conflict. `MAX_BATCH_ERROR_SIZE` is an unconditional fail-fast
+/// cutoff either way. In-batch duplicate ids collapse (last wins).
 ///
-/// Storage: one mget existence preflight + one `_bulk` create — a single
-/// refresh for the whole batch. The old per-doc loop made 2N round-trips,
-/// each waiting for an index refresh. A raced create between preflight
-/// and bulk still reports 409 (docs already written in that request stay,
-/// same partial-write exposure the sequential loop had).
+/// Storage: one mget existence preflight + one `_bulk` create — a
+/// single refresh for the whole batch.
 async fn create_items_batch(
     state: &AppState,
     collection_id: &str,
@@ -649,64 +871,195 @@ async fn create_items_batch(
         .get("features")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ApiError::BadRequest("FeatureCollection missing features".into()))?;
-    // Schema-validate members in parallel across the validator pool —
-    // sequential per-member awaits would pin a single validator for the
-    // whole batch. `buffered` keeps POOL_SIZE validations in flight and
-    // preserves doc order, so the first error is deterministic.
-    let docs: Vec<serde_json::Value> = features
-        .iter()
-        .map(|f| item_validation_doc(state, f, collection_id, scope))
-        .collect();
-    futures_util::stream::iter(docs)
-        .map(|doc| validate_member_doc(state, doc))
-        .buffered(VALIDATOR_POOL_SIZE)
-        .try_collect::<()>()
-        .await?;
+    let raise = state.raise_on_bulk_error;
+    let input_count = features.len();
+
+    // Phase 1 — admission: deserialize + collection identity, dedupe
+    // last-wins in first-seen order.
     let mut order: Vec<String> = Vec::new();
-    let mut by_id: std::collections::HashMap<String, Item> = std::collections::HashMap::new();
+    // Parsed item for storage + the raw member for validation —
+    // serde normalization heals some schema violations (e.g. a missing
+    // `type` re-serializes as "Feature"), so the schema must see the
+    // original document, like the `bulk_items` path does.
+    let mut by_id: std::collections::HashMap<String, (Item, serde_json::Value)> =
+        std::collections::HashMap::new();
+    let mut member_errors: Vec<(String, String)> = Vec::new();
+    let mut input_dupes = 0usize;
     for f in features {
-        let mut item: Item = serde_json::from_value(f.clone())
-            .map_err(|e| ApiError::BadRequest(format!("invalid feature: {e}")))?;
-        validate_item_collection(&mut item, collection_id, &state.base_url)?;
-        if !by_id.contains_key(&item.id) {
+        let id = f["id"].as_str().unwrap_or_default().to_string();
+        let mut item: Item = match serde_json::from_value(f.clone()) {
+            Ok(i) => i,
+            Err(e) => {
+                member_errors.push((id, format!("invalid feature: {e}")));
+                continue;
+            }
+        };
+        if let Err(e) = validate_item_collection(&mut item, collection_id, &state.base_url) {
+            let msg = match e {
+                ApiError::BadRequest(m) => m,
+                _ => "invalid collection identity".to_string(),
+            };
+            member_errors.push((item.id, msg));
+            continue;
+        }
+        if by_id.contains_key(&item.id) {
+            input_dupes += 1;
+        } else {
             order.push(item.id.clone());
         }
-        by_id.insert(item.id.clone(), item);
+        // Rewrite `collection` on the raw member like `bulk_items`
+        // admission does — `validate_item_collection` accepts absent/
+        // null/"" and the path id is authoritative for what we store.
+        let mut raw = f.clone();
+        raw["collection"] = json!(collection_id);
+        by_id.insert(item.id.clone(), (item, raw));
     }
+    if raise && !member_errors.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "Batch rejected. {} items are malformed.",
+            member_errors.len()
+        )));
+    }
+
+    // Phase 2 — existence preflight → conflicts (skipped or fatal).
     let keys: Vec<String> = order.iter().map(|id| item_key(id, collection_id)).collect();
     let existing = state.store.existing_ids(ITEMS_INDEX, &keys).await?;
-    if let Some(id) = order
+    let mut conflict_errors = serde_json::Map::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for id in &order {
+        if existing.contains(&item_key(id, collection_id)) {
+            if raise {
+                return Err(ApiError::Conflict(id.clone()));
+            }
+            conflict_errors.insert(
+                id.clone(),
+                json!(format!(
+                    "Item {id} in collection {collection_id} already exists"
+                )),
+            );
+        } else {
+            candidates.push(id.clone());
+        }
+    }
+
+    // Phase 3 — member validation, buffered across the validator pool.
+    let docs: Vec<serde_json::Value> = candidates
         .iter()
-        .find(|id| existing.contains(&item_key(id, collection_id)))
-    {
-        return Err(ApiError::Conflict(id.clone()));
+        .map(|id| item_validation_doc(state, &by_id[id].1, collection_id, scope))
+        .collect();
+    let validations = futures_util::stream::iter(docs)
+        .map(|doc| validate_member_doc(state, doc))
+        .buffered(VALIDATOR_POOL_SIZE)
+        .collect::<Vec<_>>()
+        .await;
+    let mut valid: Vec<String> = Vec::new();
+    let mut validation_error_count = 0usize;
+    for (id, result) in candidates.iter().zip(validations) {
+        match result {
+            Ok(()) => valid.push(id.clone()),
+            Err(ApiError::BadRequest(msg)) => {
+                validation_error_count += 1;
+                member_errors.push((id.clone(), msg));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let mut ops = Vec::with_capacity(order.len());
-    for (id, key) in order.iter().zip(&keys) {
-        let doc =
-            serde_json::to_value(&by_id[id]).map_err(|e| ApiError::Internal(e.to_string()))?;
-        ops.push((key.clone(), doc, true));
+    if let Some(max) = state.max_batch_error_size {
+        if validation_error_count > max {
+            return Err(ApiError::BadRequest(format!(
+                "Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."
+            )));
+        }
     }
+    if raise && validation_error_count > 0 {
+        return Err(ApiError::BadRequest(format!(
+            "Batch rejected. {validation_error_count} items failed validation."
+        )));
+    }
+
+    // Phase 4 — one `_bulk` create for the surviving members.
+    let ops: Vec<(String, serde_json::Value, bool)> = valid
+        .iter()
+        .map(|id| {
+            let doc = serde_json::to_value(&by_id[id].0).unwrap_or_default();
+            (item_key(id, collection_id), doc, true)
+        })
+        .collect();
     let results = state.store.bulk_write(ITEMS_INDEX, &ops).await?;
-    for (id, res) in order.iter().zip(&results) {
+    let mut added: Vec<String> = Vec::new();
+    for (id, res) in valid.iter().zip(&results) {
         match res.status {
-            s if (200..300).contains(&s) => {}
-            409 => return Err(ApiError::Conflict(id.clone())),
+            s if (200..300).contains(&s) => added.push(id.clone()),
+            409 => {
+                if raise {
+                    return Err(ApiError::Conflict(id.clone()));
+                }
+                conflict_errors.insert(
+                    id.clone(),
+                    json!(format!(
+                        "Item {id} in collection {collection_id} already exists"
+                    )),
+                );
+            }
             _ => {
-                return Err(ApiError::Internal(format!(
-                    "bulk create failed for '{id}': {}",
-                    res.error.as_deref().unwrap_or("unknown error")
-                )));
+                if raise {
+                    return Err(ApiError::Internal(format!(
+                        "bulk create failed for '{id}': {}",
+                        res.error.as_deref().unwrap_or("unknown error")
+                    )));
+                }
+                member_errors.push((
+                    id.clone(),
+                    format!(
+                        "bulk create failed: {}",
+                        res.error.as_deref().unwrap_or("unknown error")
+                    ),
+                ));
             }
         }
     }
-    let docs: Vec<serde_json::Value> = order
+    // Upstream: nothing inserted at all → 409 when every failure was a
+    // conflict, 400 otherwise ("No items were added to the database.").
+    if added.is_empty() && input_count > 0 {
+        if !conflict_errors.is_empty() && member_errors.is_empty() {
+            let id = conflict_errors.keys().next().cloned().unwrap_or_default();
+            return Err(ApiError::Conflict(id));
+        }
+        if !member_errors.is_empty() {
+            return Err(ApiError::BadRequest(
+                "No items were added to the database.".into(),
+            ));
+        }
+    }
+    let docs: Vec<serde_json::Value> = added
         .iter()
-        .map(|id| item_doc(state, &by_id[id], scope))
+        .map(|id| item_doc(state, &by_id[id].0, scope))
         .collect();
+    let mut parts = vec![format!(
+        "Processed {input_count} items: {} added",
+        added.len()
+    )];
+    if input_dupes > 0 {
+        parts.push(format!("{input_dupes} input duplicates"));
+    }
+    if validation_error_count > 0 {
+        parts.push(format!("{validation_error_count} validation errors"));
+    }
+    if !conflict_errors.is_empty() {
+        parts.push(format!("{} conflicts", conflict_errors.len()));
+    }
     Ok((
         StatusCode::CREATED,
-        geo_json(serde_json::json!({"type": "FeatureCollection", "features": docs})),
+        geo_json(serde_json::json!({
+            "type": "FeatureCollection",
+            "features": docs,
+            "conflict_errors": conflict_errors,
+            "errors": member_errors
+                .iter()
+                .map(|(id, msg)| json!({"id": id, "msg": msg}))
+                .collect::<Vec<_>>(),
+            "message": parts.join(" | "),
+        })),
     ))
 }
 
@@ -757,9 +1110,10 @@ pub async fn update_root_item(
             validate_item_collection(&mut item, &collection_id, &state.base_url)?;
             let value =
                 serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
-            validate_stac_doc(
+            validate_item_write(
                 &state,
                 &item_validation_doc(&state, &value, &collection_id, None),
+                &item.id,
             )
             .await?;
             let key = item_key(&item_id, &collection_id);
@@ -910,9 +1264,10 @@ pub async fn patch_root_item(
             // Schema-validate the merged result in read shape — stored
             // docs strip inferred links and the item schema keys
             // `collection` on a `rel=collection` link.
-            validate_stac_doc(
+            validate_item_write(
                 &state,
                 &item_validation_doc(&state, &doc, &collection_id, None),
+                &item_id,
             )
             .await?;
             let key = item_key(&item_id, &collection_id);
@@ -1002,14 +1357,16 @@ pub async fn bulk_create_items(
     }
     let upsert = body.get("method").and_then(serde_json::Value::as_str) == Some("upsert");
     if upsert && state.require_if_match {
-        return Err(ApiError::PreconditionRequired);
+        return Err(ApiError::PreconditionRequired(
+            "A bulk upsert cannot carry If-Match, which REQUIRE_IF_MATCH requires for updates; use method 'insert', or PUT each item with If-Match.".to_string(),
+        ));
     }
     let items = body
         .get("items")
         .and_then(serde_json::Value::as_object)
         .cloned()
         .ok_or_else(|| ApiError::BadRequest("body missing 'items' object".into()))?;
-    let raise_on_error = std::env::var("RAISE_ON_BULK_ERROR").is_ok_and(|v| v == "true");
+    let raise_on_error = state.raise_on_bulk_error;
     let received = items.len();
     let (mut success, mut skipped) = (0usize, 0usize);
     let mut errors: Vec<serde_json::Value> = Vec::new();
@@ -1100,6 +1457,15 @@ pub async fn bulk_create_items(
         }
         candidates.push((raw, item));
     }
+    if raise_on_error && !errors.is_empty() {
+        return Err(ApiError::BadRequest(
+            json!({
+                "message": format!("Bulk insertion rejected. {} items are malformed.", errors.len()),
+                "errors": errors,
+            })
+            .to_string(),
+        ));
+    }
     // `buffered` keeps POOL_SIZE validations in flight, results in
     // order. Schema failures are per-item errors like the other
     // malformed admissions; a fetch failure is environmental — abort.
@@ -1113,6 +1479,7 @@ pub async fn bulk_create_items(
         .collect::<Vec<_>>()
         .await;
     let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
+    let mut validation_error_count = 0usize;
     for ((raw, item), result) in candidates.into_iter().zip(validations) {
         match result {
             Ok(()) => {
@@ -1121,10 +1488,30 @@ pub async fn bulk_create_items(
                 prepared.push((item_key(&item.id, &collection_id), item.id.clone(), doc));
             }
             Err(ApiError::BadRequest(msg)) => {
+                validation_error_count += 1;
                 errors.push(json!({"id": raw["id"], "msg": msg}));
             }
             Err(e) => return Err(e),
         }
+    }
+    // `MAX_BATCH_ERROR_SIZE` — unconditional fast-fail cutoff (upstream:
+    // a payload this toxic stops the loop even when errors would
+    // otherwise be skipped).
+    if let Some(max) = state.max_batch_error_size {
+        if validation_error_count > max {
+            return Err(ApiError::BadRequest(format!(
+                "Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."
+            )));
+        }
+    }
+    if raise_on_error && validation_error_count > 0 {
+        return Err(ApiError::BadRequest(
+            json!({
+                "message": format!("Bulk insertion rejected. {validation_error_count} items failed validation."),
+                "errors": errors,
+            })
+            .to_string(),
+        ));
     }
     let ops: Vec<(String, serde_json::Value, bool)> = prepared
         .iter()

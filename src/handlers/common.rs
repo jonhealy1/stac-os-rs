@@ -76,6 +76,23 @@ pub struct AppState {
     /// `REQUIRE_IF_MATCH` — writes that accept `If-Match` require the
     /// header when true (428 when absent).
     pub require_if_match: bool,
+    /// `RAISE_ON_BULK_ERROR` — batch writes (FeatureCollection POST,
+    /// `/bulk_items`) abort on member failures when true; when false
+    /// (upstream default) failed members are skipped and reported in
+    /// the response.
+    pub raise_on_bulk_error: bool,
+    /// `ENABLE_TOPOLOGY_VALIDATION` — lightweight geometry checks on
+    /// item writes: WGS84 bounds on all coordinates, polygon ring
+    /// minimum/vertex ceiling, and antimeridian jumps (upstream's
+    /// `validate_item_topology_lightweight`).
+    pub enable_topology_validation: bool,
+    /// `MAX_TOPOLOGY_VERTICES` — polygon ring vertex ceiling
+    /// (upstream default 5000, DoS guard).
+    pub max_topology_vertices: usize,
+    /// `MAX_BATCH_ERROR_SIZE` — batch-validation error ceiling: more
+    /// failures than this aborts the batch unconditionally
+    /// ("Validation error threshold exceeded"). None = no cutoff.
+    pub max_batch_error_size: Option<usize>,
 }
 
 impl AppState {
@@ -1061,7 +1078,9 @@ pub(crate) fn require_if_match(
         Some(v) if !if_match_holds(v.to_str().unwrap_or_default(), current_etag) => {
             Err(ApiError::PreconditionFailed)
         }
-        None if state.require_if_match => Err(ApiError::PreconditionRequired),
+        None if state.require_if_match => Err(ApiError::PreconditionRequired(
+            "If-Match header is required".to_string(),
+        )),
         _ => Ok(()),
     }
 }
@@ -1273,7 +1292,7 @@ pub enum ApiError {
     /// `If-Match` precondition failed.
     PreconditionFailed,
     /// `If-Match` header required but absent (428).
-    PreconditionRequired,
+    PreconditionRequired(String),
     /// Optimistic-concurrency retries exhausted — retry the request.
     WriteConflict(String),
     /// An upstream-service dependency failed — e.g. a STAC extension
@@ -1302,10 +1321,7 @@ impl IntoResponse for ApiError {
                 StatusCode::PRECONDITION_FAILED,
                 "If-Match precondition failed".to_string(),
             ),
-            ApiError::PreconditionRequired => (
-                StatusCode::PRECONDITION_REQUIRED,
-                "If-Match header is required".to_string(),
-            ),
+            ApiError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, msg),
             ApiError::WriteConflict(id) => (
                 StatusCode::CONFLICT,
                 format!("Resource '{id}' was modified concurrently — retry the request"),

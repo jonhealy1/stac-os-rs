@@ -585,8 +585,9 @@ class _HttpDatabase:
     mappings); anything else skips the calling test.
     """
 
-    def __init__(self, os_client):
+    def __init__(self, os_client, http=None):
         self.client = _TranslatingOsClient(os_client)
+        self._http = http
         self.async_index_selector = _IndexSelector()
         # Tests isinstance-check this against DatetimeIndexInserter to
         # detect upstream's datetime-sharded mode. Any proxy instance
@@ -614,6 +615,14 @@ class _HttpDatabase:
         for logical in ("collections", "catalogs", "hierarchy"):
             await self._clear(logical)
 
+    async def get_one_item(self, item_id, collection_id, **kwargs):
+        r = await self._http.get(
+            f"/collections/{collection_id}/items/{item_id}"
+        )
+        if r.status_code == 404:
+            return None
+        return _check_status(r).json()
+
     async def find_collection(self, *args, **kwargs):
         # Present only so tests can monkeypatch it as a "lookup reached"
         # tripwire — against the external API it is never invoked.
@@ -633,17 +642,22 @@ class HttpTxnClient:
     """
 
     def __init__(self, os_client):
-        self.database = _HttpDatabase(os_client)
         self._http = httpx.AsyncClient(
             base_url=STAC_API_URL, timeout=60.0, transport=_UpstreamHostTransport()
         )
+        self.database = _HttpDatabase(os_client, self._http)
         # bulk_item_insert is synchronous upstream (no await at call
         # sites) — it needs a sync client.
         self._sync = httpx.Client(base_url=STAC_API_URL, timeout=60.0)
 
     async def create_collection(self, collection, request=None, refresh=False):
         r = await self._http.post("/collections", json=_dump(collection))
-        return _check_status(r).json()
+        result = _check_status(r).json()
+        if refresh:
+            # Upstream's refresh kwarg feeds the OS bulk/create call;
+            # the HTTP port refreshes the index directly instead.
+            await self.database.client.indices.refresh(index="_all")
+        return result
 
     def _raise_bulk_conflict(self, item_id, collection_id):
         # Emulates RAISE_ON_BULK_ERROR: the flag lives in the (separate)
@@ -702,6 +716,8 @@ class HttpTxnClient:
         return result
 
     async def create_item(self, collection_id, item, request=None, refresh=False):
+        from fastapi import HTTPException
+
         body = _dump(item)
         features = body.get("features")
         if features is None:
@@ -710,31 +726,71 @@ class HttpTxnClient:
             )
             if r.status_code == 409 and os.getenv("RAISE_ON_BULK_ERROR") == "true":
                 self._raise_bulk_conflict(body.get("id", ""), collection_id)
-            return _check_status(r).json()
-        # FeatureCollection path: upstream dedupes by item id (last wins)
-        # and returns a processed-count message.
-        last = {f["id"]: f for f in features if isinstance(f.get("id"), str) and f["id"]}
-        unique = list(last.values())
-        added = 0
-        conflicts = 0
-        for feature in unique:
-            r = await self._http.post(
-                f"/collections/{collection_id}/items", json=feature
+            if r.status_code == 400:
+                # Upstream raises HTTPException from the handler; the
+                # detail string carries the validation message.
+                raise HTTPException(
+                    status_code=400, detail=r.json().get("detail")
+                )
+            result = _check_status(r).json()
+            if refresh:
+                await self.database.client.indices.refresh(index="_all")
+            return result
+        # FeatureCollection path: one batch POST. Non-strict responses
+        # are 201 + per-member `errors`/`conflict_errors`; strict
+        # rejects surface as 4xx.
+        r = await self._http.post(
+            f"/collections/{collection_id}/items", json=body
+        )
+        if r.status_code == 409 and os.getenv("RAISE_ON_BULK_ERROR") == "true":
+            self._raise_bulk_conflict(
+                next(
+                    iter(r.json().get("conflict_errors") or {}),
+                    features[0].get("id", ""),
+                ),
+                collection_id,
             )
-            if r.status_code == 409:
-                if os.getenv("RAISE_ON_BULK_ERROR") == "true":
-                    self._raise_bulk_conflict(feature["id"], collection_id)
-                conflicts += 1
-            else:
-                _check_status(r)
-                added += 1
-        parts = [f"Processed {len(features)} items: {added} added"]
-        dups = len(features) - len(unique)
-        if dups:
-            parts.append(f"{dups} input duplicates")
-        if conflicts:
-            parts.append(f"{conflicts} conflicts")
-        return {"message": " | ".join(parts)}
+        if r.status_code == 400:
+            raise HTTPException(status_code=400, detail=r.json().get("detail"))
+        result = _check_status(r).json()
+        # RAISE_ON_BULK_ERROR lives in the API process — emulate the
+        # strict-mode rejection from the partial-success payload, like
+        # bulk_item_insert does above.
+        if os.getenv("RAISE_ON_BULK_ERROR") == "true":
+            conflicts = result.get("conflict_errors") or {}
+            member_errors = result.get("errors") or []
+            if conflicts:
+                self._raise_bulk_conflict(
+                    next(iter(conflicts)), collection_id
+                )
+            if member_errors:
+                grouped: dict = {}
+                for e in member_errors:
+                    grouped.setdefault(e.get("msg", "unknown"), []).append(
+                        e.get("id")
+                    )
+                n = len(member_errors)
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": (
+                            f"Batch rejected. {n} items failed validation."
+                        ),
+                        "errors": grouped,
+                        "summary": {
+                            "input_count": len(features),
+                            "processed_count": len(features),
+                            "valid_count": len(result.get("features") or []),
+                            "validation_error_count": n,
+                            "skipped_total": n + len(conflicts),
+                            "conflict_count": len(conflicts),
+                            "database_error_count": 0,
+                        },
+                    },
+                )
+        if refresh:
+            await self.database.client.indices.refresh(index="_all")
+        return result
 
     async def delete_collection(self, collection_id, request=None, refresh=False):
         r = await self._http.delete(f"/collections/{collection_id}")
@@ -958,7 +1014,10 @@ mock_datetime_env = _skip_fixture("mock_datetime_env")
 
 @pytest.fixture
 def stac_validator_off(monkeypatch):
-    """No-op: stac-os-rs has no ENABLE_STAC_VALIDATOR toggle (always off)."""
+    """Explicitly-unvalidated writes. In a validated run the server
+    validates regardless, so tests posting invalid docs skip."""
+    if UPSTREAM_VALIDATED:
+        pytest.skip("validated run has ENABLE_STAC_VALIDATOR=true")
     monkeypatch.setenv("ENABLE_STAC_VALIDATOR", "false")
 
 
@@ -1032,12 +1091,62 @@ _ENV_MUTATION_TESTS = {
 }
 
 
+# Set when the suite runs against an API started with
+# ENABLE_STAC_VALIDATOR=true ENABLE_TOPOLOGY_VALIDATION=true
+# REQUIRE_IF_MATCH=true (see `make test-upstream-validated`). In the
+# default run the API is unvalidated and the gated tests skip.
+UPSTREAM_VALIDATED = os.getenv("UPSTREAM_VALIDATED", "").lower() in ("1", "true")
+
 # Whole files skipped: the feature is deliberately out of scope, or the
 # file only exercises in-process internals.
 _SKIP_FILES = {
     "test_api_stac_validator.py": (
-        "stac-validate request-body validation is not implemented "
-        "(ENABLE_STAC_VALIDATOR is env-only and inert externally)"
+        "requires an API started with ENABLE_STAC_VALIDATOR=true — "
+        "run `make test-upstream-validated`"
+    ),
+}
+
+# Tests that only pass when the API runs validated — skipped in the
+# default (unvalidated) run.
+_VALIDATED_ONLY_TESTS = {
+    "test_require_if_match_returns_428_without_it": (
+        "requires REQUIRE_IF_MATCH=true — run `make test-upstream-validated`"
+    ),
+    "test_require_if_match_refuses_bulk_upsert": (
+        "requires REQUIRE_IF_MATCH=true — run `make test-upstream-validated`"
+    ),
+}
+
+# Per-test env the fixed validated-server config can't honor (server env
+# is read at startup; the monkeypatched values never leave the pytest
+# process). Equivalent behavior is covered by Rust tests.
+_VALIDATED_MODE_SKIPS = {
+    "test_chunked_validation_with_max_batch_size": (
+        "requires per-request MAX_BATCH_SIZE — chunked writes are not implemented"
+    ),
+    "test_chunked_validation_exceeds_max_error_size": (
+        "requires per-request MAX_BATCH_SIZE — chunked writes are not implemented; "
+        "the MAX_BATCH_ERROR_SIZE threshold is covered by Rust tests"
+    ),
+    "test_topology_validation_disabled_by_default": (
+        "validated run has ENABLE_TOPOLOGY_VALIDATION=true"
+    ),
+    "test_bulk_topology_validation_filters_invalid_items_lenient": (
+        "requires per-request MAX_BATCH_SIZE — chunked writes are not implemented"
+    ),
+    "test_bulk_topology_validation_trips_circuit_breaker": (
+        "requires per-request MAX_BATCH_SIZE — chunked writes are not implemented"
+    ),
+    "test_topology_validation_respects_max_vertices_limit": (
+        "requires per-request MAX_TOPOLOGY_VERTICES=10; the vertex "
+        "ceiling is covered by Rust tests"
+    ),
+    "test_topology_validation_allows_items_within_vertex_limit": (
+        "requires per-request MAX_TOPOLOGY_VERTICES=20; the vertex "
+        "ceiling is covered by Rust tests"
+    ),
+    "test_datetime_validation_disabled_by_default": (
+        "validated run has ENABLE_STAC_VALIDATOR=true"
     ),
 }
 
@@ -1069,13 +1178,15 @@ _IN_PROCESS_TESTS = {
         "races a write via monkeypatched client methods — the hook "
         "never fires against an external API"
     ),
-    "test_require_if_match_returns_428_without_it": (
-        "REQUIRE_IF_MATCH is env-only/inert externally (in-process "
-        "config flag)"
+    "test_bulk_item_insert_validation_error": (
+        "asserts upstream's python stac-validator message text verbatim; "
+        "rust stac-validate wording differs — the per-item error "
+        "structure is covered by Rust tests"
     ),
-    "test_require_if_match_refuses_bulk_upsert": (
-        "REQUIRE_IF_MATCH is env-only/inert externally (in-process "
-        "config flag)"
+    "test_bulk_item_insert_reports_validation_error_per_item": (
+        "asserts upstream's python stac-validator message text verbatim; "
+        "rust stac-validate wording differs — the per-item error "
+        "structure is covered by Rust tests"
     ),
     "test_hidden_put_queue_ack_preserves_storage_until_worker": (
         "requires a live Redis queue (out of scope)"
@@ -1217,14 +1328,6 @@ _IN_PROCESS_TESTS = {
         "monkeypatches bulk_sync on the in-process database — the "
         "external API never calls it"
     ),
-    "test_bulk_item_insert_validation_error": (
-        "ENABLE_STAC_VALIDATOR request-body validation is not "
-        "implemented (env-only/inert externally)"
-    ),
-    "test_bulk_item_insert_reports_validation_error_per_item": (
-        "ENABLE_STAC_VALIDATOR request-body validation is not "
-        "implemented (env-only/inert externally)"
-    ),
 }
 
 
@@ -1242,22 +1345,38 @@ def pytest_collection_modifyitems(items):
                     )
                 )
             )
-        if str(item.fspath).rsplit("/", 1)[-1] in _SKIP_FILES:
+        fname = str(item.fspath).rsplit("/", 1)[-1]
+        if fname in _SKIP_FILES and not (
+            UPSTREAM_VALIDATED and fname == "test_api_stac_validator.py"
+        ):
+            item.add_marker(pytest.mark.skip(reason=_SKIP_FILES[fname]))
+            continue
+        if UPSTREAM_VALIDATED and name in _VALIDATED_MODE_SKIPS:
             item.add_marker(
-                pytest.mark.skip(
-                    reason=_SKIP_FILES[str(item.fspath).rsplit("/", 1)[-1]]
-                )
+                pytest.mark.skip(reason=_VALIDATED_MODE_SKIPS[name])
+            )
+            continue
+        if not UPSTREAM_VALIDATED and name in _VALIDATED_ONLY_TESTS:
+            item.add_marker(
+                pytest.mark.skip(reason=_VALIDATED_ONLY_TESTS[name])
             )
             continue
         # Param-level skips: expectations keyed to env vars mutated
         # in-process (validator=true, USE_DATETIME=false for ranged
         # fields) — the external API can't see them.
         params = getattr(getattr(item, "callspec", None), "params", {}) or {}
-        if params.get("validator") == "true":
+        if params.get("validator") == "true" and not UPSTREAM_VALIDATED:
             item.add_marker(
                 pytest.mark.skip(
-                    reason="ENABLE_STAC_VALIDATOR=true is env-only/inert "
-                    "against an external API process"
+                    reason="requires ENABLE_STAC_VALIDATOR=true — "
+                    "run `make test-upstream-validated`"
+                )
+            )
+        elif params.get("validator") == "false" and UPSTREAM_VALIDATED:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="validated run always validates writes; the "
+                    "unvalidated side of this param has no meaning"
                 )
             )
         elif params.get("if_match", "").startswith(" ") or params.get(

@@ -34,29 +34,70 @@ pub async fn test_state(enable_transactions: bool) -> Option<Arc<AppState>> {
 /// Each call gets a unique `it-<nanos>` index prefix — every test runs
 /// against isolated, empty indices. `make test*` sweeps `it-*` after the
 /// run (`curl -XDELETE "$OPENSEARCH_URL/it-*"` for manual cleanup).
+/// Feature-flag bundle for `test_state_opts` — mirrors the AppState
+/// env knobs so tests can compose app variants without env mutation
+/// (env reads are racy under parallel test runs).
+#[derive(Clone, Copy, Default)]
+pub struct TestFlags {
+    pub enable_validator: bool,
+    pub require_if_match: bool,
+    pub raise_on_bulk_error: bool,
+    pub enable_topology_validation: bool,
+    pub max_topology_vertices: usize,
+    pub max_batch_error_size: Option<usize>,
+}
+
 pub async fn test_state_full(
     enable_transactions: bool,
     hide_alternate_parents: bool,
 ) -> Option<Arc<AppState>> {
-    test_state_opts(enable_transactions, hide_alternate_parents, false, false).await
+    test_state_opts(
+        enable_transactions,
+        hide_alternate_parents,
+        TestFlags::default(),
+    )
+    .await
 }
 
 /// `ENABLE_STAC_VALIDATOR=true` variant — write bodies are schema-validated.
 pub async fn test_state_validated() -> Option<Arc<AppState>> {
-    test_state_opts(true, false, true, false).await
+    test_state_opts(
+        true,
+        false,
+        TestFlags {
+            enable_validator: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// `ENABLE_STAC_VALIDATOR` + `REQUIRE_IF_MATCH` variant.
 pub async fn test_app_validated_if_match() -> Option<(Router, Arc<AppState>)> {
-    let state = test_state_opts(true, false, true, true).await?;
+    let state = test_state_opts(
+        true,
+        false,
+        TestFlags {
+            enable_validator: true,
+            require_if_match: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Some((build_app(state.clone()), state))
+}
+
+/// Build an app from explicit flags — for the validation/batch knobs
+/// that don't warrant their own helper.
+pub async fn test_app_flags(flags: TestFlags) -> Option<(Router, Arc<AppState>)> {
+    let state = test_state_opts(true, false, flags).await?;
     Some((build_app(state.clone()), state))
 }
 
 async fn test_state_opts(
     enable_transactions: bool,
     hide_alternate_parents: bool,
-    enable_validator: bool,
-    require_if_match: bool,
+    flags: TestFlags,
 ) -> Option<Arc<AppState>> {
     let url =
         std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
@@ -82,7 +123,7 @@ async fn test_state_opts(
         max_item_limit: None,
         excluded_item_fields: Vec::new(),
         excluded_queryables: Vec::new(),
-        validators: if enable_validator {
+        validators: if flags.enable_validator {
             vec![tokio::sync::Mutex::new(
                 stac_validate::Validator::new()
                     .await
@@ -92,7 +133,15 @@ async fn test_state_opts(
             Vec::new()
         },
         validator_cursor: std::sync::atomic::AtomicUsize::new(0),
-        require_if_match,
+        require_if_match: flags.require_if_match,
+        raise_on_bulk_error: flags.raise_on_bulk_error,
+        enable_topology_validation: flags.enable_topology_validation,
+        max_topology_vertices: if flags.max_topology_vertices == 0 {
+            5000
+        } else {
+            flags.max_topology_vertices
+        },
+        max_batch_error_size: flags.max_batch_error_size,
     }))
 }
 

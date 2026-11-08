@@ -81,8 +81,11 @@ async fn main() {
             .unwrap_or_default(),
         validators: match env_flag("ENABLE_STAC_VALIDATOR") {
             true => {
-                let mut pool = Vec::with_capacity(stac_os_rs::handlers::VALIDATOR_POOL_SIZE);
-                for _ in 0..pool.capacity() {
+                let size = env_u64("VALIDATOR_POOL_SIZE")
+                    .map(|n| (n as usize).max(1))
+                    .unwrap_or(stac_os_rs::handlers::VALIDATOR_POOL_SIZE);
+                let mut pool = Vec::with_capacity(size);
+                for _ in 0..size {
                     pool.push(tokio::sync::Mutex::new(
                         stac_validate::Validator::new().await.expect(
                             "ENABLE_STAC_VALIDATOR is set but the validator failed to initialize",
@@ -95,6 +98,12 @@ async fn main() {
         },
         validator_cursor: std::sync::atomic::AtomicUsize::new(0),
         require_if_match: env_flag("REQUIRE_IF_MATCH"),
+        raise_on_bulk_error: env_flag("RAISE_ON_BULK_ERROR"),
+        enable_topology_validation: env_flag("ENABLE_TOPOLOGY_VALIDATION"),
+        max_topology_vertices: env_u64("MAX_TOPOLOGY_VERTICES")
+            .map(|n| n as usize)
+            .unwrap_or(5000),
+        max_batch_error_size: env_u64("MAX_BATCH_ERROR_SIZE").map(|n| n as usize),
     });
     let app = build_app(state);
 
