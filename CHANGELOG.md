@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ENABLE_TOPOLOGY_VALIDATION` — geometry checks beyond the item JSON
+  schema: WGS84 bounds on every coordinate (lon ±180, lat ±90),
+  Polygon/MultiPolygon ring minimum of 4 vertices, the
+  `MAX_TOPOLOGY_VERTICES` ceiling (default 5000), and antimeridian
+  detection (>180° longitude jumps between consecutive ring vertices).
+  Failures return `400` with `Invalid item geometry: ...`
+  (`Topology Error: ...` inside batch `errors[]`). Mirrors upstream
+  `validate_item_topology_lightweight`
+- `RAISE_ON_BULK_ERROR` — strict batch writes (upstream parity). `true`:
+  a FeatureCollection POST or `bulk_items` insert with any malformed
+  member, schema failure, or conflict rejects the whole batch with
+  `400`/`409`. `false` (default): partial semantics — valid members are
+  written, failures are reported per-item
+- `MAX_BATCH_ERROR_SIZE` — validation-error ceiling for batch members:
+  once exceeded, the whole batch is rejected with `400` regardless of
+  `RAISE_ON_BULK_ERROR` (`Validation error threshold exceeded`)
+- `VALIDATOR_POOL_SIZE` — number of `stac-validate` instances kept warm
+  for concurrent validation (default 4)
+- `MAX_TOPOLOGY_VERTICES` — maximum vertices per polygon ring under
+  `ENABLE_TOPOLOGY_VALIDATION` (default 5000)
+- `make test-upstream-validated` — spins up its own API instance with
+  `ENABLE_STAC_VALIDATOR=true ENABLE_TOPOLOGY_VALIDATION=true
+  REQUIRE_IF_MATCH=true` and runs the validation-gated vendored
+  upstream tests (`test_api_stac_validator.py` + the `require_if_match`
+  tests) with `UPSTREAM_VALIDATED=1`
+
+### Changed
+
+- FeatureCollection batch POST now uses upstream partial semantics:
+  non-strict mode writes valid members and reports failures in the
+  response (`errors[]` per member, `conflict_errors` mapping id →
+  message, processed-count `message`) — was all-or-nothing 400/409.
+  A batch where every member fails returns 409 (all conflicts) or 400
+- `bulk_items` and FeatureCollection member validation now validates
+  the raw member document (serde normalization previously healed some
+  schema violations before the validator saw them) and reports upstream
+  message formats: `STAC validation failed for '{id}': ...`,
+  `Invalid item datetime: ...`, `Topology Error: ...`
+- Item write validation errors now use upstream message formats:
+  `Invalid item: STAC validation failed for '{id}': ...`,
+  `Invalid item datetime: ...`, `Invalid item geometry: ...` — and the
+  bulk-upsert-under-`REQUIRE_IF_MATCH` 428 detail now reads
+  `use method 'insert'` like upstream
+- `ENABLE_STAC_VALIDATOR` also enables upstream `validate_datetime_range`
+  checks: `start_datetime`/`end_datetime` must be supplied together,
+  `start <= end`, and `datetime` must fall inside the bounds when they
+  exist (`Invalid item datetime: ...`)
+
 ## [0.6.0] - 2026-11-08
 
 ### Added

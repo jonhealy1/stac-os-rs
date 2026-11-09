@@ -409,7 +409,7 @@ pub async fn root_landing_page(
         "stac_version": "1.0.0",
         "type": "Catalog",
         "id": "stac-multi-tenant-root",
-        "title": "STAC API with Multi-Tenant Catalogs",
+        "title": "stac-os-rs — STAC API with Multi-Tenant Catalogs",
         "description": "Multi-tenant STAC API backed by OpenSearch. Root catalog of the registry.",
         "conformsTo": conformance_classes(&state),
         "links": links

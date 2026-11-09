@@ -27,6 +27,10 @@ fn state() -> Arc<AppState> {
         validators: Vec::new(),
         validator_cursor: std::sync::atomic::AtomicUsize::new(0),
         require_if_match: false,
+        raise_on_bulk_error: false,
+        enable_topology_validation: false,
+        max_topology_vertices: 5000,
+        max_batch_error_size: None,
     })
 }
 
