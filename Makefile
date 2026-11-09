@@ -48,7 +48,10 @@ test-upstream: ## Run vendored upstream sfeos API tests against the API on :3000
 # on — two phases, since validator tests PATCH without If-Match while
 # the require_if_match tests need the 428 enforcement. Each phase
 # launches its own :3000 instance (fails fast if one's already up),
-# runs its slice with UPSTREAM_VALIDATED=1, then tears it down.
+# runs its slice with UPSTREAM_VALIDATED=1, then tears it down. The
+# binary is launched directly (not `cargo run`, whose child process
+# would survive `kill`) and `wait`ed after each phase so the port is
+# actually free before the next server binds.
 test-upstream-validated: opensearch ## Upstream validation tests against a validated API instance
 	@test -d tests/upstream/.venv || python3 -m venv tests/upstream/.venv
 	@tests/upstream/.venv/bin/pip install -q -r tests/upstream/requirements.txt
@@ -56,26 +59,36 @@ test-upstream-validated: opensearch ## Upstream validation tests against a valid
 		echo "API already running on :3000 — stop it first (make down)"; \
 		exit 1; \
 	fi
+	cargo build
 	@ENABLE_STAC_VALIDATOR=true ENABLE_TOPOLOGY_VALIDATION=true \
 		ENABLE_TRANSACTIONS_EXTENSIONS=true OPENSEARCH_URL=$(OPENSEARCH_URL) \
-		cargo run > /tmp/stac-os-rs-validated.log 2>&1 & \
+		./target/debug/stac-os-rs > /tmp/stac-os-rs-validated-1.log 2>&1 & \
 	apid=$$!; \
-	for i in $$(seq 1 120); do \
+	trap 'kill $$apid 2>/dev/null' EXIT; \
+	for i in $$(seq 1 60); do \
 		curl -sf $(STAC_API_URL)/ > /dev/null 2>&1 && break; \
 		sleep 1; \
 	done; \
+	curl -sf $(STAC_API_URL)/ > /dev/null 2>&1 || { \
+		echo "validated API failed to start — see /tmp/stac-os-rs-validated-1.log"; \
+		exit 1; \
+	}; \
 	UPSTREAM_VALIDATED=1 STAC_API_URL=$(STAC_API_URL) OPENSEARCH_URL=$(OPENSEARCH_URL) \
 		tests/upstream/.venv/bin/pytest tests/upstream/api/test_api_stac_validator.py -v; \
 	status=$$?; \
-	kill $$apid 2>/dev/null; sleep 1; \
+	kill $$apid 2>/dev/null; wait $$apid 2>/dev/null; \
 	REQUIRE_IF_MATCH=true ENABLE_TRANSACTIONS_EXTENSIONS=true \
 		OPENSEARCH_URL=$(OPENSEARCH_URL) \
-		cargo run > /tmp/stac-os-rs-validated.log 2>&1 & \
+		./target/debug/stac-os-rs > /tmp/stac-os-rs-validated-2.log 2>&1 & \
 	apid=$$!; \
-	for i in $$(seq 1 120); do \
+	for i in $$(seq 1 60); do \
 		curl -sf $(STAC_API_URL)/ > /dev/null 2>&1 && break; \
 		sleep 1; \
 	done; \
+	curl -sf $(STAC_API_URL)/ > /dev/null 2>&1 || { \
+		echo "if-match API failed to start — see /tmp/stac-os-rs-validated-2.log"; \
+		exit $$((status + 1)); \
+	}; \
 	UPSTREAM_VALIDATED=1 STAC_API_URL=$(STAC_API_URL) OPENSEARCH_URL=$(OPENSEARCH_URL) \
 		tests/upstream/.venv/bin/pytest tests/upstream/api/test_conditional_requests.py -v \
 			-k "test_require_if_match"; \

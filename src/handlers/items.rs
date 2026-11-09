@@ -387,6 +387,46 @@ async fn validate_member_doc(state: &AppState, doc: serde_json::Value) -> Result
     Ok(())
 }
 
+/// Upstream `build_bulk_summary` telemetry, embedded in the `detail`
+/// dict of strict bulk rejections ("Bulk insertion rejected." /
+/// "Batch rejected." / "No items were added to the database.").
+fn bulk_summary(
+    input_count: usize,
+    processed_count: usize,
+    valid_count: usize,
+    validation_error_count: usize,
+    conflict_count: usize,
+    database_error_count: usize,
+) -> serde_json::Value {
+    json!({
+        "input_count": input_count,
+        "processed_count": processed_count,
+        "valid_count": valid_count,
+        "skipped_total": input_count.saturating_sub(processed_count)
+            + validation_error_count
+            + conflict_count,
+        "validation_error_count": validation_error_count,
+        "conflict_count": conflict_count,
+        "database_error_count": database_error_count,
+    })
+}
+
+/// `{msg: [ids]}` grouping of `{"id","msg"}` error entries — upstream's
+/// `validation_errors` dict shape inside rejection `detail`s.
+fn errors_grouped_by_msg(errors: &[serde_json::Value]) -> serde_json::Value {
+    let mut grouped = serde_json::Map::new();
+    for e in errors {
+        let msg = e["msg"].as_str().unwrap_or("unknown").to_string();
+        grouped
+            .entry(msg)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("grouping array")
+            .push(e["id"].clone());
+    }
+    serde_json::Value::Object(grouped)
+}
+
 #[utoipa::path(
     get,
     path = "/catalogs/{catalog_id}/collections/{collection_id}/items",
@@ -724,17 +764,22 @@ pub async fn create_scoped_item(
 pub async fn update_scoped_item(
     Path((catalog_id, collection_id, item_id)): Path<(String, String, String)>,
     State(state): State<Arc<AppState>>,
-    StacJson(mut item): StacJson<Item>,
+    StacJson(body): StacJson<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    validate_item_collection(&mut item, &collection_id, &state.base_url)?;
-    let doc = serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Validate the raw document like the create path — serde
+    // normalization heals some schema violations (e.g. a missing
+    // `type` re-serializes as "Feature") before the schema sees them.
+    let body_id = body["id"].as_str().unwrap_or_default().to_string();
     validate_item_write(
         &state,
-        &item_validation_doc(&state, &doc, &collection_id, Some(&catalog_id)),
-        &item.id,
+        &item_validation_doc(&state, &body, &collection_id, Some(&catalog_id)),
+        &body_id,
     )
     .await?;
+    let mut item: Item = serde_json::from_value(body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
+    validate_item_collection(&mut item, &collection_id, &state.base_url)?;
     if !state
         .store
         .put_document(ITEMS_INDEX, &item_key(&item_id, &collection_id), &item)
@@ -915,50 +960,46 @@ async fn create_items_batch(
         by_id.insert(item.id.clone(), (item, raw));
     }
     if raise && !member_errors.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "Batch rejected. {} items are malformed.",
-            member_errors.len()
-        )));
+        return Err(ApiError::JsonDetail(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "message": format!("Batch rejected. {} items are malformed.", member_errors.len()),
+                "errors": member_errors
+                    .iter()
+                    .map(|(id, msg)| json!({"id": id, "msg": msg}))
+                    .collect::<Vec<_>>(),
+            }),
+        ));
     }
+    // Phase-1 failures are upstream's "preprocessing skipped" bucket.
+    let admission_error_count = member_errors.len();
 
-    // Phase 2 — existence preflight → conflicts (skipped or fatal).
-    let keys: Vec<String> = order.iter().map(|id| item_key(id, collection_id)).collect();
-    let existing = state.store.existing_ids(ITEMS_INDEX, &keys).await?;
-    let mut conflict_errors = serde_json::Map::new();
-    let mut candidates: Vec<String> = Vec::new();
-    for id in &order {
-        if existing.contains(&item_key(id, collection_id)) {
-            if raise {
-                return Err(ApiError::Conflict(id.clone()));
-            }
-            conflict_errors.insert(
-                id.clone(),
-                json!(format!(
-                    "Item {id} in collection {collection_id} already exists"
-                )),
-            );
-        } else {
-            candidates.push(id.clone());
-        }
-    }
-
-    // Phase 3 — member validation, buffered across the validator pool.
-    let docs: Vec<serde_json::Value> = candidates
+    // Phase 2 — member validation, buffered across the validator pool.
+    // Upstream validates before insert, so an id that both fails schema
+    // and already exists reports the validation error, not a conflict.
+    let docs: Vec<serde_json::Value> = order
         .iter()
         .map(|id| item_validation_doc(state, &by_id[id].1, collection_id, scope))
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(state, doc))
-        .buffered(VALIDATOR_POOL_SIZE)
+        .buffered(state.validators.len().max(1))
         .collect::<Vec<_>>()
         .await;
     let mut valid: Vec<String> = Vec::new();
     let mut validation_error_count = 0usize;
-    for (id, result) in candidates.iter().zip(validations) {
+    let mut validation_grouped = serde_json::Map::new();
+    for (id, result) in order.iter().zip(validations) {
         match result {
             Ok(()) => valid.push(id.clone()),
             Err(ApiError::BadRequest(msg)) => {
                 validation_error_count += 1;
+                validation_grouped
+                    .entry(msg.clone())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .expect("grouping array")
+                    .push(json!(id));
                 member_errors.push((id.clone(), msg));
             }
             Err(e) => return Err(e),
@@ -966,28 +1007,61 @@ async fn create_items_batch(
     }
     if let Some(max) = state.max_batch_error_size {
         if validation_error_count > max {
-            return Err(ApiError::BadRequest(format!(
-                "Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."
-            )));
+            return Err(ApiError::JsonDetail(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "message": format!("Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."),
+                    "summary": bulk_summary(input_count, order.len(), valid.len(), validation_error_count, 0, 0),
+                    "errors": validation_grouped,
+                }),
+            ));
         }
     }
     if raise && validation_error_count > 0 {
-        return Err(ApiError::BadRequest(format!(
-            "Batch rejected. {validation_error_count} items failed validation."
-        )));
+        return Err(ApiError::JsonDetail(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "message": format!("Batch rejected. {validation_error_count} items failed validation."),
+                "summary": bulk_summary(input_count, order.len(), valid.len(), validation_error_count, 0, 0),
+                "errors": validation_grouped,
+            }),
+        ));
+    }
+
+    // Phase 3 — existence preflight on the validated members →
+    // conflicts (skipped or fatal), then one `_bulk` create.
+    let keys: Vec<String> = valid.iter().map(|id| item_key(id, collection_id)).collect();
+    let existing = state.store.existing_ids(ITEMS_INDEX, &keys).await?;
+    let mut conflict_errors = serde_json::Map::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for id in &valid {
+        if existing.contains(&item_key(id, collection_id)) {
+            if raise {
+                return Err(ApiError::Conflict(id.clone()));
+            }
+            conflict_errors.insert(
+                id.clone(),
+                json!(format!(
+                    "Item '{id}' already exists in collection '{collection_id}'"
+                )),
+            );
+        } else {
+            candidates.push(id.clone());
+        }
     }
 
     // Phase 4 — one `_bulk` create for the surviving members.
-    let ops: Vec<(String, serde_json::Value, bool)> = valid
+    let ops: Vec<(String, serde_json::Value, bool)> = candidates
         .iter()
         .map(|id| {
-            let doc = serde_json::to_value(&by_id[id].0).unwrap_or_default();
-            (item_key(id, collection_id), doc, true)
+            serde_json::to_value(&by_id[id].0).map(|doc| (item_key(id, collection_id), doc, true))
         })
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let results = state.store.bulk_write(ITEMS_INDEX, &ops).await?;
     let mut added: Vec<String> = Vec::new();
-    for (id, res) in valid.iter().zip(&results) {
+    let mut database_error_count = 0usize;
+    for (id, res) in candidates.iter().zip(&results) {
         match res.status {
             s if (200..300).contains(&s) => added.push(id.clone()),
             409 => {
@@ -997,7 +1071,7 @@ async fn create_items_batch(
                 conflict_errors.insert(
                     id.clone(),
                     json!(format!(
-                        "Item {id} in collection {collection_id} already exists"
+                        "Item '{id}' already exists in collection '{collection_id}'"
                     )),
                 );
             }
@@ -1008,6 +1082,7 @@ async fn create_items_batch(
                         res.error.as_deref().unwrap_or("unknown error")
                     )));
                 }
+                database_error_count += 1;
                 member_errors.push((
                     id.clone(),
                     format!(
@@ -1018,18 +1093,35 @@ async fn create_items_batch(
             }
         }
     }
-    // Upstream: nothing inserted at all → 409 when every failure was a
-    // conflict, 400 otherwise ("No items were added to the database.").
+    // Upstream: nothing inserted at all → 409 only when every validated
+    // member was a conflict and nothing else went wrong (upstream's
+    // `all_conflicts` classification), 400 otherwise — `detail` is a
+    // dict either way.
     if added.is_empty() && input_count > 0 {
-        if !conflict_errors.is_empty() && member_errors.is_empty() {
-            let id = conflict_errors.keys().next().cloned().unwrap_or_default();
-            return Err(ApiError::Conflict(id));
-        }
-        if !member_errors.is_empty() {
-            return Err(ApiError::BadRequest(
-                "No items were added to the database.".into(),
-            ));
-        }
+        let all_conflicts = !conflict_errors.is_empty()
+            && conflict_errors.len() == valid.len()
+            && member_errors.is_empty()
+            && input_dupes == 0;
+        return Err(ApiError::JsonDetail(
+            if all_conflicts {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({
+                "message": "No items were added to the database.",
+                "summary": bulk_summary(
+                    input_count,
+                    order.len(),
+                    valid.len(),
+                    validation_error_count,
+                    conflict_errors.len(),
+                    database_error_count,
+                ),
+                "validation_errors": validation_grouped,
+                "conflict_errors": conflict_errors,
+            }),
+        ));
     }
     let docs: Vec<serde_json::Value> = added
         .iter()
@@ -1045,8 +1137,14 @@ async fn create_items_batch(
     if validation_error_count > 0 {
         parts.push(format!("{validation_error_count} validation errors"));
     }
+    if admission_error_count > 0 {
+        parts.push(format!("{admission_error_count} preprocessing skipped"));
+    }
     if !conflict_errors.is_empty() {
         parts.push(format!("{} conflicts", conflict_errors.len()));
+    }
+    if database_error_count > 0 {
+        parts.push(format!("{database_error_count} database errors"));
     }
     Ok((
         StatusCode::CREATED,
@@ -1084,12 +1182,15 @@ pub async fn update_root_item(
     Path((collection_id, item_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    StacJson(mut item): StacJson<Item>,
+    StacJson(body): StacJson<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if item.id != item_id {
+    if body["id"].as_str() != Some(item_id.as_str()) {
         return Err(ApiError::BadRequest(format!(
             "body id '{}' does not match path '{item_id}'",
-            item.id
+            body["id"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| body["id"].to_string())
         )));
     }
     if state
@@ -1107,15 +1208,18 @@ pub async fn update_root_item(
     {
         Some((doc, version)) if doc["collection"] == collection_id => {
             require_if_match(&state, &headers, &etag_of(&state, ITEMS_INDEX, &version))?;
-            validate_item_collection(&mut item, &collection_id, &state.base_url)?;
-            let value =
-                serde_json::to_value(&item).map_err(|e| ApiError::Internal(e.to_string()))?;
+            // Validate the raw document like the create path — serde
+            // normalization heals some schema violations before the
+            // schema sees them.
             validate_item_write(
                 &state,
-                &item_validation_doc(&state, &value, &collection_id, None),
-                &item.id,
+                &item_validation_doc(&state, &body, &collection_id, None),
+                &item_id,
             )
             .await?;
+            let mut item: Item = serde_json::from_value(body)
+                .map_err(|e| ApiError::BadRequest(format!("invalid item: {e}")))?;
+            validate_item_collection(&mut item, &collection_id, &state.base_url)?;
             let key = item_key(&item_id, &collection_id);
             let applied = if headers.contains_key(header::IF_MATCH) {
                 state
@@ -1411,12 +1515,12 @@ pub async fn bulk_create_items(
         }
     }
     if raise_on_error && !errors.is_empty() {
-        return Err(ApiError::BadRequest(
+        return Err(ApiError::JsonDetail(
+            StatusCode::BAD_REQUEST,
             json!({
                 "message": format!("Bulk insertion rejected. {} items are malformed.", errors.len()),
                 "errors": errors,
-            })
-            .to_string(),
+            }),
         ));
     }
     // Dedupe by item id, last occurrence wins (upstream dict semantics),
@@ -1434,6 +1538,7 @@ pub async fn bulk_create_items(
         }
     }
     skipped += admitted.len() - unique.len();
+    let processed_count = unique.len();
     // Deserialize + identity-check per item first (cheap, sequential),
     // then schema-validate the survivors in parallel across the
     // validator pool, and finally one `_bulk` request — a single
@@ -1458,24 +1563,25 @@ pub async fn bulk_create_items(
         candidates.push((raw, item));
     }
     if raise_on_error && !errors.is_empty() {
-        return Err(ApiError::BadRequest(
+        return Err(ApiError::JsonDetail(
+            StatusCode::BAD_REQUEST,
             json!({
                 "message": format!("Bulk insertion rejected. {} items are malformed.", errors.len()),
                 "errors": errors,
-            })
-            .to_string(),
+            }),
         ));
     }
-    // `buffered` keeps POOL_SIZE validations in flight, results in
-    // order. Schema failures are per-item errors like the other
-    // malformed admissions; a fetch failure is environmental — abort.
+    // `buffered` keeps `validators.len()` validations in flight,
+    // results in order. Schema failures are per-item errors like the
+    // other malformed admissions; a fetch failure is environmental —
+    // abort.
     let docs: Vec<serde_json::Value> = candidates
         .iter()
         .map(|(raw, _)| item_validation_doc(&state, raw, &collection_id, None))
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(&state, doc))
-        .buffered(VALIDATOR_POOL_SIZE)
+        .buffered(state.validators.len().max(1))
         .collect::<Vec<_>>()
         .await;
     let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -1499,18 +1605,38 @@ pub async fn bulk_create_items(
     // otherwise be skipped).
     if let Some(max) = state.max_batch_error_size {
         if validation_error_count > max {
-            return Err(ApiError::BadRequest(format!(
-                "Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."
-            )));
+            return Err(ApiError::JsonDetail(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "message": format!("Batch rejected. Validation error threshold exceeded ({validation_error_count} errors found). Halting validation loop."),
+                    "summary": bulk_summary(
+                        admitted.len(),
+                        processed_count,
+                        prepared.len(),
+                        validation_error_count,
+                        0,
+                        0,
+                    ),
+                    "errors": errors_grouped_by_msg(&errors),
+                }),
+            ));
         }
     }
     if raise_on_error && validation_error_count > 0 {
-        return Err(ApiError::BadRequest(
+        return Err(ApiError::JsonDetail(
+            StatusCode::BAD_REQUEST,
             json!({
                 "message": format!("Bulk insertion rejected. {validation_error_count} items failed validation."),
-                "errors": errors,
-            })
-            .to_string(),
+                "summary": bulk_summary(
+                    admitted.len(),
+                    processed_count,
+                    prepared.len(),
+                    validation_error_count,
+                    0,
+                    0,
+                ),
+                "errors": errors_grouped_by_msg(&errors),
+            }),
         ));
     }
     let ops: Vec<(String, serde_json::Value, bool)> = prepared
@@ -1524,9 +1650,12 @@ pub async fn bulk_create_items(
             409 => {
                 skipped += 1;
                 if raise_on_error {
-                    return Err(ApiError::Conflict(format!(
-                        "Item '{id}' already exists in collection '{collection_id}'"
-                    )));
+                    return Err(ApiError::JsonDetail(
+                        StatusCode::CONFLICT,
+                        json!(format!(
+                            "Item '{id}' already exists in collection '{collection_id}'"
+                        )),
+                    ));
                 }
                 errors.push(json!({"id": id, "msg": "item already exists or write conflict"}));
             }

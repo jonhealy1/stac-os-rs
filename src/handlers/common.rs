@@ -1285,6 +1285,10 @@ pub(crate) fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Va
 
 pub enum ApiError {
     BadRequest(String),
+    /// Structured `{"detail": <object>}` body — upstream raises
+    /// `HTTPException(detail={...})` for strict bulk rejections, so
+    /// `detail` is a dict (`message`/`errors`/`summary`), not a string.
+    JsonDetail(StatusCode, serde_json::Value),
     /// Requested resources sit outside the scoped catalog (403).
     Forbidden(String),
     NotFound(String),
@@ -1309,27 +1313,33 @@ impl From<opensearch::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
-            ApiError::NotFound(id) => (StatusCode::NOT_FOUND, format!("Resource '{id}' not found")),
+        let (status, detail) = match self {
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, json!(msg)),
+            ApiError::JsonDetail(status, detail) => (status, detail),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, json!(msg)),
+            ApiError::NotFound(id) => (
+                StatusCode::NOT_FOUND,
+                json!(format!("Resource '{id}' not found")),
+            ),
             ApiError::Conflict(id) => (
                 StatusCode::CONFLICT,
-                format!("Resource '{id}' already exists"),
+                json!(format!("Resource '{id}' already exists")),
             ),
             ApiError::PreconditionFailed => (
                 StatusCode::PRECONDITION_FAILED,
-                "If-Match precondition failed".to_string(),
+                json!("If-Match precondition failed"),
             ),
-            ApiError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, msg),
+            ApiError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, json!(msg)),
             ApiError::WriteConflict(id) => (
                 StatusCode::CONFLICT,
-                format!("Resource '{id}' was modified concurrently — retry the request"),
+                json!(format!(
+                    "Resource '{id}' was modified concurrently — retry the request"
+                )),
             ),
-            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, json!(msg)),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, json!(msg)),
         };
-        (status, Json(json!({ "detail": msg }))).into_response()
+        (status, Json(json!({ "detail": detail }))).into_response()
     }
 }
 
