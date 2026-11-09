@@ -817,9 +817,10 @@ pub(crate) fn collection_links(
 }
 
 /// Links for a collection read at the global `/collections/{id}` route:
-/// `self` is the canonical URL, `parent` per non-root parent catalog
-/// (landing page when root-level), `related`/`duplicate` expose the
-/// scoped paths unless `hide_alternate_parents`.
+/// `self` is the canonical URL, `parent` is always the landing page,
+/// `related`/`duplicate` expose the scoped paths for each non-root
+/// parent catalog — only when the catalogs route is mounted and
+/// `hide_alternate_parents` is off.
 pub(crate) fn global_collection_links(
     state: &AppState,
     collection_id: &str,

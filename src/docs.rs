@@ -100,6 +100,9 @@ pub fn openapi(
         doc.paths
             .paths
             .retain(|path, _| !path.starts_with("/catalogs"));
+        if let Some(tags) = doc.tags.as_mut() {
+            tags.retain(|t| t.name != "catalogs");
+        }
     }
     if !transactions_enabled {
         for item in doc.paths.paths.values_mut() {

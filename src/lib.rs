@@ -167,8 +167,10 @@ pub fn catalogs_transaction_router() -> Router<Arc<AppState>> {
         )
 }
 
-/// Build the API router. Mutating routes are only mounted when
-/// `state.enable_transactions` is set (ENABLE_TRANSACTIONS_EXTENSIONS).
+/// Build the API router. The `/catalogs` surface is only mounted when
+/// `state.enable_catalogs_route` is set (ENABLE_CATALOGS_ROUTE, default
+/// on); mutating routes additionally require `state.enable_transactions`
+/// (ENABLE_TRANSACTIONS_EXTENSIONS).
 pub fn build_app(state: Arc<AppState>) -> Router {
     let mut app = read_router();
     // Custom collections-search route — opt-in like upstream

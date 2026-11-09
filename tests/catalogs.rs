@@ -3200,18 +3200,19 @@ async fn test_catalogs_route_disabled_unmounts_surface_and_links() {
         .unwrap();
 
     // The whole catalogs surface is gone — reads and writes alike
-    // (transactions are on in this test variant).
+    // (transactions are on in this test variant). Probes hit the seeded
+    // `cat` so a mounted route would answer 200/4xx, never a masked 404.
     for (method, path) in [
-        ("GET", "/catalogs"),
-        ("GET", "/catalogs/x"),
-        ("GET", "/catalogs/x/children"),
-        ("GET", "/catalogs/x/collections"),
-        ("GET", "/catalogs/search"),
-        ("GET", "/catalogs/x/conformance"),
-        ("POST", "/catalogs"),
-        ("POST", "/catalogs/x/collections"),
+        ("GET", "/catalogs".to_string()),
+        ("GET", format!("/catalogs/{cat}")),
+        ("GET", format!("/catalogs/{cat}/children")),
+        ("GET", format!("/catalogs/{cat}/collections")),
+        ("GET", "/catalogs/search".to_string()),
+        ("GET", format!("/catalogs/{cat}/conformance")),
+        ("POST", "/catalogs".to_string()),
+        ("POST", format!("/catalogs/{cat}/collections")),
     ] {
-        let (s, _) = call(&app, method, path, None).await;
+        let (s, _) = call(&app, method, &path, None).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{method} {path}");
     }
 
