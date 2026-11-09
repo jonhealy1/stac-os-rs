@@ -82,16 +82,25 @@ pub struct ApiDoc;
 /// The rendered OpenAPI document for a given deployment configuration,
 /// with `info.version` synced from `CARGO_PKG_VERSION` (the derive macro
 /// can't read env vars). Paths are pruned to match `build_app`: non-GET
-/// operations go away when transactions are off, and the
-/// collections-search routes follow their flags — the spec never
-/// advertises endpoints that aren't mounted.
+/// operations go away when transactions are off, catalogs paths follow
+/// `ENABLE_CATALOGS_ROUTE`, and the collections-search routes follow
+/// their flags — the spec never advertises endpoints that aren't
+/// mounted.
 pub fn openapi(
     transactions_enabled: bool,
     collections_search_route: bool,
     collections_search: bool,
+    catalogs_enabled: bool,
 ) -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
     doc.info.version = env!("CARGO_PKG_VERSION").to_string();
+    if !catalogs_enabled {
+        doc.info.title = "stac-os-rs — STAC API".to_string();
+        doc.info.description = Some("STAC API backed by OpenSearch. Transaction routes exist only when ENABLE_TRANSACTIONS_EXTENSIONS is set.".to_string());
+        doc.paths
+            .paths
+            .retain(|path, _| !path.starts_with("/catalogs"));
+    }
     if !transactions_enabled {
         for item in doc.paths.paths.values_mut() {
             item.put = None;

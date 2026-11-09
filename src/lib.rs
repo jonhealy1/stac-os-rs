@@ -13,10 +13,12 @@ use axum::{
 use handlers::*;
 use std::sync::Arc;
 
-/// Read-only router — the full STAC read surface (landing page, core
-/// collections routes, catalogs registry, all search endpoints).
-/// Returned unbound; call `.with_state(state)` after merging in your
-/// own extension routes.
+/// Read-only router — the core STAC read surface (landing page,
+/// collections routes, item search), without the catalogs registry.
+/// `build_app` merges `catalogs_read_router` when
+/// `state.enable_catalogs_route` is set (`ENABLE_CATALOGS_ROUTE`,
+/// default on). Returned unbound; call `.with_state(state)` after
+/// merging in your own extension routes.
 pub fn read_router() -> Router<Arc<AppState>> {
     Router::new()
         // --- Global Landing Page ---
@@ -49,6 +51,14 @@ pub fn read_router() -> Router<Arc<AppState>> {
             "/collections/{collection_id}/items/{item_id}",
             get(get_collection_item),
         )
+}
+
+/// Multi-Tenant Catalogs read surface — merged by `build_app` only
+/// when `state.enable_catalogs_route` is set. Upstream gates the same
+/// surface behind its opt-in `ENABLE_CATALOGS_ROUTE` (default off
+/// there; this port defaults it on).
+pub fn catalogs_read_router() -> Router<Arc<AppState>> {
+    Router::new()
         // --- Registry & Management Plane ---
         .route("/catalogs", get(list_catalogs))
         .route("/catalogs/{catalog_id}", get(get_catalog))
@@ -92,9 +102,11 @@ pub fn read_router() -> Router<Arc<AppState>> {
         )
 }
 
-/// Transaction router — mutating routes. `build_app` merges this only
-/// when `state.enable_transactions` is set; embedders may merge it
-/// selectively themselves (e.g. behind auth middleware).
+/// Transaction router — mutating routes on the canonical surface.
+/// `build_app` merges this only when `state.enable_transactions` is
+/// set; catalogs-surface writes live in `catalogs_transaction_router`.
+/// Embedders may merge it selectively themselves (e.g. behind auth
+/// middleware).
 pub fn transaction_router() -> Router<Arc<AppState>> {
     Router::new()
         // Core transaction routes (STAC Transaction extension /
@@ -117,7 +129,13 @@ pub fn transaction_router() -> Router<Arc<AppState>> {
                 .delete(delete_root_item)
                 .patch(patch_root_item),
         )
-        // Catalog-extension transaction routes (scoped surface)
+}
+
+/// Catalog-extension transaction routes (scoped surface). `build_app`
+/// merges this only when both `enable_transactions` and
+/// `enable_catalogs_route` are set.
+pub fn catalogs_transaction_router() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/catalogs", post(create_root_catalog))
         .route(
             "/catalogs/{catalog_id}",
@@ -168,8 +186,16 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     if state.enable_collections_search || state.enable_collections_search_route {
         app = app.route("/collections-sortables", get(collections_sortables));
     }
+    // Multi-Tenant Catalogs extension — opt-out (default on), matching
+    // upstream's `ENABLE_CATALOGS_ROUTE` knob but inverted default.
+    if state.enable_catalogs_route {
+        app = app.merge(catalogs_read_router());
+    }
     if state.enable_transactions {
         app = app.merge(transaction_router());
+        if state.enable_catalogs_route {
+            app = app.merge(catalogs_transaction_router());
+        }
     }
     app.with_state(state)
         // Compression first so it runs innermost on the way out; the

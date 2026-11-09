@@ -3161,3 +3161,107 @@ async fn test_scoped_items_feature_collection_wrong_catalog() {
 // test_catalog_conformance_omits_transaction_uri_from_client (mock client),
 // test_core_put_collection_* / test_patch_* / test_core_post_* response-link tests
 // depend on root /collections routes we deliberately don't have.
+
+// --- ENABLE_CATALOGS_ROUTE=false (opt-out; upstream's flag is opt-in) ---
+
+#[tokio::test]
+async fn test_catalogs_route_disabled_unmounts_surface_and_links() {
+    let Some((app, state)) = test_app_flags(TestFlags {
+        disable_catalogs_route: true,
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+
+    // A catalog doc + a collection under a catalog parent, seeded
+    // directly (the catalogs write routes are themselves unmounted).
+    let cat = uniq("off-cat");
+    state
+        .store
+        .index_document(CATALOGS_INDEX, &cat, catalog(&cat))
+        .await
+        .unwrap();
+    state
+        .store
+        .set_parents(&cat, vec![ROOT_CATALOG_ID.to_string()], NodeKind::Catalog)
+        .await
+        .unwrap();
+    let ctx = ctx(&state).await;
+    state
+        .store
+        .set_parents(
+            &ctx.collection_id,
+            vec![uniq("ghost-cat"), ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+
+    // The whole catalogs surface is gone — reads and writes alike
+    // (transactions are on in this test variant).
+    for (method, path) in [
+        ("GET", "/catalogs"),
+        ("GET", "/catalogs/x"),
+        ("GET", "/catalogs/x/children"),
+        ("GET", "/catalogs/x/collections"),
+        ("GET", "/catalogs/search"),
+        ("GET", "/catalogs/x/conformance"),
+        ("POST", "/catalogs"),
+        ("POST", "/catalogs/x/collections"),
+    ] {
+        let (s, _) = call(&app, method, path, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // Landing page drops the catalogs link, catalog child links (the
+    // collection child survives), and the multi-tenant conformsTo URIs.
+    let (s, landing) = call(&app, "GET", "/", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(links_by_rel(&landing, "catalogs").is_empty());
+    for child in links_by_rel(&landing, "child") {
+        let href = child["href"].as_str().unwrap();
+        assert!(
+            !href.contains("/catalogs/"),
+            "catalogs-off landing page links into /catalogs: {href}"
+        );
+    }
+    for uri in landing["conformsTo"].as_array().unwrap() {
+        let uri = uri.as_str().unwrap();
+        assert!(
+            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children"),
+            "catalogs-off landing page conformsTo advertises {uri}"
+        );
+    }
+    let (s, conf) = call(&app, "GET", "/conformance", None).await;
+    assert_eq!(s, StatusCode::OK);
+    for uri in conf["conformsTo"].as_array().unwrap() {
+        let uri = uri.as_str().unwrap();
+        assert!(
+            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children"),
+            "/conformance advertises {uri}"
+        );
+    }
+
+    // Core surface unaffected.
+    assert_eq!(
+        call(&app, "GET", "/collections", None).await.0,
+        StatusCode::OK
+    );
+    let (s, _) = call(&app, "GET", "/search", None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Scoped related/duplicate links are suppressed on global reads —
+    // their /catalogs/{p} hrefs would 404.
+    let (s, col) = call(
+        &app,
+        "GET",
+        &format!("/collections/{}", ctx.collection_id),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(links_by_rel(&col, "related").is_empty());
+    assert!(links_by_rel(&col, "duplicate").is_empty());
+}

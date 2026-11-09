@@ -39,13 +39,19 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
         "https://api.stacspec.org/v1.1.0/collection-search#sortables",
-        "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
-        "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/search",
-        "https://api.stacspec.org/v1.0.0/children",
-        "https://api.stacspec.org/v1.0.0/children#type-filter",
     ];
+    if state.enable_catalogs_route {
+        conforms_to.extend([
+            "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
+            "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/search",
+            "https://api.stacspec.org/v1.0.0/children",
+            "https://api.stacspec.org/v1.0.0/children#type-filter",
+        ]);
+        if state.enable_transactions {
+            conforms_to.push("https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/transaction");
+        }
+    }
     if state.enable_transactions {
-        conforms_to.push("https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/transaction");
         conforms_to.push("https://api.stacspec.org/v1.0.0/ogcapi-features/extensions/transaction");
     }
     conforms_to
@@ -289,6 +295,7 @@ pub async fn api(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse
         state.enable_transactions,
         state.enable_collections_search_route,
         state.enable_collections_search,
+        state.enable_catalogs_route,
     );
     let body = doc
         .to_json()
@@ -356,13 +363,27 @@ pub async fn root_landing_page(
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
-        { "rel": "queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" },
-        { "rel": "catalogs", "type": "application/json", "href": format!("{base}/catalogs"), "title": "Multi-Tenant Catalogs Registry" }
+        { "rel": "queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" }
     ]);
+    if state.enable_catalogs_route {
+        links.as_array_mut().unwrap().push(json!({
+            "rel": "catalogs", "type": "application/json",
+            "href": format!("{base}/catalogs"),
+            "title": "Multi-Tenant Catalogs Registry"
+        }));
+    }
     // Browseable: a child link per root-level node (collections resolve
     // on the canonical /collections surface). Nodes without a backing
-    // document are skipped rather than emitting 404 links.
-    let children = state.store.get_child_nodes(ROOT_CATALOG_ID, None).await?;
+    // document are skipped rather than emitting 404 links — catalog
+    // children are skipped entirely when the catalogs route is off
+    // (their /catalogs/{id} hrefs wouldn't resolve either).
+    let children: Vec<_> = state
+        .store
+        .get_child_nodes(ROOT_CATALOG_ID, None)
+        .await?
+        .into_iter()
+        .filter(|n| state.enable_catalogs_route || n.kind != NodeKind::Catalog)
+        .collect();
     let cat_ids: Vec<String> = children
         .iter()
         .filter(|n| n.kind == NodeKind::Catalog)
@@ -409,8 +430,16 @@ pub async fn root_landing_page(
         "stac_version": "1.0.0",
         "type": "Catalog",
         "id": "stac-multi-tenant-root",
-        "title": "stac-os-rs — STAC API with Multi-Tenant Catalogs",
-        "description": "Multi-tenant STAC API backed by OpenSearch. Root catalog of the registry.",
+        "title": if state.enable_catalogs_route {
+            "stac-os-rs — STAC API with Multi-Tenant Catalogs"
+        } else {
+            "stac-os-rs — STAC API"
+        },
+        "description": if state.enable_catalogs_route {
+            "Multi-tenant STAC API backed by OpenSearch. Root catalog of the registry."
+        } else {
+            "STAC API backed by OpenSearch."
+        },
         "conformsTo": conformance_classes(&state),
         "links": links
     })))

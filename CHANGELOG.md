@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ENABLE_CATALOGS_ROUTE` — opt-out flag (default `true`) gating the
+  whole `/catalogs/**` surface: registry and scoped collection/item/
+  search reads, catalog and scoped writes (when transactions are on),
+  and the scoped `conformance`/`queryables` routes. When `false` the
+  landing page drops the `catalogs` link and catalog `child` links,
+  `conformsTo` loses the `multi-tenant-catalogs`/`children` URIs,
+  `related`/`duplicate` scoped links are suppressed on global
+  collection reads, and the OpenAPI doc prunes the `/catalogs` paths.
+  Upstream's same-named flag is opt-in (`false` default) — this port
+  keeps catalogs on by default
 - `ENABLE_TOPOLOGY_VALIDATION` — geometry checks beyond the item JSON
   schema: WGS84 bounds on every coordinate (lon ±180, lat ±90),
   Polygon/MultiPolygon ring minimum of 4 vertices, the

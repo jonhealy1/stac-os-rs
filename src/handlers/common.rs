@@ -45,6 +45,13 @@ pub struct AppState {
     /// `ENABLE_COLLECTIONS_SEARCH_ROUTE` (default false upstream) —
     /// mounts the GET/POST `/collections-search` route.
     pub enable_collections_search_route: bool,
+    /// `ENABLE_CATALOGS_ROUTE` — mounts the `/catalogs/**` surface
+    /// (registry, scoped collections/items/search, catalog writes).
+    /// Opt-out here (default on); upstream's flag is opt-in (default
+    /// off). When false the catalogs links/conformance URIs drop off
+    /// the landing page and `related`/`duplicate` scoped links are
+    /// suppressed on global collection reads (they would 404).
+    pub enable_catalogs_route: bool,
     /// `STAC_DEFAULT_COLLECTION_LIMIT` — `/collections` page size when
     /// `?limit=` is absent.
     pub default_collection_limit: u64,
@@ -838,7 +845,9 @@ pub(crate) fn global_collection_links(
     links.push(q);
     // Upstream spec for global collection reads: exactly one `parent`,
     // pointing at the landing page; catalog memberships are exposed as
-    // `related` (catalog) + `duplicate` (scoped URI) links instead.
+    // `related` (catalog) + `duplicate` (scoped URI) links instead —
+    // only when the catalogs route is mounted, since those hrefs live
+    // on the /catalogs surface.
     links.push(link_json(base.clone(), "parent").title("Root Catalog".to_string()));
     links.push(link_json(
         format!("{base}/collections/{collection_id}"),
@@ -851,7 +860,7 @@ pub(crate) fn global_collection_links(
         .collect();
     real.sort_unstable();
     real.dedup();
-    if !state.hide_alternate_parents {
+    if state.enable_catalogs_route && !state.hide_alternate_parents {
         for p in &real {
             links.push(link_json(format!("{base}/catalogs/{p}"), "related").title(p.to_string()));
             links.push(
