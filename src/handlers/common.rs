@@ -830,7 +830,7 @@ pub(crate) fn global_collection_links(
     let mut links = vec![
         link_json(format!("{base}/collections/{collection_id}"), "self"),
         link_json(base.clone(), "root"),
-        link_json(format!("{base}/collections/{collection_id}/items"), "items"),
+        Link::new(format!("{base}/collections/{collection_id}/items"), "items").geojson(),
     ];
     let mut sortables = link_json(
         format!("{base}/collections/{collection_id}/sortables"),
