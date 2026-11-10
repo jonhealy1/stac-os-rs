@@ -56,7 +56,7 @@ pub async fn list_scoped_collections(
     let mut filters = Vec::new();
     if let Some(q) = query.q.as_deref().filter(|s| !s.trim().is_empty()) {
         filters.push(json!({"multi_match": {
-            "query": q,
+            "query": split_q_terms(q).join(" "),
             "fields": ["id", "title^3", "description", "keywords"],
             "type": "best_fields",
             "fuzziness": "AUTO"
@@ -564,6 +564,16 @@ async fn validate_collection_sortby(
     Ok(())
 }
 
+/// `q=EO,Earth Observation` -> `["EO", "Earth Observation"]` — commas
+/// are the basic free-text OR separator (spaces have no special
+/// meaning, so each comma-separated term is a phrase).
+fn split_q_terms(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// `?fields=a,b,-c` -> (include, exclude).
 fn parse_get_fields(raw: Option<&str>) -> Option<(Vec<String>, Vec<String>)> {
     let raw = raw?;
@@ -630,7 +640,7 @@ fn collections_get_params(q: CollectionsQuery) -> Result<CollectionsSearchParams
         token: q.token,
         sortby: parse_get_sortby(q.sortby.as_deref()),
         fields: parse_get_fields(q.fields.as_deref()),
-        q: q.q.into_iter().collect(),
+        q: q.q.map(|s| split_q_terms(&s)).unwrap_or_default(),
         datetime: q.datetime,
         ..Default::default()
     };
@@ -684,7 +694,7 @@ fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchP
     }
     if let Some(v) = get("q") {
         p.q = match v {
-            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::String(s) => split_q_terms(&s),
             serde_json::Value::Array(a) => a
                 .iter()
                 .filter_map(|x| x.as_str().map(str::to_owned))
