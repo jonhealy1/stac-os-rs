@@ -742,6 +742,13 @@ pub async fn create_scoped_item(
     }
     Ok((
         StatusCode::CREATED,
+        [(
+            header::LOCATION,
+            format!(
+                "{}/catalogs/{catalog_id}/collections/{collection_id}/items/{}",
+                state.base_url, item.id
+            ),
+        )],
         geo_json(item_doc(&state, &item, Some(&catalog_id))),
     )
         .into_response())
@@ -886,12 +893,21 @@ pub async fn create_root_item(
         .get_document_versioned(ITEMS_INDEX, &item_key(&item.id, &collection_id))
         .await?
         .ok_or_else(|| ApiError::Internal("item vanished after create".into()))?;
-    Ok(etag_response(
-        StatusCode::CREATED,
-        &etag_of(&state, ITEMS_INDEX, &version),
-        geo_json(item_doc(&state, &item, None)),
+    Ok((
+        [(
+            header::LOCATION,
+            format!(
+                "{}/collections/{collection_id}/items/{}",
+                state.base_url, item.id
+            ),
+        )],
+        etag_response(
+            StatusCode::CREATED,
+            &etag_of(&state, ITEMS_INDEX, &version),
+            geo_json(item_doc(&state, &item, None)),
+        ),
     )
-    .into_response())
+        .into_response())
 }
 
 /// FeatureCollection batch POST — upstream `RAISE_ON_BULK_ERROR`
