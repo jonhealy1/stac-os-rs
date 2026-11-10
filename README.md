@@ -19,6 +19,7 @@ This project would not be possible without the contributors to [stac-fastapi](ht
 - [Sample Data](#sample-data)
 - [Load Testing](#load-testing)
 - [TODO](#todo)
+- [Conformance Matrix](CONFORMANCE.md)
 - [Changelog](CHANGELOG.md)
 
 ## What is this?
