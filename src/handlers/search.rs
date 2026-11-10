@@ -155,6 +155,27 @@ async fn run_scoped_search(
             ApiError::BadRequest("Invalid intersects parameter: expected valid JSON.".to_string())
         })?;
     }
+    // Free-text `q` (basic): GET carries a comma-separated term list;
+    // POST a string or string array. Any term may match — a lenient
+    // `simple_query_string` OR over the item's text fields; non-text
+    // properties are skipped by OpenSearch's lenient parsing.
+    let q_terms: Vec<String> = search
+        .items
+        .additional_fields
+        .shift_remove("q")
+        .map(|v| match v {
+            serde_json::Value::String(s) => s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
     if let Some(filter) = &mut search.items.filter {
         if let crate::api_types::Filter::Cql2Text(raw) = filter {
             if search
@@ -233,6 +254,12 @@ async fn run_scoped_search(
     }
     if let Some(filter) = &search.items.filter {
         extra_filters.push(crate::store::cql2_clause(filter).map_err(bad_filter)?);
+    }
+    if !q_terms.is_empty() {
+        extra_filters.push(json!({"simple_query_string": {
+            "query": q_terms.join(" "),
+            "fields": ["id", "collection", "properties.*"],
+        }}));
     }
 
     // A scope with no collections (or a root request filtered to

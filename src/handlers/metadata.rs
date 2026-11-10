@@ -27,6 +27,7 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.0.0/item-search#fields",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#fields",
         "https://api.stacspec.org/v1.0.0/item-search#query",
+        "https://api.stacspec.org/v1.0.0-rc.1/item-search#free-text",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#query",
         "https://api.stacspec.org/v1.0.0-rc.2/item-search#filter",
         "https://api.stacspec.org/v1.0.0/item-search#filter",
