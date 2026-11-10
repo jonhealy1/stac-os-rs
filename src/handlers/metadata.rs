@@ -17,6 +17,7 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
     let mut conforms_to = vec![
         "https://api.stacspec.org/v1.0.0/core",
         "https://api.stacspec.org/v1.0.0/browseable",
+        "https://api.stacspec.org/v1.0.0-rc.3/browseable",
         "https://api.stacspec.org/v1.0.0/ogcapi-features",
         "https://api.stacspec.org/v1.1.0/ogcapi-features#sort",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
@@ -28,6 +29,7 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.0.0/item-search#query",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#query",
         "https://api.stacspec.org/v1.0.0-rc.2/item-search#filter",
+        "https://api.stacspec.org/v1.0.0/item-search#filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/features-filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/queryables",
