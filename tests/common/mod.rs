@@ -39,6 +39,10 @@ pub async fn test_state(enable_transactions: bool) -> Option<Arc<AppState>> {
 /// (env reads are racy under parallel test runs).
 #[derive(Clone, Copy, Default)]
 pub struct TestFlags {
+    /// `ENABLE_CATALOGS_ROUTE=false` — catalogs surface unmounted.
+    /// Named for the action (disable) so the bool default keeps the
+    /// flag's on-by-default production behavior.
+    pub disable_catalogs_route: bool,
     pub enable_validator: bool,
     pub require_if_match: bool,
     pub raise_on_bulk_error: bool,
@@ -117,6 +121,7 @@ async fn test_state_opts(
         hide_alternate_parents,
         enable_collections_search: true,
         enable_collections_search_route: true,
+        enable_catalogs_route: !flags.disable_catalogs_route,
         default_collection_limit: 10,
         max_collection_limit: None,
         default_item_limit: 10,

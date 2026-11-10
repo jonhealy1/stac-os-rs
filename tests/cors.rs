@@ -18,6 +18,7 @@ fn state() -> Arc<AppState> {
         hide_alternate_parents: false,
         enable_collections_search: true,
         enable_collections_search_route: false,
+        enable_catalogs_route: true,
         default_collection_limit: 10,
         max_collection_limit: None,
         default_item_limit: 10,
