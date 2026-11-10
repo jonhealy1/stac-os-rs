@@ -4,6 +4,8 @@
 
 A STAC API Opensearch server built with Rust
 
+This project would not be possible without the contributors to [stac-fastapi](https://github.com/stac-utils/stac-fastapi) and [stac-fastapi-elasticsearch-opensearch](https://github.com/stac-utils/stac-fastapi-elasticsearch-opensearch) — it's a port of their ideas and hard work to Rust.
+
 ## Contents
 
 - [What is this?](#what-is-this)
