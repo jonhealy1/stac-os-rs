@@ -31,7 +31,7 @@ Legend:
 | `search` link (`/search`, `application/geo+json`) | ✅ | |
 | `GET /conformance` returns `{conformsTo: [...]}` | ✅ | Same class list as landing page |
 | `child` links on the landing page | ✅ | Derived from the hierarchy DAG at read time |
-| `rel=children` link + `GET /children` endpoint | ❌ | Spec: any entity emitting `child` links must carry a `children` link to a `**/children` endpoint. Catalogs have both; the landing page has neither |
+| `rel=children` link + `GET /children` endpoint | ✅ | Always mounted; collections-only when `ENABLE_CATALOGS_ROUTE` is off |
 
 ## STAC API — Features / Collections (`v1.0.0/ogcapi-features`)
 
@@ -39,7 +39,7 @@ Legend:
 |---|---|---|
 | `GET /collections` returns `{collections, links}` | ✅ | |
 | `GET /collections/{id}` | ✅ | `self`/`root`/`parent`/`canonical`/`items`/`queryables`/sortables links |
-| `items` link on Collection, `application/geo+json` | ⚠️ | Link emitted with `type: application/json`; spec table specifies `application/geo+json` |
+| `items` link on Collection, `application/geo+json` | ✅ | |
 | `GET /collections/{id}/items` | ✅ | `bbox`, `datetime`, `limit` params |
 | `GET /collections/{id}/items/{itemId}` | ✅ | |
 | OAFeat `conf/core` + `conf/geojson` | ✅ | Advertised |
@@ -58,13 +58,13 @@ Legend:
 | Default limit 10 (`STAC_DEFAULT_ITEM_LIMIT`), cap `MAX_SEARCH_LIMIT` | ✅ | |
 | Response is an ItemCollection with `numberMatched`/`numberReturned` | ✅ | Top-level fields are the current (non-deprecated) form |
 | `next`/`prev` pagination links (GET href-merge; POST body+token) | ✅ | Opaque `token` cursor |
-| `q` free-text parameter | ❌ | Advertised in generated OpenAPI on all search GETs but **silently ignored** — `GetSearch` never reads it. Implement or de-document |
+| `q` free-text parameter | ✅ | Comma-separated terms OR'd via `simple_query_string` over `id`/`collection`/`properties.*`; `v1.0.0-rc.1/item-search#free-text` advertised |
 
 ## Filter / CQL2 (`item-search#filter`, `features-3` + `cql2` classes)
 
 | Class | Status | Notes |
 |---|---|---|
-| `item-search#filter` | ⚠️ | We advertise the **`v1.0.0-rc.2`** URI; the stable `v1.0.0/item-search#filter` URI should be advertised (keeping rc.2 for back-compat) |
+| `item-search#filter` | ✅ | Both the stable `v1.0.0` and legacy `v1.0.0-rc.2` URIs advertised |
 | `ogcapi-features-3/conf/filter`, `features-filter` | ✅ | `filter` + `filter-lang` on GET and POST, `/search` and scoped search |
 | `cql2-text`, `cql2-json` | ✅ | Both input languages parse |
 | `basic-cql2` (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `AND`/`OR`/`NOT`) | ✅ | |
@@ -97,8 +97,8 @@ Legend:
 | `GET /catalogs/{id}/children` → `{children, links}` | ✅ | `root`/`parent`/`self` links; each child carries `self` |
 | `?type=Catalog\|Collection` (`children#type-filter`) | ✅ | Scoped endpoint only |
 | `children` link on catalogs with `child` links | ✅ | `catalog_links` |
-| `children` link + `GET /children` on the landing page | ❌ | Same gap as Core above |
-| Browseable conformance URI | ⚠️ | We advertise `v1.0.0/browseable`; the official class URI is **`v1.0.0-rc.3/browseable`** (still an RC in the spec) |
+| `children` link + `GET /children` on the landing page | ✅ | |
+| Browseable conformance URI | ✅ | Both `v1.0.0` and the official `v1.0.0-rc.3` URIs advertised |
 | Every item reachable via `child`/`item` traversal | ✅ | Hierarchy DAG exposes all nodes |
 
 ## Collection Search (`v1.0.0/collection-search`, opt-in flags)
@@ -109,7 +109,7 @@ Legend:
 | `collection-search#sort` (v1.1.0) | ⚠️ | Implemented, not advertised |
 | `collection-search#fields` (v1.0.0) | ⚠️ | Implemented, not advertised |
 | `collection-search#filter` (v1.0.0) | ⚠️ | CQL2 over collection fields implemented (`COLLECTION_FIELDS` mapping), not advertised |
-| `collection-search#free-text` (rc.1 basic) | ⚠️ | `q` implemented via `multi_match` over `id`/`title`/`description`/`keywords`, but **comma-separated terms are not split** (spec: commas are OR separators), and not advertised |
+| `collection-search#free-text` (rc.1 basic) | ⚠️ | `q` implemented (comma-split OR via `multi_match` over `id`/`title`/`description`/`keywords`) — not advertised |
 | `collection-search#sortables` (v1.1.0) + `/collections-sortables` | ⚠️ | Endpoint + `/collections` link implemented, but the class is advertised **unconditionally** — even when collections-search is disabled and the route is unmounted |
 | `GET /collection-queryables` (proposed path) | — | Not implemented; collection queryables live at `/collections/{id}/queryables` (per-item) |
 
@@ -130,7 +130,7 @@ Legend:
 
 | Requirement | Status | Notes |
 |---|---|---|
-| `POST /collections/{id}/items` → 201, populate `collection` from URI, 409 on dup | ⚠️ | 201 + 409 implemented; **`Location` header missing** (spec: MUST) |
+| `POST /collections/{id}/items` → 201 + `Location`, populate `collection` from URI, 409 on dup | ✅ | |
 | `POST` partial ItemCollection → 201, partial-failure semantics | ✅ | |
 | `PUT`/`PATCH` → 200/204; `id`/`collection` URI mismatch → 400; 404 on missing | ✅ | |
 | `DELETE` → 200/204 (+404 acceptable) | ✅ | |
@@ -148,26 +148,15 @@ Legend:
 
 ## Findings, ordered by effort
 
-1. **Filter + Browseable conformance URIs** — advertise
-   `v1.0.0/item-search#filter` (stable, keep rc.2) and switch
-   `v1.0.0/browseable` → `v1.0.0-rc.3/browseable`. One-line change each
-   in `conformance_classes()`.
-2. **`q` on item search** — either wire `multi_match` against `id` +
-   `properties.*` text fields (pattern already exists for collections)
-   and advertise `v1.0.0-rc.1/item-search#free-text`, or strip the
-   `q` param from the three utoipa annotations. Currently a documented
-   lie.
-3. **`items` link `type` → `application/geo+json`** — one-line fix.
-4. **`Location` header on item create** — spec MUST; small response
-   change on both create paths.
-5. **Collections `q` comma-split** — split `q` on `,` before joining, to
-   match basic free-text OR semantics.
-6. **`GET /children` + `children` link on landing page** — required by
-   the `v1.0.0/children` class we advertise; reuse
-   `get_catalog_children` with `ROOT_CATALOG_ID`.
-7. **Gate `collection-search#sortables`** on the collections-search
+**Resolved** (this branch): conformance URIs, item-search `q`, `items`
+link media type, `Location` on create, collections `q` comma-split,
+`GET /children` + landing-page link.
+
+**Open:**
+
+1. **Gate `collection-search#sortables`** on the collections-search
    flags; advertise the implemented-but-unclaimed classes
    (`collection-search`, `simple-query`, `#sort`, `#fields`, `#filter`,
    `#free-text`) only when the flags are on.
-8. **Optional advertisement additions** — `v1.0.0/collections`,
+2. **Optional advertisement additions** — `v1.0.0/collections`,
    OAFeat `conf/oas30`, `rel=conformance` on scoped catalog docs.

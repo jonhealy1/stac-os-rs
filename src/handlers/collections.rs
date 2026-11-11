@@ -694,7 +694,7 @@ fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchP
     }
     if let Some(v) = get("q") {
         p.q = match v {
-            serde_json::Value::String(s) => split_q_terms(&s),
+            serde_json::Value::String(s) => split_q_terms(s),
             serde_json::Value::Array(a) => a
                 .iter()
                 .filter_map(|x| x.as_str().map(str::to_owned))

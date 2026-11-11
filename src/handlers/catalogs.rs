@@ -277,12 +277,50 @@ pub async fn get_catalog_children(
     Query(query): Query<ChildrenQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    children_page(&state, &catalog_id, &catalog_id, query, raw).await
+}
+
+/// `GET /children` — the landing page's children endpoint, required
+/// by the Children conformance class for any entity emitting `child`
+/// links. Same listing as a catalog's `/children` scoped at root;
+/// collection docs carry their canonical global links.
+#[utoipa::path(
+    get,
+    path = "/children",
+    tag = "catalogs",
+    summary = "List root children (catalogs + collections)",
+    params(ChildrenQuery),
+    responses(
+        (status = 200, description = "Successful response"),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub async fn get_root_children(
+    RawQuery(raw): RawQuery,
+    Query(query): Query<ChildrenQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    children_page(&state, ROOT_CATALOG_ID, "", query, raw).await
+}
+
+/// Shared children listing. `scope_id` selects the hierarchy node;
+/// `endpoint` is the URL segment appended after `/catalogs/` for
+/// link generation ("" = the root `/children` endpoint).
+async fn children_page(
+    state: &Arc<AppState>,
+    scope_id: &str,
+    endpoint: &str,
+    query: ChildrenQuery,
+    raw: Option<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let catalog_id = scope_id;
     let clause = listing_filter_clause(
         query.filter.as_deref(),
         query.filter_lang.as_deref(),
         crate::store::COLLECTION_FIELDS,
     )?;
-    require_catalog(&state, &catalog_id).await?;
+    require_catalog(state, catalog_id).await?;
     let (limit, offset) = list_window(
         query.limit,
         query.token.as_deref(),
@@ -290,7 +328,18 @@ pub async fn get_catalog_children(
         None,
     )?;
     let kind = parse_kind(query.r#type.as_deref());
-    let nodes = state.store.get_child_nodes(&catalog_id, kind).await?;
+    let nodes = state.store.get_child_nodes(catalog_id, kind).await?;
+    // Without the catalogs route, catalog children have no resolvable
+    // hrefs — the root listing is collections-only (same filter the
+    // landing page applies to its child links).
+    let nodes: Vec<_> = if endpoint.is_empty() && !state.enable_catalogs_route {
+        nodes
+            .into_iter()
+            .filter(|n| n.kind != NodeKind::Catalog)
+            .collect()
+    } else {
+        nodes
+    };
 
     let (children, matched): (Vec<serde_json::Value>, usize) = if clause.is_some() {
         // Filtered listing — query the docs directly, scoped to child ids.
@@ -318,8 +367,13 @@ pub async fn get_catalog_children(
             };
             let parents = parents_map.get(&id).cloned().unwrap_or_default();
             let generated = match kind_map.get(&id) {
-                Some(NodeKind::Collection) => collection_links(&state, &id, &catalog_id, &parents),
-                _ => catalog_links(&state, &id, &parents).await?,
+                Some(NodeKind::Collection) if endpoint.is_empty() => {
+                    global_collection_links(state, &id, &parents)
+                }
+                Some(NodeKind::Collection) => {
+                    collection_links(state, &id, scope_id, &parents)
+                }
+                _ => catalog_links(state, &id, &parents).await?,
             };
             merge_doc_links(&mut doc, generated, &state.base_url);
             out.push(doc);
@@ -367,9 +421,12 @@ pub async fn get_catalog_children(
             };
             let generated = match node.kind {
                 // parent link locked to this listing's catalog context
-                NodeKind::Catalog => catalog_links(&state, &node.id, &node.parents).await?,
+                NodeKind::Catalog => catalog_links(state, &node.id, &node.parents).await?,
+                NodeKind::Collection if endpoint.is_empty() => {
+                    global_collection_links(state, &node.id, &node.parents)
+                }
                 NodeKind::Collection => {
-                    collection_links(&state, &node.id, &catalog_id, &node.parents)
+                    collection_links(state, &node.id, scope_id, &node.parents)
                 }
             };
             merge_doc_links(&mut doc, generated, &state.base_url);
@@ -378,15 +435,25 @@ pub async fn get_catalog_children(
         (children, matched)
     };
 
+    let self_path = if endpoint.is_empty() {
+        "/children".to_string()
+    } else {
+        format!("/catalogs/{endpoint}/children")
+    };
+    let parent_href = if endpoint.is_empty() {
+        state.base_url.clone()
+    } else {
+        format!("{}/catalogs/{endpoint}", state.base_url)
+    };
     let mut links = json!([
-        { "rel": "self", "href": format!("{}/catalogs/{catalog_id}/children", state.base_url) },
+        { "rel": "self", "href": format!("{}{self_path}", state.base_url) },
         { "rel": "root", "href": state.base_url },
-        { "rel": "parent", "href": format!("{}/catalogs/{catalog_id}", state.base_url) }
+        { "rel": "parent", "href": parent_href }
     ]);
     let extra = pagination_extra(raw.as_deref());
     if let Some(next) = list_next_link(
-        &state,
-        &format!("/catalogs/{catalog_id}/children"),
+        state,
+        &self_path,
         limit,
         offset,
         children.len(),

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `GET /children` — the Children extension's landing-page endpoint,
+  **always mounted** (not gated by `ENABLE_CATALOGS_ROUTE`): returns
+  root-level catalogs and collections with `?type=` filtering,
+  `?limit=&token=` paging, and `filter` + `filter-lang`, in the same
+  `{children, links}` shape as `/catalogs/{id}/children`. With the
+  catalogs route off, the listing is collections-only — catalog child
+  hrefs wouldn't resolve. The landing page emits a `rel=children`
+  link in both modes, and `v1.0.0/children` is now in the
+  unconditional `conformsTo` set (`children#type-filter` stays
+  catalogs-gated)
+- Free-text `q` on item search (`/search`, `/catalogs/search`,
+  `/catalogs/{id}/search`, GET and POST) — comma-separated terms
+  OR'd via a lenient `simple_query_string` over `id`, `collection`,
+  and `properties.*`. Advertises
+  `v1.0.0-rc.1/item-search#free-text`; the param was previously
+  documented in OpenAPI but silently dropped
+- `Location` header on item create 201s (Transaction extension MUST)
+  — canonical URI on `/collections/{id}/items`, scoped URI on the
+  scoped path
+- Conformance URIs: stable `v1.0.0/item-search#filter` alongside the
+  legacy rc.2 URI, and `v1.0.0-rc.3/browseable` alongside `v1.0.0` —
+  both variants advertised so validators resolve either
+- [CONFORMANCE.md](CONFORMANCE.md) — per-requirement audit of every
+  advertised conformance class against the official spec tables
+
+### Fixed
+
+- `items` link on global collection reads now reports
+  `application/geo+json` (was `application/json`; scoped reads were
+  already correct)
+- Collections `q` now splits comma-separated terms (`q=EO,Earth` is
+  OR over two terms, not the literal `"EO,"`) on `GET /collections`,
+  `POST /collections-search`, and the scoped listing
+
 ## [0.7.0] - 2026-11-09
 
 ### Added

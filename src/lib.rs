@@ -28,6 +28,10 @@ pub fn read_router() -> Router<Arc<AppState>> {
         .route("/api.html", get(api_docs_html))
         .route("/docs", get(api_docs_html))
         .route("/_mgmt/ping", get(mgmt_ping))
+        // Children endpoint for the landing page — collections always
+        // appear; catalogs join the listing when the catalogs route
+        // is mounted (their /catalogs/{id} hrefs must resolve).
+        .route("/children", get(get_root_children))
         .route("/sortables", get(sortables))
         .route("/queryables", get(get_queryables))
         // --- Core STAC item search (registry-wide; same as /catalogs/search) ---

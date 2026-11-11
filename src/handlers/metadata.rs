@@ -42,12 +42,12 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
         "https://api.stacspec.org/v1.1.0/collection-search#sortables",
+        "https://api.stacspec.org/v1.0.0/children",
     ];
     if state.enable_catalogs_route {
         conforms_to.extend([
             "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
             "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/search",
-            "https://api.stacspec.org/v1.0.0/children",
             "https://api.stacspec.org/v1.0.0/children#type-filter",
         ]);
         if state.enable_transactions {
@@ -368,6 +368,10 @@ pub async fn root_landing_page(
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
         { "rel": "queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" }
     ]);
+    links.as_array_mut().unwrap().push(json!({
+        "rel": "children", "type": "application/json",
+        "href": format!("{base}/children")
+    }));
     if state.enable_catalogs_route {
         links.as_array_mut().unwrap().push(json!({
             "rel": "catalogs", "type": "application/json",
