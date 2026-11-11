@@ -41,9 +41,21 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions",
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
-        "https://api.stacspec.org/v1.1.0/collection-search#sortables",
         "https://api.stacspec.org/v1.0.0/children",
     ];
+    // Collections-search classes ride the same flag pair as the
+    // routes — never advertised when the params aren't accepted.
+    if state.enable_collections_search || state.enable_collections_search_route {
+        conforms_to.extend([
+            "https://api.stacspec.org/v1.0.0/collection-search",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query",
+            "https://api.stacspec.org/v1.1.0/collection-search#sort",
+            "https://api.stacspec.org/v1.1.0/collection-search#sortables",
+            "https://api.stacspec.org/v1.0.0/collection-search#fields",
+            "https://api.stacspec.org/v1.0.0/collection-search#filter",
+            "https://api.stacspec.org/v1.0.0-rc.1/collection-search#free-text",
+        ]);
+    }
     if state.enable_catalogs_route {
         conforms_to.extend([
             "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
