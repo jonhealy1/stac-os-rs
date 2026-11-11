@@ -112,7 +112,7 @@ async def test_get_search_content_type(app_client, ctx):
 async def test_api_headers(app_client):
     resp = await app_client.get("/api")
     assert (
-        resp.headers["Content-Type"] == "application/vnd.oai.openapi+json;version=3.0"
+        resp.headers["Content-Type"] == "application/vnd.oai.openapi+json;version=3.1"
     )
     assert resp.status_code == 200
 

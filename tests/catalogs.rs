@@ -3216,11 +3216,21 @@ async fn test_catalogs_route_disabled_unmounts_surface_and_links() {
         assert_eq!(s, StatusCode::NOT_FOUND, "{method} {path}");
     }
 
+    // GET /children stays mounted with catalogs off — collections only.
+    let (s, body) = call(&app, "GET", "/children", None).await;
+    assert_eq!(s, StatusCode::OK);
+    for c in body["children"].as_array().unwrap() {
+        assert_ne!(c["type"].as_str(), Some("Catalog"));
+    }
+
     // Landing page drops the catalogs link, catalog child links (the
     // collection child survives), and the multi-tenant conformsTo URIs.
+    // The unconditional `v1.0.0/children` stays; `children#type-filter`
+    // is catalogs-gated.
     let (s, landing) = call(&app, "GET", "/", None).await;
     assert_eq!(s, StatusCode::OK);
     assert!(links_by_rel(&landing, "catalogs").is_empty());
+    assert!(!links_by_rel(&landing, "children").is_empty());
     for child in links_by_rel(&landing, "child") {
         let href = child["href"].as_str().unwrap();
         assert!(
@@ -3231,16 +3241,21 @@ async fn test_catalogs_route_disabled_unmounts_surface_and_links() {
     for uri in landing["conformsTo"].as_array().unwrap() {
         let uri = uri.as_str().unwrap();
         assert!(
-            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children"),
+            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children#"),
             "catalogs-off landing page conformsTo advertises {uri}"
         );
     }
+    assert!(landing["conformsTo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u.as_str() == Some("https://api.stacspec.org/v1.0.0/children")));
     let (s, conf) = call(&app, "GET", "/conformance", None).await;
     assert_eq!(s, StatusCode::OK);
     for uri in conf["conformsTo"].as_array().unwrap() {
         let uri = uri.as_str().unwrap();
         assert!(
-            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children"),
+            !uri.contains("multi-tenant-catalogs") && !uri.contains("/children#"),
             "/conformance advertises {uri}"
         );
     }

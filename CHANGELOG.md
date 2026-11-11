@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs-gated)
 - Free-text `q` on item search (`/search`, `/catalogs/search`,
   `/catalogs/{id}/search`, GET and POST) — comma-separated terms
-  OR'd via a lenient `simple_query_string` over `id`, `collection`,
-  and `properties.*`. Advertises
+  OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`)
+  over `id`, `collection`, and `properties.*`. Advertises
   `v1.0.0-rc.1/item-search#free-text`; the param was previously
   documented in OpenAPI but silently dropped
 - `Location` header on item create 201s (Transaction extension MUST)
@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Collections `q` now splits comma-separated terms (`q=EO,Earth` is
   OR over two terms, not the literal `"EO,"`) on `GET /collections`,
   `POST /collections-search`, and the scoped listing
+- `q` is preserved in POST `/search` `next`/`prev` link bodies —
+  pages after the first were silently unfiltered
+- Malformed `q` (`{"q": 5}`, non-string array elements) and an
+  unrecognized `?type=` on the children endpoints now return 400
+  instead of being silently ignored
+- `conformsTo` no longer advertises OAFeat `conf/oas30` — the served
+  document is OpenAPI 3.1, which has no Part-1 conformance URI. The
+  `service-desc` link and `/api` Content-Type now report
+  `application/vnd.oai.openapi+json;version=3.1`
 
 ## [0.7.0] - 2026-11-09
 

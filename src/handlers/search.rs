@@ -156,26 +156,32 @@ async fn run_scoped_search(
         })?;
     }
     // Free-text `q` (basic): GET carries a comma-separated term list;
-    // POST a string or string array. Any term may match — a lenient
-    // `simple_query_string` OR over the item's text fields; non-text
-    // properties are skipped by OpenSearch's lenient parsing.
-    let q_terms: Vec<String> = search
-        .items
-        .additional_fields
-        .shift_remove("q")
-        .map(|v| match v {
-            serde_json::Value::String(s) => s
-                .split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect(),
-            serde_json::Value::Array(a) => a
-                .iter()
-                .filter_map(|t| t.as_str().map(str::to_owned))
-                .collect(),
-            _ => Vec::new(),
-        })
-        .unwrap_or_default();
+    // POST a string or string array — anything else is a 400 (upstream
+    // pydantic semantics). `q` stays in `additional_fields` so POST
+    // `next`/`prev` bodies carry it forward unchanged.
+    let q_terms: Vec<String> = match search.items.additional_fields.get("q") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => split_q_terms(s),
+        Some(serde_json::Value::Array(a)) => {
+            let mut terms = Vec::new();
+            for v in a {
+                match v.as_str() {
+                    Some(s) => terms.extend(split_q_terms(s)),
+                    None => {
+                        return Err(ApiError::BadRequest(
+                            "Invalid parameters provided: q".to_string(),
+                        ))
+                    }
+                }
+            }
+            terms
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "Invalid parameters provided: q".to_string(),
+            ))
+        }
+    };
     if let Some(filter) = &mut search.items.filter {
         if let crate::api_types::Filter::Cql2Text(raw) = filter {
             if search
@@ -255,10 +261,19 @@ async fn run_scoped_search(
     if let Some(filter) = &search.items.filter {
         extra_filters.push(crate::store::cql2_clause(filter).map_err(bad_filter)?);
     }
+    // `multi_match` + `lenient` (upstream `apply_free_text_filter`):
+    // `properties.*` expands to dates and numerics too — lenient skips
+    // fields a term can't parse instead of failing the whole query,
+    // and avoids `simple_query_string`'s operator syntax mangling
+    // hyphenated terms like `sentinel-2`.
     if !q_terms.is_empty() {
-        extra_filters.push(json!({"simple_query_string": {
+        extra_filters.push(json!({"multi_match": {
             "query": q_terms.join(" "),
             "fields": ["id", "collection", "properties.*"],
+            "type": "best_fields",
+            "fuzziness": "AUTO",
+            "lenient": true,
+            "operator": "or",
         }}));
     }
 

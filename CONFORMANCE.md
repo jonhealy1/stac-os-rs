@@ -25,7 +25,7 @@ Legend:
 |---|---|---|
 | `GET /` landing page returns a valid STAC Catalog with `conformsTo` | ✅ | `root_landing_page`, `metadata.rs` |
 | `conformance` link (`/conformance`) | ✅ | |
-| `service-desc` link → OpenAPI doc | ✅ | `/api`, `application/vnd.oai.openapi+json;version=3.0` |
+| `service-desc` link → OpenAPI doc | ✅ | `/api`, `application/vnd.oai.openapi+json;version=3.1` |
 | `service-doc` link → human-readable docs | ✅ | `/api.html` (also aliased at `/docs`) |
 | `data` link (`/collections`) | ✅ | |
 | `search` link (`/search`, `application/geo+json`) | ✅ | |
@@ -43,7 +43,7 @@ Legend:
 | `GET /collections/{id}/items` | ✅ | `bbox`, `datetime`, `limit` params |
 | `GET /collections/{id}/items/{itemId}` | ✅ | |
 | OAFeat `conf/core` + `conf/geojson` | ✅ | Advertised |
-| OAFeat `conf/oas30` | ✅ | OpenAPI 3.0 served at `service-desc` |
+| OAFeat `conf/oas30` | — | Not advertised — `/api` serves OpenAPI 3.1 (utoipa 6), which has no Part-1 conformance URI |
 | `https://api.stacspec.org/v1.0.0/collections` (subset class) | ✅ | |
 
 ## STAC API — Item Search (`v1.0.0/item-search`)
@@ -58,7 +58,7 @@ Legend:
 | Default limit 10 (`STAC_DEFAULT_ITEM_LIMIT`), cap `MAX_SEARCH_LIMIT` | ✅ | |
 | Response is an ItemCollection with `numberMatched`/`numberReturned` | ✅ | Top-level fields are the current (non-deprecated) form |
 | `next`/`prev` pagination links (GET href-merge; POST body+token) | ✅ | Opaque `token` cursor |
-| `q` free-text parameter | ✅ | Comma-separated terms OR'd via `simple_query_string` over `id`/`collection`/`properties.*`; `v1.0.0-rc.1/item-search#free-text` advertised |
+| `q` free-text parameter | ✅ | Comma-separated terms OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`) over `id`/`collection`/`properties.*`; `v1.0.0-rc.1/item-search#free-text` advertised |
 
 ## Filter / CQL2 (`item-search#filter`, `features-3` + `cql2` classes)
 
@@ -105,11 +105,11 @@ Legend:
 
 | Class | Status | Notes |
 |---|---|---|
-| `v1.0.0/collection-search` + `ogcapi-common-2/conf/simple-query` | ⚠️ | `bbox`/`datetime`/`limit` implemented on `GET /collections` (gated by `ENABLE_COLLECTIONS_SEARCH`) — **not advertised** |
-| `collection-search#sort` (v1.1.0) | ⚠️ | Implemented, not advertised |
-| `collection-search#fields` (v1.0.0) | ⚠️ | Implemented, not advertised |
-| `collection-search#filter` (v1.0.0) | ⚠️ | CQL2 over collection fields implemented (`COLLECTION_FIELDS` mapping), not advertised |
-| `collection-search#free-text` (rc.1 basic) | ⚠️ | `q` implemented (comma-split OR via `multi_match` over `id`/`title`/`description`/`keywords`) — not advertised |
+| `v1.0.0/collection-search` + `ogcapi-common-2/conf/simple-query` | ✅ | `bbox`/`datetime`/`limit` implemented on `GET /collections`; advertised when either collections-search flag is on |
+| `collection-search#sort` (v1.1.0) | ✅ | Advertised when either collections-search flag is on |
+| `collection-search#fields` (v1.0.0) | ✅ | Advertised when either collections-search flag is on |
+| `collection-search#filter` (v1.0.0) | ✅ | CQL2 over collection fields (`COLLECTION_FIELDS` mapping); advertised when either collections-search flag is on |
+| `collection-search#free-text` (rc.1 basic) | ✅ | `q` comma-split OR via `multi_match` over `id`/`title`/`description`/`keywords`; advertised when either collections-search flag is on |
 | `collection-search#sortables` (v1.1.0) + `/collections-sortables` | ✅ | Advertised only when a collections-search flag is on |
 | `GET /collection-queryables` (proposed path) | — | Not implemented; collection queryables live at `/collections/{id}/queryables` (per-item) |
 

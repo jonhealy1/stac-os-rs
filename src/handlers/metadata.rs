@@ -23,7 +23,8 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "https://api.stacspec.org/v1.1.0/ogcapi-features#sort",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
-        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
+        // `conf/oas30` is deliberately absent: utoipa 6 can only emit an
+        // OpenAPI 3.1+ document, which has no Part-1 conformance URI.
         "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/sortables",
         "https://api.stacspec.org/v1.0.0/item-search",
         "https://api.stacspec.org/v1.0.0/item-search#fields",
@@ -320,7 +321,7 @@ pub async fn api(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse
     Ok((
         [(
             header::CONTENT_TYPE,
-            "application/vnd.oai.openapi+json;version=3.0",
+            "application/vnd.oai.openapi+json;version=3.1",
         )],
         body,
     ))
@@ -375,7 +376,7 @@ pub async fn root_landing_page(
         { "rel": "self", "type": "application/json", "href": format!("{base}/") },
         { "rel": "root", "type": "application/json", "href": format!("{base}/") },
         { "rel": "conformance", "type": "application/json", "href": format!("{base}/conformance") },
-        { "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0", "href": format!("{base}/api") },
+        { "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.1", "href": format!("{base}/api") },
         { "rel": "service-doc", "type": "text/html", "href": format!("{base}/api.html") },
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },

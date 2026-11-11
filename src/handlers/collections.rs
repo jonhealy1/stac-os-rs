@@ -564,16 +564,6 @@ async fn validate_collection_sortby(
     Ok(())
 }
 
-/// `q=EO,Earth Observation` -> `["EO", "Earth Observation"]` — commas
-/// are the basic free-text OR separator (spaces have no special
-/// meaning, so each comma-separated term is a phrase).
-fn split_q_terms(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect()
-}
-
 /// `?fields=a,b,-c` -> (include, exclude).
 fn parse_get_fields(raw: Option<&str>) -> Option<(Vec<String>, Vec<String>)> {
     let raw = raw?;
@@ -695,11 +685,18 @@ fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchP
     if let Some(v) = get("q") {
         p.q = match v {
             serde_json::Value::String(s) => split_q_terms(s),
-            serde_json::Value::Array(a) => a
-                .iter()
-                .filter_map(|x| x.as_str().map(str::to_owned))
-                .collect(),
-            _ => vec![],
+            serde_json::Value::Array(a) => {
+                let mut terms = Vec::new();
+                for x in a {
+                    match x.as_str() {
+                        Some(s) => terms.extend(split_q_terms(s)),
+                        None => return Err(bad("q")),
+                    }
+                }
+                terms
+            }
+            serde_json::Value::Null => vec![],
+            _ => return Err(bad("q")),
         };
     }
     let lang = get("filter_lang")
