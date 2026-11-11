@@ -43,8 +43,8 @@ Legend:
 | `GET /collections/{id}/items` | ✅ | `bbox`, `datetime`, `limit` params |
 | `GET /collections/{id}/items/{itemId}` | ✅ | |
 | OAFeat `conf/core` + `conf/geojson` | ✅ | Advertised |
-| OAFeat `conf/oas30` | — | We serve OpenAPI 3.0, so this *may* be advertised; currently not |
-| `https://api.stacspec.org/v1.0.0/collections` (subset class) | — | Satisfied behaviorally; not advertised |
+| OAFeat `conf/oas30` | ✅ | OpenAPI 3.0 served at `service-desc` |
+| `https://api.stacspec.org/v1.0.0/collections` (subset class) | ✅ | |
 
 ## STAC API — Item Search (`v1.0.0/item-search`)
 
@@ -110,7 +110,7 @@ Legend:
 | `collection-search#fields` (v1.0.0) | ⚠️ | Implemented, not advertised |
 | `collection-search#filter` (v1.0.0) | ⚠️ | CQL2 over collection fields implemented (`COLLECTION_FIELDS` mapping), not advertised |
 | `collection-search#free-text` (rc.1 basic) | ⚠️ | `q` implemented (comma-split OR via `multi_match` over `id`/`title`/`description`/`keywords`) — not advertised |
-| `collection-search#sortables` (v1.1.0) + `/collections-sortables` | ⚠️ | Endpoint + `/collections` link implemented, but the class is advertised **unconditionally** — even when collections-search is disabled and the route is unmounted |
+| `collection-search#sortables` (v1.1.0) + `/collections-sortables` | ✅ | Advertised only when a collections-search flag is on |
 | `GET /collection-queryables` (proposed path) | — | Not implemented; collection queryables live at `/collections/{id}/queryables` (per-item) |
 
 ## Multi-Tenant Catalogs (`v1.0.0/multi-tenant-catalogs`, StacLabs)
@@ -123,7 +123,7 @@ Legend:
 | `/catalogs/search` registry-wide | ✅ | Root-scope equivalent |
 | Poly-hierarchy: one `parent` per scoped read, `related` for alternates | ✅ | `CATALOGS_HIDE_ALTERNATE_PARENTS` opt-out |
 | Transaction surface (`…/transaction` class, `ENABLE_TRANSACTIONS_EXTENSIONS`) | ✅ | Link/unlink is non-destructive; orphans adopt to root |
-| `conformance` link on scoped catalog docs | ⚠️ | `/catalogs/{id}/conformance` exists but the doc doesn't link to it |
+| `conformance` link on scoped catalog docs | ✅ | |
 | `POST /catalogs/{id}/bulk` | — | Planned; currently 404/405 (distinct from `_bulk` item ingest) |
 
 ## Transaction (`ogcapi-features/extensions/transaction`)
@@ -154,9 +154,9 @@ link media type, `Location` on create, collections `q` comma-split,
 
 **Open:**
 
-1. **Gate `collection-search#sortables`** on the collections-search
-   flags; advertise the implemented-but-unclaimed classes
-   (`collection-search`, `simple-query`, `#sort`, `#fields`, `#filter`,
-   `#free-text`) only when the flags are on.
-2. **Optional advertisement additions** — `v1.0.0/collections`,
-   OAFeat `conf/oas30`, `rel=conformance` on scoped catalog docs.
+Nothing currently claimed-but-missing. Remaining honest gaps are all
+unclaimed: CQL2 classes we don't advertise (temporal functions,
+property-property, CASEI/ACCENTI, array ops, arithmetic),
+`POST /catalogs/{id}/bulk`, deep paging beyond 10k, and a
+`/collection-queryables` endpoint (the spec's proposed path — ours is
+per-collection instead).

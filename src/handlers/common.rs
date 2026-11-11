@@ -727,6 +727,10 @@ pub(crate) async fn catalog_links(
         "data",
     ));
     links.push(link_json(
+        format!("{base}/catalogs/{catalog_id}/conformance"),
+        "conformance",
+    ));
+    links.push(link_json(
         format!("{base}/catalogs/{catalog_id}/children"),
         "children",
     ));
