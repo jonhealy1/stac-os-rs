@@ -112,7 +112,13 @@ async fn test_state_opts(
         .ok()?
         .with_index_prefix(uniq("it"))
         .with_refresh(opensearch::params::Refresh::True);
-    store.ensure_indices().await.ok()?;
+    // OpenSearch answered but index creation failed — the environment is
+    // broken (e.g. a cluster `create_index` block), not absent. Fail loudly
+    // rather than letting every test silently pass as "skipped".
+    store
+        .ensure_indices()
+        .await
+        .expect("ensure_indices failed — check OpenSearch cluster blocks/settings");
     Some(Arc::new(AppState {
         base_url: "http://test".to_string(),
         store,
@@ -128,16 +134,18 @@ async fn test_state_opts(
         max_item_limit: None,
         excluded_item_fields: Vec::new(),
         excluded_queryables: Vec::new(),
-        validators: if flags.enable_validator {
-            vec![tokio::sync::Mutex::new(
-                stac_validate::Validator::new()
-                    .await
-                    .expect("validator init failed"),
-            )]
+        validator: if flags.enable_validator {
+            Some(
+                stac_validate::Validator::with_client_builder(
+                    reqwest::Client::builder().timeout(stac_os_rs::handlers::VALIDATION_TIMEOUT),
+                )
+                .await
+                .expect("validator init failed"),
+            )
         } else {
-            Vec::new()
+            None
         },
-        validator_cursor: std::sync::atomic::AtomicUsize::new(0),
+        validation_concurrency: stac_os_rs::handlers::VALIDATOR_POOL_SIZE,
         require_if_match: flags.require_if_match,
         raise_on_bulk_error: flags.raise_on_bulk_error,
         enable_topology_validation: flags.enable_topology_validation,
