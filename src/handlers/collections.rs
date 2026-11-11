@@ -56,7 +56,7 @@ pub async fn list_scoped_collections(
     let mut filters = Vec::new();
     if let Some(q) = query.q.as_deref().filter(|s| !s.trim().is_empty()) {
         filters.push(json!({"multi_match": {
-            "query": q,
+            "query": split_q_terms(q).join(" "),
             "fields": ["id", "title^3", "description", "keywords"],
             "type": "best_fields",
             "fuzziness": "AUTO"
@@ -630,7 +630,7 @@ fn collections_get_params(q: CollectionsQuery) -> Result<CollectionsSearchParams
         token: q.token,
         sortby: parse_get_sortby(q.sortby.as_deref()),
         fields: parse_get_fields(q.fields.as_deref()),
-        q: q.q.into_iter().collect(),
+        q: q.q.map(|s| split_q_terms(&s)).unwrap_or_default(),
         datetime: q.datetime,
         ..Default::default()
     };
@@ -684,12 +684,19 @@ fn collections_post_params(body: serde_json::Value) -> Result<CollectionsSearchP
     }
     if let Some(v) = get("q") {
         p.q = match v {
-            serde_json::Value::String(s) => vec![s.clone()],
-            serde_json::Value::Array(a) => a
-                .iter()
-                .filter_map(|x| x.as_str().map(str::to_owned))
-                .collect(),
-            _ => vec![],
+            serde_json::Value::String(s) => split_q_terms(s),
+            serde_json::Value::Array(a) => {
+                let mut terms = Vec::new();
+                for x in a {
+                    match x.as_str() {
+                        Some(s) => terms.extend(split_q_terms(s)),
+                        None => return Err(bad("q")),
+                    }
+                }
+                terms
+            }
+            serde_json::Value::Null => vec![],
+            _ => return Err(bad("q")),
         };
     }
     let lang = get("filter_lang")

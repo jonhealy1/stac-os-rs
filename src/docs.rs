@@ -47,6 +47,7 @@ use crate::handlers;
         handlers::catalogs::get_catalog,
         handlers::catalogs::update_catalog,
         handlers::catalogs::disband_catalog,
+        handlers::catalogs::get_root_children,
         handlers::catalogs::get_catalog_children,
         handlers::catalogs::list_sub_catalogs,
         handlers::catalogs::link_or_create_sub_catalog,

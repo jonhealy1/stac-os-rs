@@ -610,12 +610,27 @@ pub(crate) fn validate_children_response(
     Ok(())
 }
 
-pub(crate) fn parse_kind(raw: Option<&str>) -> Option<NodeKind> {
+/// `?type=` on the children endpoints: `Catalog`/`Collection` are the
+/// only valid values — anything else is a 400, not "no filter".
+pub(crate) fn parse_kind(raw: Option<&str>) -> Result<Option<NodeKind>, ApiError> {
     match raw {
-        Some("Catalog") => Some(NodeKind::Catalog),
-        Some("Collection") => Some(NodeKind::Collection),
-        _ => None,
+        None => Ok(None),
+        Some("Catalog") => Ok(Some(NodeKind::Catalog)),
+        Some("Collection") => Ok(Some(NodeKind::Collection)),
+        Some(_) => Err(ApiError::BadRequest(
+            "Invalid type parameter: expected 'Catalog' or 'Collection'.".to_string(),
+        )),
     }
+}
+
+/// `q=EO,Earth Observation` -> `["EO", "Earth Observation"]` — commas
+/// are the basic free-text OR separator (spaces have no special
+/// meaning, so each comma-separated term is a phrase).
+pub(crate) fn split_q_terms(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// 404 unless `catalog_id` is the implicit root or a catalog document —
@@ -727,6 +742,10 @@ pub(crate) async fn catalog_links(
         "data",
     ));
     links.push(link_json(
+        format!("{base}/catalogs/{catalog_id}/conformance"),
+        "conformance",
+    ));
+    links.push(link_json(
         format!("{base}/catalogs/{catalog_id}/children"),
         "children",
     ));
@@ -830,7 +849,7 @@ pub(crate) fn global_collection_links(
     let mut links = vec![
         link_json(format!("{base}/collections/{collection_id}"), "self"),
         link_json(base.clone(), "root"),
-        link_json(format!("{base}/collections/{collection_id}/items"), "items"),
+        Link::new(format!("{base}/collections/{collection_id}/items"), "items").geojson(),
     ];
     let mut sortables = link_json(
         format!("{base}/collections/{collection_id}/sortables"),

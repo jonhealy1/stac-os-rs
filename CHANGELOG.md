@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-11
+
+### Added
+
+- `GET /children` — the Children extension's landing-page endpoint,
+  **always mounted** (not gated by `ENABLE_CATALOGS_ROUTE`): returns
+  root-level catalogs and collections with `?type=` filtering,
+  `?limit=&token=` paging, and `filter` + `filter-lang`, in the same
+  `{children, links}` shape as `/catalogs/{id}/children`. With the
+  catalogs route off, the listing is collections-only — catalog child
+  hrefs wouldn't resolve. The landing page emits a `rel=children`
+  link in both modes, and `v1.0.0/children` is now in the
+  unconditional `conformsTo` set (`children#type-filter` stays
+  catalogs-gated)
+- Free-text `q` on item search (`/search`, `/catalogs/search`,
+  `/catalogs/{id}/search`, GET and POST) — comma-separated terms
+  OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`)
+  over `id`, `collection`, and `properties.*`. Advertises
+  `v1.0.0-rc.1/item-search#free-text`; the param was previously
+  documented in OpenAPI but silently dropped
+- `Location` header on item create 201s (Transaction extension MUST)
+  — canonical URI on `/collections/{id}/items`, scoped URI on the
+  scoped path
+- Conformance URIs: stable `v1.0.0/item-search#filter` alongside the
+  legacy rc.2 URI, and `v1.0.0-rc.3/browseable` alongside `v1.0.0` —
+  both variants advertised so validators resolve either
+- [CONFORMANCE.md](CONFORMANCE.md) — per-requirement audit of every
+  advertised conformance class against the official spec tables
+
+### Fixed
+
+- `items` link on global collection reads now reports
+  `application/geo+json` (was `application/json`; scoped reads were
+  already correct)
+- Collections `q` now splits comma-separated terms (`q=EO,Earth` is
+  OR over two terms, not the literal `"EO,"`) on `GET /collections`,
+  `POST /collections-search`, and the scoped listing
+- `q` is preserved in POST `/search` `next`/`prev` link bodies —
+  pages after the first were silently unfiltered
+- Malformed `q` (`{"q": 5}`, non-string array elements) and an
+  unrecognized `?type=` on the children endpoints now return 400
+  instead of being silently ignored
+- `conformsTo` no longer advertises OAFeat `conf/oas30` — the served
+  document is OpenAPI 3.1, which has no Part-1 conformance URI. The
+  `service-desc` link and `/api` Content-Type now report
+  `application/vnd.oai.openapi+json;version=3.1`
+
 ## [0.7.0] - 2026-11-09
 
 ### Added
@@ -363,12 +410,13 @@ implementing the core spec plus the multi-tenant-catalogs extension.
 - ~150 Rust tests (incl. a port of upstream's `test_catalogs.py`) and a
   vendored sfeos API suite under `tests/upstream/` running over HTTP
 
-[Unreleased]: https://github.com/jonhealy1/stac-os-rs/compare/v0.7.0...main
-[0.7.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/jonhealy1/stac-os-rs/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/jonhealy1/stac-os-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/StacLabs/stac-os-rs/compare/v0.8.0...main
+[0.8.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/StacLabs/stac-os-rs/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/StacLabs/stac-os-rs/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/StacLabs/stac-os-rs/releases/tag/v0.1.0

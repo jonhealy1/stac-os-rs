@@ -19,6 +19,7 @@ This project would not be possible without the contributors to [stac-fastapi](ht
 - [Sample Data](#sample-data)
 - [Load Testing](#load-testing)
 - [TODO](#todo)
+- [Conformance Matrix](CONFORMANCE.md)
 - [Changelog](CHANGELOG.md)
 
 ## What is this?
@@ -53,7 +54,8 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/_mgmt/ping` | Health check — `{"message":"PONG"}` |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
 | GET | `/queryables` | OGC Queryables JSON Schema — core item fields (`application/schema+json`) |
-| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter` → `next`/`prev` links |
+| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `offset`, `fields`, `query`, `filter`, `q` (free text) → `next`/`prev` links |
+| GET | `/children` | Children extension — root-level catalogs + collections (`{children, links}`); `?type=Catalog\|Collection`, `?limit=&token=`, `filter` + `filter-lang`. Always mounted: collections-only when `ENABLE_CATALOGS_ROUTE` is off |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry. Collections-search extensions: `sortby`, `fields`, `q` (free text), `filter` + `filter-lang`, `query`, `datetime`, `bbox` |
 | GET/POST | `/collections-search` | Requires `ENABLE_COLLECTIONS_SEARCH_ROUTE`. Same parameter surface as extended `/collections`; POST takes `{sortby:[{field,direction}], fields:{include,exclude}, q, filter, query, datetime, bbox, limit, token}` — `next` links carry `body.token` |
 | GET | `/collections-sortables` | Sortables schema for collections-search (mounted when either collections-search flag is on) |
@@ -79,7 +81,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search` |
 | GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections |
 
-GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes), `filter` (cql2-text) as query params; POST takes the full `Search` body (`intersects`, `fields: {include, exclude}`, `query`, `filter` + `filter-lang` — defaults to `cql2-json`). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query.
+GET search takes `bbox`, `datetime`, `ids`, `collections`, `limit`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes), `q` (comma-separated free-text terms, OR'd), `filter` (cql2-text) as query params; POST takes the full `Search` body (`intersects`, `fields: {include, exclude}`, `query`, `filter` + `filter-lang` — defaults to `cql2-json`). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query.
 
 `fields` implements the [Fields extension](https://github.com/stac-api-extensions/fields): include/exclude with nested paths (`properties.datetime`) and `*` wildcards (`properties.eo:*`); when an include selection matches nothing, items fall back to `{id, collection}` per spec.
 
@@ -150,7 +152,7 @@ docker compose up -d          # API :3000, OpenSearch :9200, Dashboards :5601
 ```
 
 > **Just want to run it, not hack on it?** `compose.release.yml` pulls the published
-> image (`ghcr.io/jonhealy1/stac-os-rs`) instead of building from source — no
+> image (`ghcr.io/staclabs/stac-os-rs`) instead of building from source — no
 > Rust toolchain or repo checkout needed:
 >
 > ```bash

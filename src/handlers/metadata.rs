@@ -17,17 +17,23 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
     let mut conforms_to = vec![
         "https://api.stacspec.org/v1.0.0/core",
         "https://api.stacspec.org/v1.0.0/browseable",
+        "https://api.stacspec.org/v1.0.0-rc.3/browseable",
         "https://api.stacspec.org/v1.0.0/ogcapi-features",
+        "https://api.stacspec.org/v1.0.0/collections",
         "https://api.stacspec.org/v1.1.0/ogcapi-features#sort",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
+        // `conf/oas30` is deliberately absent: utoipa 6 can only emit an
+        // OpenAPI 3.1+ document, which has no Part-1 conformance URI.
         "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/sortables",
         "https://api.stacspec.org/v1.0.0/item-search",
         "https://api.stacspec.org/v1.0.0/item-search#fields",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#fields",
         "https://api.stacspec.org/v1.0.0/item-search#query",
+        "https://api.stacspec.org/v1.0.0-rc.1/item-search#free-text",
         "https://api.stacspec.org/v1.0.0/ogcapi-features#query",
         "https://api.stacspec.org/v1.0.0-rc.2/item-search#filter",
+        "https://api.stacspec.org/v1.0.0/item-search#filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/features-filter",
         "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/queryables",
@@ -38,13 +44,25 @@ fn conformance_classes(state: &AppState) -> Vec<&'static str> {
         "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions",
         "https://api.stacspec.org/v1.1.0/item-search#sort",
         "https://api.stacspec.org/v1.1.0/item-search#sortables",
-        "https://api.stacspec.org/v1.1.0/collection-search#sortables",
+        "https://api.stacspec.org/v1.0.0/children",
     ];
+    // Collections-search classes ride the same flag pair as the
+    // routes — never advertised when the params aren't accepted.
+    if state.enable_collections_search || state.enable_collections_search_route {
+        conforms_to.extend([
+            "https://api.stacspec.org/v1.0.0/collection-search",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query",
+            "https://api.stacspec.org/v1.1.0/collection-search#sort",
+            "https://api.stacspec.org/v1.1.0/collection-search#sortables",
+            "https://api.stacspec.org/v1.0.0/collection-search#fields",
+            "https://api.stacspec.org/v1.0.0/collection-search#filter",
+            "https://api.stacspec.org/v1.0.0-rc.1/collection-search#free-text",
+        ]);
+    }
     if state.enable_catalogs_route {
         conforms_to.extend([
             "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs",
             "https://api.stacspec.org/v1.0.0/multi-tenant-catalogs/search",
-            "https://api.stacspec.org/v1.0.0/children",
             "https://api.stacspec.org/v1.0.0/children#type-filter",
         ]);
         if state.enable_transactions {
@@ -303,7 +321,7 @@ pub async fn api(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse
     Ok((
         [(
             header::CONTENT_TYPE,
-            "application/vnd.oai.openapi+json;version=3.0",
+            "application/vnd.oai.openapi+json;version=3.1",
         )],
         body,
     ))
@@ -358,13 +376,17 @@ pub async fn root_landing_page(
         { "rel": "self", "type": "application/json", "href": format!("{base}/") },
         { "rel": "root", "type": "application/json", "href": format!("{base}/") },
         { "rel": "conformance", "type": "application/json", "href": format!("{base}/conformance") },
-        { "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0", "href": format!("{base}/api") },
+        { "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.1", "href": format!("{base}/api") },
         { "rel": "service-doc", "type": "text/html", "href": format!("{base}/api.html") },
         { "rel": "data", "type": "application/json", "href": format!("{base}/collections") },
         { "rel": "search", "type": "application/geo+json", "href": format!("{base}/search") },
         { "rel": "http://www.opengis.net/def/rel/ogc/1.0/sortables", "type": "application/schema+json", "href": format!("{base}/sortables"), "title": "Sortables" },
         { "rel": "queryables", "type": "application/schema+json", "href": format!("{base}/queryables"), "title": "Queryables" }
     ]);
+    links.as_array_mut().unwrap().push(json!({
+        "rel": "children", "type": "application/json",
+        "href": format!("{base}/children")
+    }));
     if state.enable_catalogs_route {
         links.as_array_mut().unwrap().push(json!({
             "rel": "catalogs", "type": "application/json",
