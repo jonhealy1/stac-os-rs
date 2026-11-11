@@ -152,7 +152,7 @@ docker compose up -d          # API :3000, OpenSearch :9200, Dashboards :5601
 ```
 
 > **Just want to run it, not hack on it?** `compose.release.yml` pulls the published
-> image (`ghcr.io/jonhealy1/stac-os-rs`) instead of building from source — no
+> image (`ghcr.io/staclabs/stac-os-rs`) instead of building from source — no
 > Rust toolchain or repo checkout needed:
 >
 > ```bash

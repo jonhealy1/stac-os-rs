@@ -2,7 +2,7 @@
 #   docker compose -f compose.release.yml up -d
 services:
   api:
-    image: ghcr.io/jonhealy1/stac-os-rs:latest
+    image: ghcr.io/staclabs/stac-os-rs:latest
     container_name: stac-os-api
     ports:
       - "3000:3000"
