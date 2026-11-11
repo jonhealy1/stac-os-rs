@@ -85,24 +85,23 @@ async fn main() {
                     .collect()
             })
             .unwrap_or_default(),
-        validators: match env_flag("ENABLE_STAC_VALIDATOR") {
-            true => {
-                let size = env_u64("VALIDATOR_POOL_SIZE")
-                    .map(|n| (n as usize).max(1))
-                    .unwrap_or(stac_os_rs::handlers::VALIDATOR_POOL_SIZE);
-                let mut pool = Vec::with_capacity(size);
-                for _ in 0..size {
-                    pool.push(tokio::sync::Mutex::new(
-                        stac_validate::Validator::new().await.expect(
-                            "ENABLE_STAC_VALIDATOR is set but the validator failed to initialize",
-                        ),
-                    ));
-                }
-                pool
-            }
-            false => Vec::new(),
+        validator: if env_flag("ENABLE_STAC_VALIDATOR") {
+            // One shared validator — `stac-validate` 0.6.16 is `&self`
+            // with an interior shared schema cache. The injected client
+            // puts a bound on extension-schema fetches.
+            Some(
+                stac_validate::Validator::with_client_builder(
+                    reqwest::Client::builder().timeout(stac_os_rs::handlers::VALIDATION_TIMEOUT),
+                )
+                .await
+                .expect("ENABLE_STAC_VALIDATOR is set but the validator failed to initialize"),
+            )
+        } else {
+            None
         },
-        validator_cursor: std::sync::atomic::AtomicUsize::new(0),
+        validation_concurrency: env_u64("VALIDATOR_POOL_SIZE")
+            .map(|n| (n as usize).max(1))
+            .unwrap_or(stac_os_rs::handlers::VALIDATOR_POOL_SIZE),
         require_if_match: env_flag("REQUIRE_IF_MATCH"),
         raise_on_bulk_error: env_flag("RAISE_ON_BULK_ERROR"),
         enable_topology_validation: env_flag("ENABLE_TOPOLOGY_VALIDATION"),

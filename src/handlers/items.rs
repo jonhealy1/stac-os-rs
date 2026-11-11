@@ -346,7 +346,7 @@ async fn validate_item_write(
         )),
         other => other,
     })?;
-    if !state.validators.is_empty() {
+    if state.validator.is_some() {
         if let Err(msg) = validate_item_datetime(doc) {
             return Err(ApiError::BadRequest(format!(
                 "Invalid item datetime: {msg}"
@@ -376,7 +376,7 @@ async fn validate_member_doc(state: &AppState, doc: serde_json::Value) -> Result
         )),
         other => other,
     })?;
-    if !state.validators.is_empty() {
+    if state.validator.is_some() {
         if let Err(msg) = validate_item_datetime(&doc) {
             return Err(ApiError::BadRequest(msg));
         }
@@ -990,7 +990,7 @@ async fn create_items_batch(
     // Phase-1 failures are upstream's "preprocessing skipped" bucket.
     let admission_error_count = member_errors.len();
 
-    // Phase 2 — member validation, buffered across the validator pool.
+    // Phase 2 — member validation, buffered across the shared validator.
     // Upstream validates before insert, so an id that both fails schema
     // and already exists reports the validation error, not a conflict.
     let docs: Vec<serde_json::Value> = order
@@ -999,7 +999,7 @@ async fn create_items_batch(
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(state, doc))
-        .buffered(state.validators.len().max(1))
+        .buffered(state.validation_concurrency)
         .collect::<Vec<_>>()
         .await;
     let mut valid: Vec<String> = Vec::new();
@@ -1556,8 +1556,8 @@ pub async fn bulk_create_items(
     skipped += admitted.len() - unique.len();
     let processed_count = unique.len();
     // Deserialize + identity-check per item first (cheap, sequential),
-    // then schema-validate the survivors in parallel across the
-    // validator pool, and finally one `_bulk` request — a single
+    // then schema-validate the survivors concurrently on the shared
+    // validator, and finally one `_bulk` request — a single
     // round-trip and one refresh for the whole batch.
     let mut candidates: Vec<(&serde_json::Value, Item)> = Vec::new();
     for raw in unique {
@@ -1587,7 +1587,7 @@ pub async fn bulk_create_items(
             }),
         ));
     }
-    // `buffered` keeps `validators.len()` validations in flight,
+    // `buffered` keeps `validation_concurrency` validations in flight,
     // results in order. Schema failures are per-item errors like the
     // other malformed admissions; a fetch failure is environmental —
     // abort.
@@ -1597,7 +1597,7 @@ pub async fn bulk_create_items(
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(&state, doc))
-        .buffered(state.validators.len().max(1))
+        .buffered(state.validation_concurrency)
         .collect::<Vec<_>>()
         .await;
     let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();

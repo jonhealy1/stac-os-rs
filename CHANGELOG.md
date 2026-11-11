@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [CONFORMANCE.md](CONFORMANCE.md) — per-requirement audit of every
   advertised conformance class against the official spec tables
 
+### Changed
+
+- `stac-validate` 0.6.15 → 0.6.16 (upstream adopted the issues we
+  filed): `Validator::validate` now takes `&self` over a shared
+  `Arc<Mutex<HashMap<Uri, OnceCell>>>` schema cache, so one instance
+  validates batch members concurrently and each extension schema is
+  fetched at most once — the local validator pool, round-robin cursor,
+  per-instance caches, and the `stac_version` guard are all deleted.
+  Unknown versions now fail with `CannotValidateVersion` before any
+  URI build instead of panicking; the fetch timeout is applied via
+  `Validator::with_client_builder` with our own reqwest client
+  (`VALIDATION_TIMEOUT`, 30s). `VALIDATOR_POOL_SIZE` is kept under its
+  shipped env name but now bounds batch-validation concurrency only
+- A 404 on a schema fetch now maps to `400` (the document references a
+  schema that doesn't exist — e.g. a URI-valid but unhosted
+  `stac_version` like `2.0.0`, or a dead `stac_extensions` URI) instead
+  of `502`; other fetch/compile failures remain `502`
+
 ### Fixed
 
 - `items` link on global collection reads now reports
