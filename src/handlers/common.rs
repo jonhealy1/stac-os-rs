@@ -73,8 +73,9 @@ pub struct AppState {
     /// STAC JSON schemas before they reach the store. `None` = validation
     /// off (upstream default). `stac-validate` 0.6.16 validates through
     /// `&self` with a shared `Arc<Mutex<OnceCell>>` schema cache — one
-    /// instance validates concurrently and fetches each extension
-    /// schema at most once.
+    /// instance validates concurrently and concurrent fetches of the
+    /// same extension schema are deduplicated (a failed fetch isn't
+    /// cached; the next validation retries it).
     pub validator: Option<stac_validate::Validator>,
     /// Max in-flight batch-member validations — the `buffered` width
     /// (`VALIDATOR_POOL_SIZE`, default 4). Bounds how many schema
@@ -121,14 +122,18 @@ pub(crate) async fn validate_stac_doc(
     };
     let value = serde_json::to_value(doc)
         .map_err(|e| ApiError::BadRequest(format!("STAC validation failed: {e}")))?;
-    // Unknown `stac_version`s fail fast with `CannotValidateVersion`
-    // before any URI build or fetch; extension-schema fetch stalls are
-    // bounded by the timeout on the injected reqwest client.
-    validator
-        .validate_value(value)
-        .await
-        .map(|_| ())
-        .map_err(validation_error)
+    // URI-invalid `stac_version`s fail fast with `CannotValidateVersion`;
+    // extension schemas are fetched sequentially, each with the
+    // injected reqwest client's timeout — so bound the whole call too,
+    // or a doc citing N slow URIs stalls the write N×30s.
+    match tokio::time::timeout(VALIDATION_TIMEOUT, validator.validate_value(value)).await {
+        Err(_) => Err(ApiError::BadGateway(format!(
+            "STAC validation timed out after {}s",
+            VALIDATION_TIMEOUT.as_secs()
+        ))),
+        Ok(Err(e)) => Err(validation_error(e)),
+        Ok(Ok(_)) => Ok(()),
+    }
 }
 
 /// `VALIDATOR_POOL_SIZE` default — max in-flight batch-member
@@ -137,8 +142,10 @@ pub(crate) async fn validate_stac_doc(
 /// `Validator` rather than sizing a pool of mutexed instances.
 pub const VALIDATOR_POOL_SIZE: usize = 4;
 
-/// Timeout applied to schema fetches via the injected reqwest client —
-/// bounds a slow extension-schema host so one URI can't stall a write.
+/// Bounds a single schema fetch via the injected reqwest client, and
+/// the whole `validate_stac_doc` call — extension schemas are fetched
+/// sequentially under one validation, so a per-fetch bound alone
+/// wouldn't cap the total.
 pub const VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Schema fetch/compile failures are upstream-service problems (502)

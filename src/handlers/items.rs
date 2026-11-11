@@ -993,13 +993,14 @@ async fn create_items_batch(
     // Phase 2 — member validation, buffered across the shared validator.
     // Upstream validates before insert, so an id that both fails schema
     // and already exists reports the validation error, not a conflict.
+    // `.max(1)`: `buffered(0)` never polls the stream and hangs.
     let docs: Vec<serde_json::Value> = order
         .iter()
         .map(|id| item_validation_doc(state, &by_id[id].1, collection_id, scope))
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(state, doc))
-        .buffered(state.validation_concurrency)
+        .buffered(state.validation_concurrency.max(1))
         .collect::<Vec<_>>()
         .await;
     let mut valid: Vec<String> = Vec::new();
@@ -1588,7 +1589,8 @@ pub async fn bulk_create_items(
         ));
     }
     // `buffered` keeps `validation_concurrency` validations in flight,
-    // results in order. Schema failures are per-item errors like the
+    // results in order (`.max(1)`: `buffered(0)` never polls the
+    // stream and hangs). Schema failures are per-item errors like the
     // other malformed admissions; a fetch failure is environmental —
     // abort.
     let docs: Vec<serde_json::Value> = candidates
@@ -1597,7 +1599,7 @@ pub async fn bulk_create_items(
         .collect();
     let validations = futures_util::stream::iter(docs)
         .map(|doc| validate_member_doc(&state, doc))
-        .buffered(state.validation_concurrency)
+        .buffered(state.validation_concurrency.max(1))
         .collect::<Vec<_>>()
         .await;
     let mut prepared: Vec<(String, String, serde_json::Value)> = Vec::new();
